@@ -31,6 +31,7 @@ class RadixLinearAttention(nnx.Module):
         A_log: nnx.Param | None = None,
         dt_bias: nnx.Param | None = None,
         scale: float | None = None,
+        kda_lower_bound: float | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -62,6 +63,7 @@ class RadixLinearAttention(nnx.Module):
                 self.q_conv1d is not None or self.k_conv1d is not None or self.v_conv1d is not None
             )
         ), "RadixLinearAttention: fused `conv1d` is mutually exclusive with q/k/v_conv1d"
+        self.kda_lower_bound = kda_lower_bound
 
     def __call__(
         self,
