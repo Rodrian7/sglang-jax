@@ -991,14 +991,11 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
-        predict = np.asarray(jax.device_get(predict))
-        accept_index = np.asarray(jax.device_get(accept_index))
-        accept_length = np.asarray(jax.device_get(accept_length))
-
         accept_length = accept_length + 1
         accept_index = accept_index.flatten()
-        verified_id = np.zeros_like(accept_index, dtype=predict.dtype)
-        verified_id[accept_index != -1] = predict[accept_index[accept_index != -1]]
+        # On-device gather: avoid host sync from device_get.
+        safe_idx = jnp.where(accept_index >= 0, accept_index, 0)
+        verified_id = jnp.where(accept_index >= 0, predict[safe_idx], 0)
         return predict, verified_id, accept_length, accept_index
 
 

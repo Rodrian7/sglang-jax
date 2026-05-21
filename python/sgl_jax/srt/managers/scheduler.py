@@ -1824,7 +1824,8 @@ class Scheduler(
             info = batch.reqs_info[0]
             if batch_output.accept_lens is not None:
                 # Decode
-                info.seq_lens = info.seq_lens + batch_output.accept_lens
+                accept_lens_cpu = np.asarray(jax.device_get(batch_output.accept_lens))
+                info.seq_lens = info.seq_lens + accept_lens_cpu
             else:
                 # Prefill
                 info.seq_lens = info.seq_lens + 1

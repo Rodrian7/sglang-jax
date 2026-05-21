@@ -371,9 +371,9 @@ class EAGLEWorker(BaseSpecWorker):
         # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
         draft_n = self.speculative_num_draft_tokens
         accept_width = self.speculative_num_steps + 1
-        req_ids = np.arange(len(accept_index)) // accept_width
+        req_ids = jnp.arange(accept_index.shape[0]) // accept_width
         per_req_last = req_ids * draft_n + draft_n - 1
-        safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
+        safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
         with self._maybe_count_misses() as c_gather:
             logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
             logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
