@@ -141,7 +141,8 @@ class MiMoV2Moe(nnx.Module):
         topk_weights, topk_ids = self.topk(router_logits, correction_bias=correction_bias)
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+            if token_valid_mask is not None:
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
         mlp_output = self.experts(hidden_states, topk_weights, topk_ids)
         return mlp_output, topk_ids
 
@@ -765,11 +766,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                     scale_key = key + "_scale"
                     scale_target = target_param + "_scale"
                     scale_srcs = [p.replace(".weight", ".weight_scale_inv") for p in src_paths]
-                    scale_sharding = (
-                        (("data", "tensor"), None, None)
-                        if use_model_mesh_for_scale
-                        else ("expert", None, None)
-                    )
+                    if use_model_mesh_for_scale:
+                        scale_sharding = (("data", "tensor"), None, None)
+                    elif scale_target.endswith("wo_scale"):
+                        scale_sharding = ("expert", None, None, None)
+                    else:
+                        scale_sharding = ("expert", None, None, "tensor")
                     augmented[scale_key] = WeightMapping(
                         target_path=[scale_target] + scale_srcs,
                         sharding=scale_sharding,

@@ -459,8 +459,13 @@ class FusedEPMoE(nnx.Module):
         assert hidden_states.ndim == 2
 
         orig_num_tokens = hidden_states.shape[0]
-        if orig_num_tokens % self.ep_size != 0:
-            pad_size = (-orig_num_tokens) % self.ep_size
+        # The fused kernel requires num_tokens to be a multiple of
+        # ep_size * t_packing (t_packing=2 for bf16) so that each device
+        # gets an even, packing-aligned token slice.
+        t_packing = 32 // (hidden_states.dtype.itemsize * 8)
+        align = self.ep_size * t_packing
+        if orig_num_tokens % align != 0:
+            pad_size = (-orig_num_tokens) % align
             hidden_states = jnp.pad(hidden_states, ((0, pad_size), (0, 0)))
             topk_weights = jnp.pad(topk_weights, ((0, pad_size), (0, 0)))
             topk_ids = jnp.pad(topk_ids, ((0, pad_size), (0, 0)), constant_values=-1)
