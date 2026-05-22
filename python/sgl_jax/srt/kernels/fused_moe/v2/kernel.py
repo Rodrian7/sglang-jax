@@ -234,8 +234,6 @@ def _fused_ep_moe_kernel(
     a2a_s_x2_hbm,         # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
     a2a_s_acc_x2_hbm,     # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
     a2a_g_hbm,            # (num_experts, bt, out_packing, h_per_out)
-    token_scales_hbm,     # None | (local_num_tokens, 128) f32
-    a2a_s_scale_x2_hbm,   # None | (expert_buffer_count, a2a_max_tokens, 128) f32
     w1_shared_hbm,        # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,        # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,        # None | (se_intermediate_size, hidden_size)
@@ -273,7 +271,7 @@ def _fused_ep_moe_kernel(
     b_up_acc_vmem,         # None | (bts, bf) f32
     # Token staging per bts tile
     b_x_vmem,              # (bts, t_packing, h_per_t) t_dtype
-    b_x_scale_vmem,        # None | (bts, 128) f32
+    b_x_scale_vmem,        # None | (bts, 128) f32 — extracted from token payload
     # Output accumulator per bts tile
     b_y_acc_vmem,          # (bts, t_packing, h_per_t) f32
     # Output staging for HBM writeback per bts tile
@@ -296,10 +294,6 @@ def _fused_ep_moe_kernel(
     md_send_sem,           # DMA scalar
     md_recv_sem,           # DMA scalar
     barrier_sem,           # BARRIER
-    # Scale-related scratch (None when no dynamic activation quant)
-    x_scale_sem,           # None | DMA(1,)
-    scale_send_x2_sems,    # None | DMA(expert_buffer_count,) or DMA(num_bt_banks, expert_buffer_count)
-    scale_recv_x2_sems,    # None | DMA(expert_buffer_count,) or DMA(num_bt_banks, expert_buffer_count)
     *,
     # Static params
     top_k: int,
@@ -505,21 +499,6 @@ def _fused_ep_moe_kernel(
         if use_gather_bank:
             return a2a_g_hbm.at[gather_bank_id, e_id, pl.ds(start, size)]
         return a2a_g_hbm.at[e_id, pl.ds(start, size)]
-
-    def a2a_s_scale_ref(a2a_bank_id, e_sem_id, start, size):
-        if use_bt_banking:
-            return a2a_s_scale_x2_hbm.at[a2a_bank_id, e_sem_id, pl.ds(start, size)]
-        return a2a_s_scale_x2_hbm.at[e_sem_id, pl.ds(start, size)]
-
-    def scale_scatter_send_sem_ref(a2a_bank_id, e_sem_id):
-        if use_bt_banking:
-            return scale_send_x2_sems.at[a2a_bank_id, e_sem_id]
-        return scale_send_x2_sems.at[e_sem_id]
-
-    def scale_scatter_recv_sem_ref(a2a_bank_id, e_sem_id):
-        if use_bt_banking:
-            return scale_recv_x2_sems.at[a2a_bank_id, e_sem_id]
-        return scale_recv_x2_sems.at[e_sem_id]
 
     def gather_send_sem_ref(gather_bank_id, e_sem_id):
         if use_gather_bank:
@@ -865,12 +844,6 @@ def _fused_ep_moe_kernel(
                             dst_ref=a2a_s_ref(a2a_bank_id, e_sem_id_k, start, local_sz),
                             sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
                         ).start()
-                        if token_scales_hbm is not None:
-                            pltpu.make_async_copy(
-                                src_ref=token_scales_hbm.at[pl.ds(src_t_id, local_sz)],
-                                dst_ref=a2a_s_scale_ref(a2a_bank_id, e_sem_id_k, start, local_sz),
-                                sem=scale_scatter_recv_sem_ref(a2a_bank_id, e_sem_id_k),
-                            ).start()
 
                 if not disable_a2a_scatter_remote_copy:
                     @pl.when(remote_sz != 0)
@@ -889,15 +862,6 @@ def _fused_ep_moe_kernel(
                             device_id=get_mesh_device_id(recv_id),
                             device_id_type=pltpu.DeviceIdType.MESH,
                         ).start()
-                        if token_scales_hbm is not None:
-                            pltpu.make_async_remote_copy(
-                                src_ref=token_scales_hbm.at[pl.ds(src_t_id, remote_sz)],
-                                dst_ref=a2a_s_scale_ref(a2a_bank_id, e_sem_id_k, start, remote_sz),
-                                send_sem=scale_scatter_send_sem_ref(a2a_bank_id, e_sem_id_k),
-                                recv_sem=scale_scatter_recv_sem_ref(a2a_bank_id, e_sem_id_k),
-                                device_id=get_mesh_device_id(recv_id),
-                                device_id_type=pltpu.DeviceIdType.MESH,
-                            ).start()
 
             return None
 
@@ -933,12 +897,6 @@ def _fused_ep_moe_kernel(
                 pltpu.make_async_copy(
                     src_ref=ref, dst_ref=ref, sem=scatter_send_sem(a2a_bank_id, slot),
                 ).wait()
-                if token_scales_hbm is not None:
-                    scale_ref = a2a_s_scale_ref(a2a_bank_id, slot, 0, scatter_send_sz)
-                    pltpu.make_async_copy(
-                        src_ref=scale_ref, dst_ref=scale_ref,
-                        sem=scale_scatter_send_sem_ref(a2a_bank_id, slot),
-                    ).wait()
 
             return None
 
@@ -966,12 +924,6 @@ def _fused_ep_moe_kernel(
             pltpu.make_async_copy(
                 src_ref=ref, dst_ref=ref, sem=scatter_recv_sem(a2a_bank_id, e_sem_id),
             ).wait()
-            if token_scales_hbm is not None:
-                scale_ref = a2a_s_scale_ref(a2a_bank_id, e_sem_id, 0, sz)
-                pltpu.make_async_copy(
-                    src_ref=scale_ref, dst_ref=scale_ref,
-                    sem=scale_scatter_recv_sem_ref(a2a_bank_id, e_sem_id),
-                ).wait()
 
     # ===== A2A gather (static for loop, prefix sum, dst position 0) =====
 
@@ -1404,21 +1356,17 @@ def _fused_ep_moe_kernel(
                         dst_ref=b_x_vmem,
                         sem=x_stage_sem.at[0],
                     ).start(priority=1)
-                    if token_scales_hbm is not None:
-                        pltpu.make_async_copy(
-                            src_ref=a2a_s_scale_ref(a2a_bank_id, e_sem_id, tile_start, bts),
-                            dst_ref=b_x_scale_vmem,
-                            sem=x_scale_sem.at[0],
-                        ).start(priority=1)
                     pltpu.make_async_copy(
                         src_ref=b_x_vmem, dst_ref=b_x_vmem,
                         sem=x_stage_sem.at[0],
                     ).wait()
-                    if token_scales_hbm is not None:
-                        pltpu.make_async_copy(
-                            src_ref=b_x_scale_vmem, dst_ref=b_x_scale_vmem,
-                            sem=x_scale_sem.at[0],
-                        ).wait()
+                    if dynamic_activation_quant:
+                        scale_bytes = b_x_vmem[pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4)]
+                        scale_f32 = lax.bitcast_convert_type(scale_bytes, jnp.float32)
+                        b_x_scale_vmem.at[pl.ds(0, bts), pl.ds(0, 1)][...] = scale_f32
+                        b_x_vmem.at[pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4)][...] = (
+                            jnp.zeros((bts, 4), jnp.float8_e4m3fn)
+                        )
 
                 if can_cross_expert_prefetch:
                     use_prefetched_bf0 = jnp.logical_and(
@@ -2736,19 +2684,6 @@ def fused_ep_moe_v2(
         pltpu.SemaphoreType.DMA,                                            # md_send
         pltpu.SemaphoreType.DMA,                                            # md_recv
         pltpu.SemaphoreType.BARRIER,                                        # barrier
-        # Scale-related scratch (None when no dynamic activation quant)
-        (None if not dynamic_activation_quant else
-            pltpu.SemaphoreType.DMA((1,))),                                 # x_scale_sem
-        (None if not dynamic_activation_quant else (
-            pltpu.SemaphoreType.DMA((num_bt_banks, expert_buffer_count))
-            if use_bt_banking else
-            pltpu.SemaphoreType.DMA((expert_buffer_count,))
-        )),                                                                 # scale_send
-        (None if not dynamic_activation_quant else (
-            pltpu.SemaphoreType.DMA((num_bt_banks, expert_buffer_count))
-            if use_bt_banking else
-            pltpu.SemaphoreType.DMA((expert_buffer_count,))
-        )),                                                                 # scale_recv
     )
 
     fused_moe = jax.named_scope(scope_name)(
@@ -2823,8 +2758,6 @@ def fused_ep_moe_v2(
                     hbm_spec,                                               # a2a_s
                     hbm_spec,                                               # a2a_s_acc
                     hbm_spec,                                               # a2a_g
-                    None if not dynamic_activation_quant else hbm_spec,     # token_scales
-                    None if not dynamic_activation_quant else hbm_spec,     # a2a_s_scale
                     None if w1_shared is None else hbm_spec,                # w1_shared
                     None if w3_shared is None else hbm_spec,                # w3_shared
                     None if w2_shared is None else hbm_spec,                # w2_shared
@@ -2861,7 +2794,6 @@ def fused_ep_moe_v2(
             P(),                                  # a2a_s
             P(),                                  # a2a_s_acc
             P(),                                  # a2a_g
-            None if not dynamic_activation_quant else P(),                   # a2a_s_scale
             None if w1_shared is None else P(),   # w1_shared
             None if w3_shared is None else P(),   # w3_shared
             None if w2_shared is None else P(),   # w2_shared
@@ -2874,7 +2806,6 @@ def fused_ep_moe_v2(
         w1_scale_arg, w2_scale_arg, w3_scale_arg,
         topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
-        a2a_s_scale_hbm_scratch=None,
         w1_shared=None, w3_shared=None, w2_shared=None,
     ):
         if dynamic_activation_quant:
@@ -2883,11 +2814,10 @@ def fused_ep_moe_v2(
             x_scale = jnp.maximum(x_amax / FP8_E4M3_MAX, 1e-12)
             tokens = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
             tokens = tokens.reshape(-1, t_packing, h_per_t)
-            token_scales = jnp.pad(
-                x_scale.reshape(-1, 1), ((0, 0), (0, 127)),
+            scale_as_fp8 = lax.bitcast_convert_type(
+                x_scale.squeeze(-1), jnp.float8_e4m3fn,
             )
-        else:
-            token_scales = None
+            tokens = tokens.at[:, 0, h_per_t - 4:h_per_t].set(scale_as_fp8)
 
         if pad_local > 0:
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
@@ -2899,12 +2829,6 @@ def fused_ep_moe_v2(
                 mode="constant",
                 constant_values=-1,
             )
-            if token_scales is not None:
-                token_scales = jnp.pad(
-                    token_scales, ((0, pad_local), (0, 0)),
-                    constant_values=0.0,
-                )
-
         if needs_jax_allreduce:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k], padded_num_experts, bt,
@@ -2934,10 +2858,6 @@ def fused_ep_moe_v2(
             pltpu.with_memory_space_constraint(a2a_s_hbm_scratch, pltpu.HBM),
             pltpu.with_memory_space_constraint(a2a_s_acc_hbm_scratch, pltpu.HBM),
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),
-            (None if token_scales is None else
-                pltpu.with_memory_space_constraint(token_scales, pltpu.HBM)),
-            (None if a2a_s_scale_hbm_scratch is None else
-                pltpu.with_memory_space_constraint(a2a_s_scale_hbm_scratch, pltpu.HBM)),
             (None if w1_shared is None else
                 pltpu.with_memory_space_constraint(w1_shared, pltpu.HBM)),
             (None if w3_shared is None else
@@ -2965,19 +2885,10 @@ def fused_ep_moe_v2(
         a2a_g_shape = (num_bt_banks,) + a2a_g_shape
     a2a_g_hbm_scratch = pl.empty(a2a_g_shape, out_dtype)
 
-    if dynamic_activation_quant:
-        a2a_s_scale_shape = (expert_buffer_count, a2a_max_tokens, 128)
-        if use_bt_banking:
-            a2a_s_scale_shape = (num_bt_banks,) + a2a_s_scale_shape
-        a2a_s_scale_hbm_scratch = pl.empty(a2a_s_scale_shape, jnp.float32)
-    else:
-        a2a_s_scale_hbm_scratch = None
-
     return kernel(
         tokens, w1, w2, w3,
         w1_scale, w2_scale, w3_scale,
         topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
-        a2a_s_scale_hbm_scratch,
         w1_shared, w3_shared, w2_shared,
     )
