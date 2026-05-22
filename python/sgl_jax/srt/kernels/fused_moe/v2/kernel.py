@@ -1730,29 +1730,25 @@ def _fused_ep_moe_kernel(
                             up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                             act = maybe_cast_ffn2_input(activation_fn(gate, up_val, act_fn))
                         if not disable_dynamic_ffn2:
-                            if use_direct_w2 and dynamic_activation_quant:
-                                gate_full = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                                up_full = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                                act_full = activation_fn(gate_full, up_full, act_fn)
-                                a_amax = jnp.max(jnp.abs(act_full), axis=-1, keepdims=True)
-                                a_s = jnp.maximum(a_amax / FP8_E4M3_MAX, 1e-12)
-                                act_fp8_full = (act_full / a_s).astype(jnp.float8_e4m3fn)
                             for p_id in range(t_packing):
                                 if use_direct_w2:
                                     def _ffn2_sg_body(sg_id, partial_acc):
                                         sg_off = sg_id * quant_block_k
+                                        gate_slice = b_gate_acc_vmem[
+                                            pl.ds(btc_id * btc, btc),
+                                            pl.ds(sg_off, quant_block_k),
+                                        ]
+                                        up_slice = b_up_acc_vmem[
+                                            pl.ds(btc_id * btc, btc),
+                                            pl.ds(sg_off, quant_block_k),
+                                        ]
+                                        act_slice = activation_fn(gate_slice, up_slice, act_fn)
                                         if dynamic_activation_quant:
-                                            act_slice = lax.dynamic_slice(act_fp8_full, (0, sg_off), (btc, quant_block_k))
+                                            a_amax = jnp.max(jnp.abs(act_slice), axis=-1, keepdims=True)
+                                            a_s = jnp.maximum(a_amax / FP8_E4M3_MAX, 1e-12)
+                                            act_slice = (act_slice / a_s).astype(jnp.float8_e4m3fn)
                                         else:
-                                            gate_slice = b_gate_acc_vmem[
-                                                pl.ds(btc_id * btc, btc),
-                                                pl.ds(sg_off, quant_block_k),
-                                            ]
-                                            up_slice = b_up_acc_vmem[
-                                                pl.ds(btc_id * btc, btc),
-                                                pl.ds(sg_off, quant_block_k),
-                                            ]
-                                            act_slice = maybe_cast_ffn2_input(activation_fn(gate_slice, up_slice, act_fn))
+                                            act_slice = maybe_cast_ffn2_input(act_slice)
                                         w2_tile = b_w2_x2_vmem[
                                             slot,
                                             p_id,
