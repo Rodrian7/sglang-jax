@@ -458,6 +458,13 @@ class FusedEPMoE(nnx.Module):
         """
         assert hidden_states.ndim == 2
 
+        orig_num_tokens = hidden_states.shape[0]
+        if orig_num_tokens % self.ep_size != 0:
+            pad_size = (-orig_num_tokens) % self.ep_size
+            hidden_states = jnp.pad(hidden_states, ((0, pad_size), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad_size), (0, 0)))
+            topk_ids = jnp.pad(topk_ids, ((0, pad_size), (0, 0)), constant_values=-1)
+
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
@@ -515,4 +522,6 @@ class FusedEPMoE(nnx.Module):
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        if orig_num_tokens != output.shape[0]:
+            output = output[:orig_num_tokens]
         return output
