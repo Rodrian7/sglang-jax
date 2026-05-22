@@ -234,8 +234,8 @@ def _fused_ep_moe_kernel(
     a2a_s_x2_hbm,         # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
     a2a_s_acc_x2_hbm,     # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
     a2a_g_hbm,            # (num_experts, bt, out_packing, h_per_out)
-    token_scales_hbm,     # None | (local_num_tokens, 8) f32
-    a2a_s_scale_x2_hbm,   # None | (expert_buffer_count, a2a_max_tokens, 8) f32
+    token_scales_hbm,     # None | (local_num_tokens, 128) f32
+    a2a_s_scale_x2_hbm,   # None | (expert_buffer_count, a2a_max_tokens, 128) f32
     w1_shared_hbm,        # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,        # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,        # None | (se_intermediate_size, hidden_size)
@@ -273,7 +273,7 @@ def _fused_ep_moe_kernel(
     b_up_acc_vmem,         # None | (bts, bf) f32
     # Token staging per bts tile
     b_x_vmem,              # (bts, t_packing, h_per_t) t_dtype
-    b_x_scale_vmem,        # None | (bts, 8) f32
+    b_x_scale_vmem,        # None | (bts, 128) f32
     # Output accumulator per bts tile
     b_y_acc_vmem,          # (bts, t_packing, h_per_t) f32
     # Output staging for HBM writeback per bts tile
@@ -2686,7 +2686,7 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, t_packing, h_per_t), t_dtype),                    # x
         # VMEM: per-token scale (only for dynamic activation quant)
         (None if not dynamic_activation_quant else
-            pltpu.VMEM((bts, 8), jnp.float32)),                            # x_scale
+            pltpu.VMEM((bts, 128), jnp.float32)),                           # x_scale
         # VMEM: output accumulator per bts tile (fp32)
         pltpu.VMEM((bts, t_packing, h_per_t), jnp.float32),                # y_acc
         # VMEM: output staging for HBM writeback (out_dtype)
@@ -2878,7 +2878,7 @@ def fused_ep_moe_v2(
             tokens = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
             tokens = tokens.reshape(-1, t_packing, h_per_t)
             token_scales = jnp.pad(
-                x_scale.reshape(-1, 1), ((0, 0), (0, 7)),
+                x_scale.reshape(-1, 1), ((0, 0), (0, 127)),
             )
         else:
             token_scales = None
@@ -2960,7 +2960,7 @@ def fused_ep_moe_v2(
     a2a_g_hbm_scratch = pl.empty(a2a_g_shape, out_dtype)
 
     if dynamic_activation_quant:
-        a2a_s_scale_shape = (expert_buffer_count, a2a_max_tokens, 8)
+        a2a_s_scale_shape = (expert_buffer_count, a2a_max_tokens, 128)
         if use_bt_banking:
             a2a_s_scale_shape = (num_bt_banks,) + a2a_s_scale_shape
         a2a_s_scale_hbm_scratch = pl.empty(a2a_s_scale_shape, jnp.float32)
