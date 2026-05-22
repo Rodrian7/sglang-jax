@@ -2146,9 +2146,9 @@ def _fused_ep_moe_kernel(
             b3 = lax.bitcast_convert_type(
                 ((scale_i32 >> jnp.int32(24)) & jnp.int32(0xFF)).astype(jnp.int8),
                 jnp.float8_e4m3fn)
-            pos = np.arange(hidden_size)
+            pos = lax.iota(jnp.int32, hidden_size)
             for byte_idx, byte_val in enumerate([b0, b1, b2, b3]):
-                mask = jnp.array(pos == h_per_t - 4 + byte_idx)
+                mask = pos == jnp.int32(h_per_t - 4 + byte_idx)
                 x_fp8_flat = jnp.where(mask[None, :], byte_val[:, None], x_fp8_flat)
             fp8_staging[...] = x_fp8_flat.reshape(bt, t_packing, h_per_t)
             pltpu.make_async_copy(
