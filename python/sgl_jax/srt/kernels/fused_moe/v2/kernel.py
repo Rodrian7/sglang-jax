@@ -1469,7 +1469,7 @@ def _fused_ep_moe_kernel(
                                             pl.ds(0, bf),
                                         ].reshape(bf)
                                         if dynamic_activation_quant:
-                                            gate_acc += jnp.stack([d1[i] * s1 * x_s[i, 0] for i in range(btc)], axis=0)
+                                            gate_acc += d1 * (x_s * s1)
                                         else:
                                             gate_acc += jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
 
@@ -1485,7 +1485,7 @@ def _fused_ep_moe_kernel(
                                             pl.ds(0, bf),
                                         ].reshape(bf)
                                         if dynamic_activation_quant:
-                                            up_acc += jnp.stack([d3[i] * s3 * x_s[i, 0] for i in range(btc)], axis=0)
+                                            up_acc += d3 * (x_s * s3)
                                         else:
                                             up_acc += jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
                                         return gate_acc, up_acc
@@ -1740,7 +1740,7 @@ def _fused_ep_moe_kernel(
                                             pl.ds(0, h_per_t),
                                         ].reshape(h_per_t)
                                         if dynamic_activation_quant:
-                                            return partial_acc + jnp.stack([d[i] * s * a_s[i, 0] for i in range(btc)], axis=0)
+                                            return partial_acc + d * (a_s * s)
                                         else:
                                             return partial_acc + jnp.stack([d[i] * s for i in range(btc)], axis=0)
 
