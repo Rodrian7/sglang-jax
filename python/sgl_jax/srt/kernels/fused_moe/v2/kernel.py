@@ -285,7 +285,7 @@ def _fused_ep_moe_kernel(
     b_se_acc_vmem,         # None | (2, bt, hidden_size) f32
     # Pre-quantization staging (DAQ only)
     prequant_staging_vmem, # None | (bt, input_t_packing, input_h_per_t) bf16
-    prequant_sem,          # None | DMA(1,)
+    prequant_sem,          # None | DMA scalar
     # --- Semaphores ---
     x_stage_sem,           # DMA(1,) — token staging
     y_store_sem,           # DMA(1,) — output store from y_acc
@@ -2792,7 +2792,7 @@ def fused_ep_moe_v2(
         (None if not dynamic_activation_quant else
             pltpu.VMEM((bt, input_t_packing, input_h_per_t), jnp.bfloat16)),  # prequant_staging
         (None if not dynamic_activation_quant else
-            pltpu.SemaphoreType.DMA((1,))),                                    # prequant_sem
+            pltpu.SemaphoreType.DMA),                                          # prequant_sem
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),                                      # x_stage
         pltpu.SemaphoreType.DMA((1,)),                                      # y_store
