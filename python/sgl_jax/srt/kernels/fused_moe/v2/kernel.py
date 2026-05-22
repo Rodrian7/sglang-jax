@@ -16,6 +16,7 @@ import math
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -2129,9 +2130,7 @@ def _fused_ep_moe_kernel(
             x_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
             x_scale = jnp.maximum(x_amax / jnp.float32(FP8_E4M3_MAX),
                                   jnp.float32(1e-12))
-            x_fp8 = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
-            x_fp8 = x_fp8.reshape(bt, t_packing, h_per_t)
-            fp8_staging[...] = x_fp8
+            x_fp8_flat = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
             scale_i32 = lax.bitcast_convert_type(
                 x_scale.squeeze(-1), jnp.int32,
             )
@@ -2147,8 +2146,11 @@ def _fused_ep_moe_kernel(
             b3 = lax.bitcast_convert_type(
                 ((scale_i32 >> jnp.int32(24)) & jnp.int32(0xFF)).astype(jnp.int8),
                 jnp.float8_e4m3fn)
-            scale_as_fp8 = jnp.stack([b0, b1, b2, b3], axis=-1)
-            fp8_staging.at[pl.ds(0, bt), 0, pl.ds(h_per_t - 4, 4)][...] = scale_as_fp8
+            pos = np.arange(hidden_size)
+            for byte_idx, byte_val in enumerate([b0, b1, b2, b3]):
+                mask = jnp.array(pos == h_per_t - 4 + byte_idx)
+                x_fp8_flat = jnp.where(mask[None, :], byte_val[:, None], x_fp8_flat)
+            fp8_staging[...] = x_fp8_flat.reshape(bt, t_packing, h_per_t)
             pltpu.make_async_copy(
                 src_ref=fp8_staging,
                 dst_ref=q_tokens_hbm.at[pl.ds(bt_start, bt)],
