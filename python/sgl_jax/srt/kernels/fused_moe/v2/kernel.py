@@ -334,7 +334,6 @@ def _fused_ep_moe_kernel(
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
-    skip_post_gather_sync: bool = True,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     direct_scaled_dot: bool = False,
@@ -2214,8 +2213,7 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            if not skip_post_gather_sync:
-                sync_barrier()
+            sync_barrier()
 
             start_send_bo(bt_id=bt_id)
 
@@ -2258,8 +2256,7 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            if not skip_post_gather_sync:
-                sync_barrier()
+            sync_barrier()
             start_send_bo(bt_id=bt_id)
 
             tail_start = max(local_num_experts - expert_buffer_count, 0)
@@ -2357,7 +2354,6 @@ def jax_allreduce_metadata_by_bt(
         "dynamic_activation_quant",
         "cross_expert_prefetch_mode", "next_w2_prologue_priority",
         "w2_fetch_order", "w2_fetch_priority",
-        "skip_post_gather_sync",
         "skip_inter_bt_sync",
         "interleave_bt",
     ],
@@ -2423,7 +2419,6 @@ def fused_ep_moe_v2(
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
-    skip_post_gather_sync: bool = True,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     dp_axis_name: str = "data",
@@ -2637,8 +2632,6 @@ def fused_ep_moe_v2(
         scope_name += f"-w2p_{next_w2_prologue_priority}"
     if w2_fetch_order != "after_w13" or w2_fetch_priority != 1:
         scope_name += f"-w2fetch_{w2_fetch_order}_p{w2_fetch_priority}"
-    if skip_post_gather_sync:
-        scope_name += "-skip_post_gather_sync"
     if skip_inter_bt_sync:
         scope_name += "-skip_inter_bt_sync"
     if interleave_bt:
@@ -2779,7 +2772,6 @@ def fused_ep_moe_v2(
                 next_w2_prologue_priority=next_w2_prologue_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
-                skip_post_gather_sync=skip_post_gather_sync,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 direct_scaled_dot=direct_scaled_dot,
