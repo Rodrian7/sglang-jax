@@ -2131,6 +2131,7 @@ def _fused_ep_moe_kernel(
                                   jnp.float32(1e-12))
             x_fp8 = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
             x_fp8 = x_fp8.reshape(bt, t_packing, h_per_t)
+            fp8_staging[...] = x_fp8
             scale_i32 = lax.bitcast_convert_type(
                 x_scale.squeeze(-1), jnp.int32,
             )
@@ -2147,8 +2148,7 @@ def _fused_ep_moe_kernel(
                 ((scale_i32 >> jnp.int32(24)) & jnp.int32(0xFF)).astype(jnp.int8),
                 jnp.float8_e4m3fn)
             scale_as_fp8 = jnp.stack([b0, b1, b2, b3], axis=-1)
-            x_fp8 = x_fp8.at[:, 0, h_per_t - 4:h_per_t].set(scale_as_fp8)
-            fp8_staging[...] = x_fp8
+            fp8_staging.at[pl.ds(0, bt), 0, pl.ds(h_per_t - 4, 4)][...] = scale_as_fp8
             pltpu.make_async_copy(
                 src_ref=fp8_staging,
                 dst_ref=q_tokens_hbm.at[pl.ds(bt_start, bt)],
