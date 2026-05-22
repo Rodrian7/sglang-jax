@@ -2554,7 +2554,17 @@ def fused_ep_moe_v2(
 
     expert_buffer_count = local_num_experts
 
-    if not dynamic_activation_quant:
+    if dynamic_activation_quant:
+        tokens_f32 = tokens.astype(jnp.float32)
+        x_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
+        x_scale = jnp.maximum(x_amax / FP8_E4M3_MAX, 1e-12)
+        tokens = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
+        tokens = tokens.reshape(-1, t_packing, h_per_t)
+        scale_as_fp8 = lax.bitcast_convert_type(
+            x_scale.squeeze(-1), jnp.float8_e4m3fn,
+        )
+        tokens = tokens.at[:, 0, h_per_t - 4:h_per_t].set(scale_as_fp8)
+    else:
         tokens = tokens.reshape(-1, t_packing, h_per_t)
 
     if padded_top_k > top_k:
@@ -2859,17 +2869,6 @@ def fused_ep_moe_v2(
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
         w1_shared=None, w3_shared=None, w2_shared=None,
     ):
-        if dynamic_activation_quant:
-            tokens_f32 = tokens.astype(jnp.float32)
-            x_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
-            x_scale = jnp.maximum(x_amax / FP8_E4M3_MAX, 1e-12)
-            tokens = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
-            tokens = tokens.reshape(-1, t_packing, h_per_t)
-            scale_as_fp8 = lax.bitcast_convert_type(
-                x_scale.squeeze(-1), jnp.float8_e4m3fn,
-            )
-            tokens = tokens.at[:, 0, h_per_t - 4:h_per_t].set(scale_as_fp8)
-
         if pad_local > 0:
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
             topk_weights = jnp.pad(topk_weights, ((0, pad_local), (0, 0)),

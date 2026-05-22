@@ -560,6 +560,7 @@ class FusedEPMoEV2(FusedEPMoE):
             )
 
         direct_scaled_dot = w1_scale is not None
+        dynamic_activation_quant = direct_scaled_dot
 
         output = fused_ep_moe_v2(
             self.mesh,
@@ -587,6 +588,7 @@ class FusedEPMoEV2(FusedEPMoE):
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
             direct_scaled_dot=direct_scaled_dot,
+            dynamic_activation_quant=dynamic_activation_quant,
             skip_post_gather_sync=True,
             skip_inter_bt_sync=True,
             dp_axis_name="data",
