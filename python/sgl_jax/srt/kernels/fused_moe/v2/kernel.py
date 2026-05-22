@@ -966,6 +966,12 @@ def _fused_ep_moe_kernel(
             pltpu.make_async_copy(
                 src_ref=ref, dst_ref=ref, sem=scatter_recv_sem(a2a_bank_id, e_sem_id),
             ).wait()
+            if token_scales_hbm is not None:
+                scale_ref = a2a_s_scale_ref(a2a_bank_id, e_sem_id, 0, sz)
+                pltpu.make_async_copy(
+                    src_ref=scale_ref, dst_ref=scale_ref,
+                    sem=scale_scatter_recv_sem_ref(a2a_bank_id, e_sem_id),
+                ).wait()
 
     # ===== A2A gather (static for loop, prefix sum, dst position 0) =====
 
