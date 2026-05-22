@@ -444,22 +444,15 @@ class FusedEPMoE(nnx.Module):
         hidden_states: jax.Array,
         topk_weights: jax.Array,
         topk_ids: jax.Array,
+        token_valid_mask: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """
-        Forward pass through the fused MoE layer.
-
-        Args:
-            hidden_states: Input tokens, shape (num_tokens, hidden_size) or
-                          (batch_size, seq_len, hidden_size)
-            topk_weights: Pre-computed top-k weights
-            topk_ids: Pre-computed top-k expert IDs
-
-        Returns:
-            MoE layer output, same shape as hidden_states
-        """
+        """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
+        if token_valid_mask is not None:
+            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -517,7 +510,8 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
         return output
 
 
@@ -536,10 +530,7 @@ class FusedEPMoEV2(FusedEPMoE):
         *,
         block_config=None,
     ) -> jax.Array:
-        from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
-            FusedMoEBlockConfig as V2BlockConfig,
-            fused_ep_moe_v2,
-        )
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
             get_tuned_fused_moe_v2_block_config,
         )
