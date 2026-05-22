@@ -1362,7 +1362,15 @@ def _fused_ep_moe_kernel(
                     ).wait()
                     if dynamic_activation_quant:
                         scale_bytes = b_x_vmem[pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4)]
-                        scale_f32 = lax.bitcast_convert_type(scale_bytes, jnp.float32)
+                        scale_i8 = lax.bitcast_convert_type(scale_bytes, jnp.int8)
+                        scale_u32 = scale_i8.astype(jnp.int32) & jnp.int32(0xFF)
+                        scale_packed = (
+                            scale_u32[:, 0]
+                            | (scale_u32[:, 1] << jnp.int32(8))
+                            | (scale_u32[:, 2] << jnp.int32(16))
+                            | (scale_u32[:, 3] << jnp.int32(24))
+                        )
+                        scale_f32 = lax.bitcast_convert_type(scale_packed, jnp.float32)
                         b_x_scale_vmem.at[pl.ds(0, bts), pl.ds(0, 1)][...] = scale_f32[:, None]
                         b_x_vmem.at[pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4)][...] = (
                             jnp.zeros((bts, 4), jnp.float8_e4m3fn)
