@@ -262,40 +262,34 @@ class FlashAttention(AttentionBackend):
         )
 
         if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
-            # Reconstruct page_indices properly respecting ragged allocation
-            page_indices_list = []
-            offset = 0
-            allocate_lens = batch.spec_info.allocate_lens
-            # Ensure it's accessible as array
-            if hasattr(allocate_lens, "device"):
-                allocate_lens = jax.device_get(allocate_lens)
+            allocate_lens = np.asarray(batch.spec_info.allocate_lens)
+            real_bs = batch.real_bs
+            ps = self.page_size
 
-            num_pages_per_seq = aligned_seq_lens // self.page_size
+            alloc_aligned = ((allocate_lens[:real_bs].astype(np.int32) + ps - 1) // ps) * ps
+            pages_per_req = (aligned_seq_lens[:real_bs] // ps).astype(np.int32)
+            total_pages = int(np.sum(pages_per_req))
 
-            for i in range(batch.real_bs):
-                alloc_len = (
-                    (int(allocate_lens[i]) + self.page_size - 1) // self.page_size
-                ) * self.page_size
-                needed_pages = int(num_pages_per_seq[i])
-
-                if needed_pages > 0:
-                    # Get the slice of cache_loc for this request
-                    # We assume batch.cache_loc is ordered and packed according to allocate_lens
-                    req_cache_loc = batch.cache_loc[offset : offset + alloc_len]
-
-                    # Select the first token of each page
-                    # The tokens are at indices 0, page_size, 2*page_size...
-                    # We need `needed_pages` entries.
-
-                    indices = np.arange(needed_pages) * self.page_size
-                    selected = req_cache_loc[indices]
-                    page_indices_list.extend(selected // self.page_size)
-
-                offset += alloc_len
+            if total_pages > 0:
+                offsets = np.empty(real_bs, dtype=np.int32)
+                offsets[0] = 0
+                if real_bs > 1:
+                    np.cumsum(alloc_aligned[:-1], out=offsets[1:])
+                flat_offsets = np.repeat(offsets, pages_per_req)
+                page_starts = np.concatenate(
+                    [np.array([0], dtype=np.int32), np.cumsum(pages_per_req[:-1])]
+                ) if real_bs > 1 else np.array([0], dtype=np.int32)
+                page_nums = np.arange(total_pages, dtype=np.int32) - np.repeat(
+                    page_starts, pages_per_req
+                )
+                cache_indices = flat_offsets + page_nums * ps
+                page_indices_arr = (batch.cache_loc[cache_indices] // ps).astype(np.int32)
+            else:
+                page_indices_arr = np.array([], dtype=np.int32)
 
             page_indices = np.pad(
-                np.array(page_indices_list, dtype=np.int32),
-                (0, page_indices.shape[0] - len(page_indices_list)),
+                page_indices_arr,
+                (0, page_indices.shape[0] - len(page_indices_arr)),
             )
 
         num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
