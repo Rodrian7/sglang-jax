@@ -1439,9 +1439,10 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_off, quant_block_k),
                                         ]
                                         if dynamic_activation_quant:
-                                            x_amax = jnp.max(jnp.abs(x_slice), axis=-1, keepdims=True)
+                                            x_f32 = x_slice.astype(jnp.float32)
+                                            x_amax = jnp.max(jnp.abs(x_f32), axis=-1, keepdims=True)
                                             x_s = jnp.maximum(x_amax / FP8_E4M3_MAX, 1e-12)
-                                            x_slice = (x_slice / x_s).astype(jnp.float8_e4m3fn)
+                                            x_slice = (x_f32 / x_s).astype(jnp.float8_e4m3fn)
                                         else:
                                             x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[
