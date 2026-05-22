@@ -589,7 +589,7 @@ class FusedEPMoEV2(FusedEPMoE):
             w3_shared=w3_shared_val,
             direct_scaled_dot=direct_scaled_dot,
             dynamic_activation_quant=dynamic_activation_quant,
-            skip_post_gather_sync=not dynamic_activation_quant,
+            skip_post_gather_sync=False,
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",
