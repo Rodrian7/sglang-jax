@@ -1742,7 +1742,7 @@ def _fused_ep_moe_kernel(
                                     def _ffn2_sg_body(sg_id, partial_acc):
                                         sg_off = sg_id * quant_block_k
                                         if dynamic_activation_quant:
-                                            act_slice = act_fp8_full[:, pl.ds(sg_off, quant_block_k)]
+                                            act_slice = lax.dynamic_slice(act_fp8_full, (0, sg_off), (btc, quant_block_k))
                                         else:
                                             gate_slice = b_gate_acc_vmem[
                                                 pl.ds(btc_id * btc, btc),
