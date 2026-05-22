@@ -248,6 +248,7 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 )
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
+dynamic_act_quant = os.environ.get("BENCH_DYNAMIC_ACT_QUANT", "0") == "1"
 ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
 ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
@@ -400,6 +401,13 @@ if active_ablation:
     log(f"ablation flags: {active_ablation}")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
+if dynamic_act_quant:
+    log("dynamic_activation_quant=True (per-block fp8 quantize + dual scale compensation)")
+    if not direct_scaled_dot:
+        direct_scaled_dot = True
+        direct_scaled_dot_ffn1_modes = [True]
+        direct_scaled_dot_ffn2_modes = [True]
+        log("  -> forced direct_scaled_dot=True (required for dynamic act quant)")
 if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
     log(
         "input cast controls: "
@@ -1045,6 +1053,7 @@ for num_tokens in token_candidates:
                 ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                dynamic_activation_quant=dynamic_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
                 next_w2_prologue_priority=next_w2_priority,
                 w2_fetch_order=w2_fetch_order,
@@ -1130,6 +1139,7 @@ if check_correctness:
             ffn1_dequant_chunk=ffn1_dequant_chunks[0],
             cast_ffn1_input_fp8=cast_ffn1_input_fp8,
             cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+            dynamic_activation_quant=dynamic_act_quant,
             w2_fetch_order=w2_fetch_orders[0],
             w2_fetch_priority=w2_fetch_priorities[0],
             skip_post_gather_sync=skip_post_gather_sync_modes[0],

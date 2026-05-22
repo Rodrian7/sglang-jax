@@ -85,6 +85,9 @@ def _pad128(x):
     return ((x + 127) // 128) * 128
 
 
+FP8_E4M3_MAX = 448.0
+
+
 def get_dtype_packing(dtype):
     bits = jnp.dtype(dtype).itemsize * 8
     return 32 // bits
@@ -340,6 +343,7 @@ def _fused_ep_moe_kernel(
     ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
+    dynamic_activation_quant: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -1434,7 +1438,12 @@ def _fused_ep_moe_kernel(
                                             p_id,
                                             pl.ds(sg_off, quant_block_k),
                                         ]
-                                        x_slice = maybe_cast_ffn1_input(x_slice)
+                                        if dynamic_activation_quant:
+                                            x_amax = jnp.max(jnp.abs(x_slice), axis=-1, keepdims=True)
+                                            x_s = jnp.maximum(x_amax / FP8_E4M3_MAX, 1e-12)
+                                            x_slice = (x_slice / x_s).astype(jnp.float8_e4m3fn)
+                                        else:
+                                            x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[
                                             slot,
                                             p_id,
@@ -1458,7 +1467,10 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, bf),
                                         ].reshape(bf)
-                                        gate_acc += jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        if dynamic_activation_quant:
+                                            gate_acc += jnp.stack([d1[i] * s1 * x_s[i, 0] for i in range(btc)], axis=0)
+                                        else:
+                                            gate_acc += jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
 
                                         d3 = jnp.dot(
                                             x_slice, w3_tile,
@@ -1471,7 +1483,10 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, bf),
                                         ].reshape(bf)
-                                        up_acc += jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        if dynamic_activation_quant:
+                                            up_acc += jnp.stack([d3[i] * s3 * x_s[i, 0] for i in range(btc)], axis=0)
+                                        else:
+                                            up_acc += jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
                                         return gate_acc, up_acc
 
                                     gate, up = lax.fori_loop(
@@ -1700,7 +1715,12 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_off, quant_block_k),
                                         ]
                                         act_slice = activation_fn(gate_slice, up_slice, act_fn)
-                                        act_slice = maybe_cast_ffn2_input(act_slice)
+                                        if dynamic_activation_quant:
+                                            a_amax = jnp.max(jnp.abs(act_slice), axis=-1, keepdims=True)
+                                            a_s = jnp.maximum(a_amax / FP8_E4M3_MAX, 1e-12)
+                                            act_slice = (act_slice / a_s).astype(jnp.float8_e4m3fn)
+                                        else:
+                                            act_slice = maybe_cast_ffn2_input(act_slice)
                                         w2_tile = b_w2_x2_vmem[
                                             slot,
                                             p_id,
@@ -1718,7 +1738,10 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, h_per_t),
                                         ].reshape(h_per_t)
-                                        return partial_acc + jnp.stack([d[i] * s for i in range(btc)], axis=0)
+                                        if dynamic_activation_quant:
+                                            return partial_acc + jnp.stack([d[i] * s * a_s[i, 0] for i in range(btc)], axis=0)
+                                        else:
+                                            return partial_acc + jnp.stack([d[i] * s for i in range(btc)], axis=0)
 
                                     partial = lax.fori_loop(
                                         0,
@@ -2246,6 +2269,7 @@ def jax_allreduce_metadata_by_bt(
         "direct_scaled_dot_ffn1", "direct_scaled_dot_ffn2",
         "ffn1_dequant_mode", "ffn1_dequant_chunk",
         "cast_ffn1_input_fp8", "cast_ffn2_input_fp8",
+        "dynamic_activation_quant",
         "cross_expert_prefetch_mode", "next_w2_prologue_priority",
         "w2_fetch_order", "w2_fetch_priority",
         "skip_post_gather_sync",
@@ -2309,6 +2333,7 @@ def fused_ep_moe_v2(
     ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
+    dynamic_activation_quant: bool = False,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
@@ -2497,6 +2522,8 @@ def fused_ep_moe_v2(
         scope_name += f"-ffn1_fchunk_{ffn1_dequant_chunk}"
     if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
         scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
+    if dynamic_activation_quant:
+        scope_name += "-dyn_act_quant"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
@@ -2671,6 +2698,7 @@ def fused_ep_moe_v2(
                 ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                dynamic_activation_quant=dynamic_activation_quant,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
             ),
