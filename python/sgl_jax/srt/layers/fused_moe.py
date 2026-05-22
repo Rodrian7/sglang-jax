@@ -560,7 +560,6 @@ class FusedEPMoEV2(FusedEPMoE):
             )
 
         direct_scaled_dot = w1_scale is not None
-        dynamic_activation_quant = direct_scaled_dot
 
         output = fused_ep_moe_v2(
             self.mesh,
