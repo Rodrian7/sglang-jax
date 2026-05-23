@@ -676,6 +676,14 @@ def _fused_ep_moe_kernel(
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
 
+                if (early_e0_w_prefetch
+                        and can_cross_expert_prefetch
+                        and not can_bt_scatter_overlap):
+                    start_fetch_w1(0, 0, 0, priority=1)
+                    start_fetch_w3(0, 0, 0, priority=1)
+                    if can_full_cross_expert_prefetch:
+                        start_fetch_w2(0, 0, 0, priority=1)
+
                 for _ in range(num_devices):
                     recv_ref = d2e_count_vmem.at[
                         0,
@@ -1350,6 +1358,13 @@ def _fused_ep_moe_kernel(
             return jnp.bool_(False)
 
         def _run_inactive(_):
+            if can_cross_expert_prefetch:
+                @pl.when(bf0_prefetched)
+                def _():
+                    wait_fetch_w1(0)
+                    wait_fetch_w3(0)
+                    if can_full_cross_expert_prefetch:
+                        wait_fetch_w2(0)
             return start_prefetch_expert_bf0(
                 bt_sem_id, local_e_id + jnp.int32(1),
                 include_w2=can_full_cross_expert_prefetch,
@@ -2048,12 +2063,6 @@ def _fused_ep_moe_kernel(
             can_bt_scatter_overlap, bt_id > jnp.int32(0)
         )
 
-        if early_e0_w_prefetch and can_cross_expert_prefetch:
-            @pl.when(jnp.logical_not(current_bt_scatter_prefetched))
-            def _():
-                start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
-                start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
-
         def prepare_bt_metadata(_bt_id, _bt_sem_id):
             wait_fetch_topk(bt_id=_bt_id)
             _t2e_routing = b_topk_ids_x2_vmem[_bt_sem_id]
@@ -2070,18 +2079,12 @@ def _fused_ep_moe_kernel(
 
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
-        if early_e0_w_prefetch and can_cross_expert_prefetch:
-            _e0_id = my_id * local_num_experts
-            _e0_has_tokens = expert_sizes_x2_smem[bt_sem_id, 0, _e0_id] > 0
-            _early_started = jnp.logical_not(current_bt_scatter_prefetched)
-            early_bf0_prefetched = jnp.logical_and(_early_started, _e0_has_tokens)
-
-            @pl.when(jnp.logical_and(_early_started, jnp.logical_not(_e0_has_tokens)))
-            def _():
-                wait_fetch_w1(0)
-                wait_fetch_w3(0)
-        else:
-            early_bf0_prefetched = jnp.bool_(False)
+        early_bf0_prefetched = jnp.bool_(
+            early_e0_w_prefetch
+            and can_cross_expert_prefetch
+            and async_metadata_broadcast
+            and not can_bt_scatter_overlap
+        )
 
         if not skip_post_gather:
             wait_store_output(bt_id=bt_id - 2)
@@ -2105,13 +2108,7 @@ def _fused_ep_moe_kernel(
 
             @pl.when(next_bt_id < num_bt)
             def _():
-                if early_e0_w_prefetch and can_cross_expert_prefetch:
-                    start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
-                    start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
                 prepare_bt_metadata(next_bt_id, next_bt_sem_id)
-                if early_e0_w_prefetch and can_cross_expert_prefetch:
-                    wait_fetch_w1(0)
-                    wait_fetch_w3(0)
                 start_a2a_scatter_batch(
                     bt_sem_id=next_bt_sem_id,
                     bt_start=next_bt_start,
