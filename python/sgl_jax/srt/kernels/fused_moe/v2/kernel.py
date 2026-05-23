@@ -2098,34 +2098,35 @@ def _fused_ep_moe_kernel(
 
     # ===== In-kernel pre-quantization (DAQ) =====
 
-    def start_fetch_prequant_tokens(bt_id):
-        if q_tokens_hbm is None:
+    def prequant_and_metadata(bt_id, metadata_fn):
+        """Fetch bf16 tokens, overlap allreduce via metadata_fn, quantize to fp8."""
+        if not dynamic_activation_quant:
+            metadata_fn()
             return
         input_t_packing = tokens_hbm.shape[1]
         input_h_per_t = tokens_hbm.shape[2]
         bt_start = bt_id * bt
-        pltpu.make_async_copy(
-            src_ref=tokens_hbm.at[
-                pl.ds(bt_start, bt),
-                pl.ds(0, input_t_packing),
-                pl.ds(0, input_h_per_t),
-            ],
-            dst_ref=prequant_staging_vmem,
-            sem=prequant_sem,
-        ).start()
 
-    def quantize_and_store(bt_id):
-        if q_tokens_hbm is None:
-            return
-        bt_start = bt_id * bt
-        pltpu.make_async_copy(
-            src_ref=prequant_staging_vmem,
-            dst_ref=prequant_staging_vmem,
-            sem=prequant_sem,
-        ).wait()
+        def _scoped_body(bf16_staging, fp8_staging):
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[
+                    pl.ds(bt_start, bt),
+                    pl.ds(0, input_t_packing),
+                    pl.ds(0, input_h_per_t),
+                ],
+                dst_ref=bf16_staging,
+                sem=prequant_sem,
+            ).start()
 
-        def _quant_body(fp8_staging):
-            bf16_data = prequant_staging_vmem[...]
+            metadata_fn()
+
+            pltpu.make_async_copy(
+                src_ref=bf16_staging,
+                dst_ref=bf16_staging,
+                sem=prequant_sem,
+            ).wait()
+
+            bf16_data = bf16_staging[...]
             tokens_f32 = bf16_data.reshape(bt, hidden_size).astype(jnp.float32)
             x_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
             x_scale = jnp.maximum(x_amax / jnp.float32(FP8_E4M3_MAX),
@@ -2164,7 +2165,8 @@ def _fused_ep_moe_kernel(
             ).wait()
 
         pl.run_scoped(
-            _quant_body,
+            _scoped_body,
+            pltpu.VMEM((bt, input_t_packing, input_h_per_t), jnp.bfloat16),
             pltpu.VMEM((bt, t_packing, h_per_t), jnp.float8_e4m3fn),
         )
 
@@ -2203,18 +2205,14 @@ def _fused_ep_moe_kernel(
         if can_bt_scatter_overlap:
             @pl.when(jnp.logical_not(current_bt_scatter_prefetched))
             def _():
+                prequant_and_metadata(
+                    bt_id, lambda: prepare_bt_metadata(bt_id, bt_sem_id))
                 if dynamic_activation_quant:
-                    start_fetch_prequant_tokens(bt_id)
-                prepare_bt_metadata(bt_id, bt_sem_id)
-                if dynamic_activation_quant:
-                    quantize_and_store(bt_id)
                     start_fetch_se_tokens(bt_id)
         else:
+            prequant_and_metadata(
+                bt_id, lambda: prepare_bt_metadata(bt_id, bt_sem_id))
             if dynamic_activation_quant:
-                start_fetch_prequant_tokens(bt_id)
-            prepare_bt_metadata(bt_id, bt_sem_id)
-            if dynamic_activation_quant:
-                quantize_and_store(bt_id)
                 start_fetch_se_tokens(bt_id)
 
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
@@ -2241,11 +2239,10 @@ def _fused_ep_moe_kernel(
 
             @pl.when(next_bt_id < num_bt)
             def _():
+                prequant_and_metadata(
+                    next_bt_id,
+                    lambda: prepare_bt_metadata(next_bt_id, next_bt_sem_id))
                 if dynamic_activation_quant:
-                    start_fetch_prequant_tokens(next_bt_id)
-                prepare_bt_metadata(next_bt_id, next_bt_sem_id)
-                if dynamic_activation_quant:
-                    quantize_and_store(next_bt_id)
                     start_fetch_se_tokens(next_bt_id)
                 start_a2a_scatter_batch(
                     bt_sem_id=next_bt_sem_id,
@@ -2805,8 +2802,7 @@ def fused_ep_moe_v2(
         (None if w1_shared is None else
             pltpu.VMEM((smem_banks, bt, hidden_size), jnp.float32)),                 # se_acc
         # VMEM: pre-quantization staging (DAQ only)
-        (None if not dynamic_activation_quant else
-            pltpu.VMEM((bt, input_t_packing, input_h_per_t), jnp.bfloat16)),  # prequant_staging
+        None,  # prequant_staging (removed — now pl.run_scoped inside kernel)
         (None if not dynamic_activation_quant else
             pltpu.SemaphoreType.DMA),                                          # prequant_sem
         # Semaphores
