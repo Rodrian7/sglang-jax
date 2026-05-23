@@ -2614,7 +2614,6 @@ def fused_ep_moe_v2(
     num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
     smem_banks = num_bt if use_gather_bank else 2
 
-    padded_local = local_num_tokens + pad_local
     if dynamic_activation_quant:
         prequant_call = pl.pallas_call(
             functools.partial(
@@ -2623,11 +2622,11 @@ def fused_ep_moe_v2(
                 h_per_t=h_per_t,
             ),
             out_shape=jax.ShapeDtypeStruct(
-                (padded_local, t_packing, h_per_t), jnp.float8_e4m3fn,
+                (local_num_tokens, t_packing, h_per_t), jnp.float8_e4m3fn,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
-                grid=(padded_local // bt,),
+                grid=(local_num_tokens // bt,),
                 in_specs=[
                     pl.BlockSpec(
                         (bt, input_t_packing, input_h_per_t),
