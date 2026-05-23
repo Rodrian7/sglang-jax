@@ -1429,7 +1429,7 @@ def _fused_ep_moe_kernel(
 
                     next_bf_id = bf_id + 2
 
-                    if direct_scaled_dot_ffn1 and w1_scale_hbm is not None and bt <= 16:
+                    if direct_scaled_dot_ffn1 and w1_scale_hbm is not None:
                         wait_fetch_w1(slot)
 
                         def _gate_only_btc(btc_id, ___):
@@ -1477,78 +1477,6 @@ def _fused_ep_moe_kernel(
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
                         lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
-
-                    elif direct_scaled_dot_ffn1 and w1_scale_hbm is not None:
-                        wait_fetch_w1(slot)
-                        wait_fetch_w3(slot)
-
-                        def gate_up_btc_direct(btc_id, ___):
-                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            if not disable_dynamic_ffn1:
-                                if dynamic_activation_quant:
-                                    x_s = b_x_scale_vmem[pl.ds(btc_id * btc, btc), 0:1]
-                                for p_id in range(t_packing):
-                                    def _ffn1_sg_body(sg_id, carry):
-                                        gate_acc, up_acc = carry
-                                        sg_off = sg_id * quant_block_k
-                                        x_slice = b_x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            p_id,
-                                            pl.ds(sg_off, quant_block_k),
-                                        ]
-                                        if not dynamic_activation_quant:
-                                            x_slice = maybe_cast_ffn1_input(x_slice)
-                                        w1_tile = b_w1_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_off, quant_block_k),
-                                            pl.ds(0, bf),
-                                        ]
-                                        w3_tile = b_w3_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_off, quant_block_k),
-                                            pl.ds(0, bf),
-                                        ]
-                                        d1 = jnp.dot(
-                                            x_slice, w1_tile,
-                                            preferred_element_type=jnp.float32,
-                                        )
-                                        s1 = b_w1_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        gate_acc += d1 * s1[None, :]
-
-                                        d3 = jnp.dot(
-                                            x_slice, w3_tile,
-                                            preferred_element_type=jnp.float32,
-                                        )
-                                        s3 = b_w3_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        up_acc += d3 * s3[None, :]
-                                        return gate_acc, up_acc
-
-                                    gate, up = lax.fori_loop(
-                                        0, n_sg, _ffn1_sg_body, (gate, up), unroll=n_sg,
-                                    )
-                                if dynamic_activation_quant:
-                                    gate = gate * x_s
-                                    up = up * x_s
-                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
-                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
-                            return None
-
-                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
 
                     elif ffn1_use_chunked_dequant:
                         wait_fetch_w1(slot)
