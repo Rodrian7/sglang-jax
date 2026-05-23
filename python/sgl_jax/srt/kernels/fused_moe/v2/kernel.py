@@ -332,6 +332,8 @@ def _fused_ep_moe_kernel(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
+    early_e0_w_prefetch: bool = True,
+    async_metadata_broadcast: bool = False,
     direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool = False,
     direct_scaled_dot_ffn2: bool = False,
@@ -655,59 +657,8 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = local_sizes
 
-            sync_barrier()
-
-            if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
-                rounds = int(math.log2(num_devices))
-                for round_id in range(rounds):
-                    sync_barrier()
-
-                    chunk = 1 << round_id
-                    chunk_i32 = jnp.int32(chunk)
-                    peer_id = my_id ^ chunk_i32
-
-                    send_start = (my_id >> round_id) << round_id
-                    recv_start = (peer_id >> round_id) << round_id
-
-                    pltpu.make_async_remote_copy(
-                        src_ref=d2e_count_vmem.at[
-                            pl.ds(send_start, chunk),
-                            pl.ds(0, 1),
-                            pl.ds(0, padded_num_experts),
-                        ],
-                        dst_ref=d2e_count_vmem.at[
-                            pl.ds(send_start, chunk),
-                            pl.ds(0, 1),
-                            pl.ds(0, padded_num_experts),
-                        ],
-                        send_sem=md_send_sem,
-                        recv_sem=md_recv_sem,
-                        device_id=get_mesh_device_id(peer_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
-
-                    recv_ref = d2e_count_vmem.at[
-                        pl.ds(recv_start, chunk),
-                        pl.ds(0, 1),
-                        pl.ds(0, padded_num_experts),
-                    ]
-                    pltpu.make_async_copy(
-                        src_ref=recv_ref, dst_ref=recv_ref,
-                        sem=md_recv_sem,
-                    ).wait()
-
-                    send_ref = d2e_count_vmem.at[
-                        pl.ds(send_start, chunk),
-                        pl.ds(0, 1),
-                        pl.ds(0, padded_num_experts),
-                    ]
-                    pltpu.make_async_copy(
-                        src_ref=send_ref, dst_ref=send_ref,
-                        sem=md_send_sem,
-                    ).wait()
-            else:
-                for step in range(1, num_devices):
-                    peer_id = (my_id + step) % num_devices
+            if async_metadata_broadcast:
+                for peer_id_int in range(num_devices):
                     pltpu.make_async_remote_copy(
                         src_ref=d2e_count_vmem.at[
                             my_id,
@@ -721,13 +672,13 @@ def _fused_ep_moe_kernel(
                         ],
                         send_sem=md_send_sem,
                         recv_sem=md_recv_sem,
-                        device_id=get_mesh_device_id(peer_id),
+                        device_id=get_mesh_device_id(jnp.int32(peer_id_int)),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
 
-                    src_peer = (my_id + num_devices - step) % num_devices
+                for _ in range(num_devices):
                     recv_ref = d2e_count_vmem.at[
-                        src_peer,
+                        0,
                         pl.ds(0, 1),
                         pl.ds(0, padded_num_experts),
                     ]
@@ -736,6 +687,7 @@ def _fused_ep_moe_kernel(
                         sem=md_recv_sem,
                     ).wait()
 
+                for _ in range(num_devices):
                     send_ref = d2e_count_vmem.at[
                         my_id,
                         pl.ds(0, 1),
@@ -745,8 +697,99 @@ def _fused_ep_moe_kernel(
                         src_ref=send_ref, dst_ref=send_ref,
                         sem=md_send_sem,
                     ).wait()
+            else:
+                sync_barrier()
 
-            sync_barrier()
+                if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
+                    rounds = int(math.log2(num_devices))
+                    for round_id in range(rounds):
+                        sync_barrier()
+
+                        chunk = 1 << round_id
+                        chunk_i32 = jnp.int32(chunk)
+                        peer_id = my_id ^ chunk_i32
+
+                        send_start = (my_id >> round_id) << round_id
+                        recv_start = (peer_id >> round_id) << round_id
+
+                        pltpu.make_async_remote_copy(
+                            src_ref=d2e_count_vmem.at[
+                                pl.ds(send_start, chunk),
+                                pl.ds(0, 1),
+                                pl.ds(0, padded_num_experts),
+                            ],
+                            dst_ref=d2e_count_vmem.at[
+                                pl.ds(send_start, chunk),
+                                pl.ds(0, 1),
+                                pl.ds(0, padded_num_experts),
+                            ],
+                            send_sem=md_send_sem,
+                            recv_sem=md_recv_sem,
+                            device_id=get_mesh_device_id(peer_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+
+                        recv_ref = d2e_count_vmem.at[
+                            pl.ds(recv_start, chunk),
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ]
+                        pltpu.make_async_copy(
+                            src_ref=recv_ref, dst_ref=recv_ref,
+                            sem=md_recv_sem,
+                        ).wait()
+
+                        send_ref = d2e_count_vmem.at[
+                            pl.ds(send_start, chunk),
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ]
+                        pltpu.make_async_copy(
+                            src_ref=send_ref, dst_ref=send_ref,
+                            sem=md_send_sem,
+                        ).wait()
+                else:
+                    for step in range(1, num_devices):
+                        peer_id = (my_id + step) % num_devices
+                        pltpu.make_async_remote_copy(
+                            src_ref=d2e_count_vmem.at[
+                                my_id,
+                                pl.ds(0, 1),
+                                pl.ds(0, padded_num_experts),
+                            ],
+                            dst_ref=d2e_count_vmem.at[
+                                my_id,
+                                pl.ds(0, 1),
+                                pl.ds(0, padded_num_experts),
+                            ],
+                            send_sem=md_send_sem,
+                            recv_sem=md_recv_sem,
+                            device_id=get_mesh_device_id(peer_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+
+                        src_peer = (my_id + num_devices - step) % num_devices
+                        recv_ref = d2e_count_vmem.at[
+                            src_peer,
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ]
+                        pltpu.make_async_copy(
+                            src_ref=recv_ref, dst_ref=recv_ref,
+                            sem=md_recv_sem,
+                        ).wait()
+
+                        send_ref = d2e_count_vmem.at[
+                            my_id,
+                            pl.ds(0, 1),
+                            pl.ds(0, padded_num_experts),
+                        ]
+                        pltpu.make_async_copy(
+                            src_ref=send_ref, dst_ref=send_ref,
+                            sem=md_send_sem,
+                        ).wait()
+
+                sync_barrier()
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
@@ -2005,6 +2048,12 @@ def _fused_ep_moe_kernel(
             can_bt_scatter_overlap, bt_id > jnp.int32(0)
         )
 
+        if early_e0_w_prefetch and can_cross_expert_prefetch:
+            @pl.when(jnp.logical_not(current_bt_scatter_prefetched))
+            def _():
+                start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
+                start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
+
         def prepare_bt_metadata(_bt_id, _bt_sem_id):
             wait_fetch_topk(bt_id=_bt_id)
             _t2e_routing = b_topk_ids_x2_vmem[_bt_sem_id]
@@ -2020,6 +2069,19 @@ def _fused_ep_moe_kernel(
             prepare_bt_metadata(bt_id, bt_sem_id)
 
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
+
+        if early_e0_w_prefetch and can_cross_expert_prefetch:
+            _e0_id = my_id * local_num_experts
+            _e0_has_tokens = expert_sizes_x2_smem[bt_sem_id, 0, _e0_id] > 0
+            _early_started = jnp.logical_not(current_bt_scatter_prefetched)
+            early_bf0_prefetched = jnp.logical_and(_early_started, _e0_has_tokens)
+
+            @pl.when(jnp.logical_and(_early_started, jnp.logical_not(_e0_has_tokens)))
+            def _():
+                wait_fetch_w1(0)
+                wait_fetch_w3(0)
+        else:
+            early_bf0_prefetched = jnp.bool_(False)
 
         if not skip_post_gather:
             wait_store_output(bt_id=bt_id - 2)
@@ -2043,7 +2105,13 @@ def _fused_ep_moe_kernel(
 
             @pl.when(next_bt_id < num_bt)
             def _():
+                if early_e0_w_prefetch and can_cross_expert_prefetch:
+                    start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
+                    start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
                 prepare_bt_metadata(next_bt_id, next_bt_sem_id)
+                if early_e0_w_prefetch and can_cross_expert_prefetch:
+                    wait_fetch_w1(0)
+                    wait_fetch_w3(0)
                 start_a2a_scatter_batch(
                     bt_sem_id=next_bt_sem_id,
                     bt_start=next_bt_start,
@@ -2055,7 +2123,7 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
-        init_carry = (jnp.int32(0), jnp.bool_(False))
+        init_carry = (jnp.int32(0), early_bf0_prefetched)
 
         def compute_expert_batch(local_e_id, carry):
             curr_se_block, bf0_w13_prefetched = carry
@@ -2244,6 +2312,8 @@ def jax_allreduce_metadata_by_bt(
         "w2_fetch_order", "w2_fetch_priority",
         "skip_inter_bt_sync",
         "interleave_bt",
+        "early_e0_w_prefetch",
+        "async_metadata_broadcast",
     ],
 )
 def fused_ep_moe_v2(
@@ -2308,6 +2378,8 @@ def fused_ep_moe_v2(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
+    early_e0_w_prefetch: bool = True,
+    async_metadata_broadcast: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -2653,6 +2725,8 @@ def fused_ep_moe_v2(
                 w2_fetch_priority=w2_fetch_priority,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
+                early_e0_w_prefetch=early_e0_w_prefetch,
+                async_metadata_broadcast=async_metadata_broadcast,
                 direct_scaled_dot=direct_scaled_dot,
                 direct_scaled_dot_ffn1=direct_scaled_dot_ffn1,
                 direct_scaled_dot_ffn2=direct_scaled_dot_ffn2,

@@ -20,6 +20,8 @@ Env vars:
   BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_EARLY_E0_PREFETCH — comma-separated 0/1 early expert 0 W1/W3 prefetch during allreduce
+  BENCH_ASYNC_MD_BROADCAST — comma-separated 0/1 async flat broadcast metadata (no barriers)
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -261,6 +263,12 @@ skip_inter_bt_sync_modes = parse_csv_bool(
 interleave_bt_modes = parse_csv_bool(
     "BENCH_INTERLEAVE_BT", [True],
 )
+early_e0_w_prefetch_modes = parse_csv_bool(
+    "BENCH_EARLY_E0_PREFETCH", [True],
+)
+async_metadata_broadcast_modes = parse_csv_bool(
+    "BENCH_ASYNC_MD_BROADCAST", [False],
+)
 valid_ffn1_dequant_modes = {"full", "fchunk"}
 invalid_ffn1_dequant_modes = [
     mode for mode in ffn1_dequant_modes if mode not in valid_ffn1_dequant_modes
@@ -431,6 +439,10 @@ if skip_inter_bt_sync_modes != [True]:
     log(f"skip_inter_bt_sync sweep: {skip_inter_bt_sync_modes}")
 if interleave_bt_modes != [True]:
     log(f"interleave_bt sweep: {interleave_bt_modes}")
+log(
+    f"early_e0_w_prefetch={early_e0_w_prefetch_modes} "
+    f"async_metadata_broadcast={async_metadata_broadcast_modes}"
+)
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -909,6 +921,8 @@ for num_tokens in token_candidates:
             w2_fetch_priorities,
             skip_inter_bt_sync_modes,
             interleave_bt_modes,
+            early_e0_w_prefetch_modes,
+            async_metadata_broadcast_modes,
         )
     ]
     seen_resolved_configs = set()
@@ -925,6 +939,8 @@ for num_tokens in token_candidates:
         w2_fetch_priority,
         skip_inter_bt_sync,
         interleave_bt,
+        early_e0_prefetch,
+        async_md_broadcast,
     ) in configs_to_try:
         if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
             continue
@@ -945,7 +961,9 @@ for num_tokens in token_candidates:
             f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
             f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
             f"skip_ibt={int(skip_inter_bt_sync)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"e0pf={int(early_e0_prefetch)},"
+            f"async_md={int(async_md_broadcast)}"
         )
 
         padded_nt = num_tokens
@@ -970,7 +988,9 @@ for num_tokens in token_candidates:
             f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
             f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
             f"skip_ibt={int(skip_inter_bt_sync)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"e0pf={int(early_e0_prefetch)},"
+            f"async_md={int(async_md_broadcast)}"
         )
         resolved_key = (
             bc_resolved.bt,
@@ -987,6 +1007,8 @@ for num_tokens in token_candidates:
             w2_fetch_priority,
             skip_inter_bt_sync,
             interleave_bt,
+            early_e0_prefetch,
+            async_md_broadcast,
         )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
@@ -1040,6 +1062,8 @@ for num_tokens in token_candidates:
                 w2_fetch_priority=w2_fetch_priority,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
+                early_e0_w_prefetch=early_e0_prefetch,
+                async_metadata_broadcast=async_md_broadcast,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
