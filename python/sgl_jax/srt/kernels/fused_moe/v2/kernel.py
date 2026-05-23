@@ -89,6 +89,33 @@ def _pad128(x):
 FP8_E4M3_MAX = 448.0
 
 
+def _prequant_tokens_kernel(x_ref, out_ref, *, hidden_size, h_per_t):
+    tile = x_ref.shape[0]
+    x_f32 = x_ref[...].reshape(tile, hidden_size).astype(jnp.float32)
+    amax = jnp.max(jnp.abs(x_f32), axis=-1, keepdims=True)
+    scale = jnp.maximum(amax / jnp.float32(FP8_E4M3_MAX), jnp.float32(1e-12))
+    x_fp8 = (x_f32 / scale).astype(jnp.float8_e4m3fn)
+    scale_i32 = lax.bitcast_convert_type(scale.squeeze(-1), jnp.int32)
+    b0 = lax.bitcast_convert_type(
+        (scale_i32 & jnp.int32(0xFF)).astype(jnp.int8), jnp.float8_e4m3fn)
+    b1 = lax.bitcast_convert_type(
+        ((scale_i32 >> jnp.int32(8)) & jnp.int32(0xFF)).astype(jnp.int8),
+        jnp.float8_e4m3fn)
+    b2 = lax.bitcast_convert_type(
+        ((scale_i32 >> jnp.int32(16)) & jnp.int32(0xFF)).astype(jnp.int8),
+        jnp.float8_e4m3fn)
+    b3 = lax.bitcast_convert_type(
+        ((scale_i32 >> jnp.int32(24)) & jnp.int32(0xFF)).astype(jnp.int8),
+        jnp.float8_e4m3fn)
+    x_pre = x_fp8[:, :h_per_t - 4]
+    scale_bytes = jnp.concatenate(
+        [b0[:, None], b1[:, None], b2[:, None], b3[:, None]], axis=1)
+    x_post = x_fp8[:, h_per_t:]
+    x_fp8 = jnp.concatenate([x_pre, scale_bytes, x_post], axis=1)
+    t_packing = hidden_size // h_per_t
+    out_ref[...] = x_fp8.reshape(tile, t_packing, h_per_t)
+
+
 def get_dtype_packing(dtype):
     bits = jnp.dtype(dtype).itemsize * 8
     return 32 // bits
@@ -241,7 +268,6 @@ def _fused_ep_moe_kernel(
     metadata_starts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
     metadata_sizes_hbm,   # None | (num_bt, 1, padded_num_experts) int32
     metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, padded_num_experts) int32
-    q_tokens_hbm,         # None | (local_num_tokens, t_packing, h_per_t) fp8
     # --- HBM output ---
     output_hbm,           # (local_num_tokens, hidden_size)
     # --- SMEM scratch ---
@@ -284,9 +310,6 @@ def _fused_ep_moe_kernel(
     b_se_w3_x2_vmem,       # None | (2, t_packing, h_per_t, bse)
     b_se_w2_x2_vmem,       # None | (2, t_packing, bse, h_per_t)
     b_se_acc_vmem,         # None | (2, bt, hidden_size) f32
-    # Pre-quantization staging (DAQ only)
-    prequant_staging_vmem, # None | (bt, input_t_packing, input_h_per_t) bf16
-    prequant_sem,          # None | DMA scalar
     # --- Semaphores ---
     x_stage_sem,           # DMA(1,) — token staging
     y_store_sem,           # DMA(1,) — output store from y_acc
@@ -388,8 +411,7 @@ def _fused_ep_moe_kernel(
     assert padded_num_experts == align_to(num_experts, 128)
     assert routing_smem_top_k in (top_k, align_to(top_k, 128))
 
-    t_dtype = q_tokens_hbm.dtype if q_tokens_hbm is not None else tokens_hbm.dtype
-    scatter_src_hbm = q_tokens_hbm if q_tokens_hbm is not None else tokens_hbm
+    t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
     h_per_t = hidden_size // t_packing
 
@@ -845,7 +867,7 @@ def _fused_ep_moe_kernel(
                         src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id_k=e_sem_id_k
                     ):
                         pltpu.make_async_copy(
-                            src_ref=scatter_src_hbm.at[pl.ds(src_t_id, local_sz)],
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
                             dst_ref=a2a_s_ref(a2a_bank_id, e_sem_id_k, start, local_sz),
                             sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
                         ).start()
@@ -860,7 +882,7 @@ def _fused_ep_moe_kernel(
                         recv_id=recv_id,
                     ):
                         pltpu.make_async_remote_copy(
-                            src_ref=scatter_src_hbm.at[pl.ds(src_t_id, remote_sz)],
+                            src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
                             dst_ref=a2a_s_ref(a2a_bank_id, e_sem_id_k, start, remote_sz),
                             send_sem=scatter_send_sem(a2a_bank_id, e_sem_id_k),
                             recv_sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
@@ -1424,10 +1446,10 @@ def _fused_ep_moe_kernel(
                                         w1_tile = b_w1_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d1 = jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
                                         s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        if dynamic_activation_quant:
-                                            return gate_acc + d1 * (x_s * s1[None, :])
                                         return gate_acc + d1 * s1[None, :]
                                     gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
+                                if dynamic_activation_quant:
+                                    gate = gate * x_s
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                             return None
                         lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
@@ -1448,10 +1470,10 @@ def _fused_ep_moe_kernel(
                                         w3_tile = b_w3_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d3 = jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
                                         s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        if dynamic_activation_quant:
-                                            return up_acc + d3 * (x_s * s3[None, :])
                                         return up_acc + d3 * s3[None, :]
                                     up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
+                                if dynamic_activation_quant:
+                                    up = up * x_s
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
                         lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
@@ -1500,10 +1522,7 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, bf),
                                         ].reshape(bf)
-                                        if dynamic_activation_quant:
-                                            gate_acc += d1 * (x_s * s1[None, :])
-                                        else:
-                                            gate_acc += d1 * s1[None, :]
+                                        gate_acc += d1 * s1[None, :]
 
                                         d3 = jnp.dot(
                                             x_slice, w3_tile,
@@ -1516,15 +1535,15 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, bf),
                                         ].reshape(bf)
-                                        if dynamic_activation_quant:
-                                            up_acc += d3 * (x_s * s3[None, :])
-                                        else:
-                                            up_acc += d3 * s3[None, :]
+                                        up_acc += d3 * s3[None, :]
                                         return gate_acc, up_acc
 
                                     gate, up = lax.fori_loop(
                                         0, n_sg, _ffn1_sg_body, (gate, up), unroll=n_sg,
                                     )
+                                if dynamic_activation_quant:
+                                    gate = gate * x_s
+                                    up = up * x_s
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
@@ -2040,7 +2059,7 @@ def _fused_ep_moe_kernel(
         bt_sem_id = bt_bank_id(bt_id)
         for p_id in range(t_packing):
             pltpu.make_async_copy(
-                src_ref=scatter_src_hbm.at[
+                src_ref=tokens_hbm.at[
                     pl.ds(bt_start, bt), p_id, pl.ds(0, h_per_t)
                 ],
                 dst_ref=b_se_tokens_vmem.at[bt_sem_id, 0, pl.ds(0, bt), p_id, pl.ds(0, h_per_t)],
@@ -2096,80 +2115,6 @@ def _fused_ep_moe_kernel(
                 def _(se_ref=se_ref, partial=partial):
                     se_ref[...] = se_ref[...] + partial
 
-    # ===== In-kernel pre-quantization (DAQ) =====
-
-    def prequant_and_metadata(bt_id, metadata_fn):
-        """Fetch bf16 tokens, overlap allreduce via metadata_fn, quantize to fp8."""
-        if not dynamic_activation_quant:
-            metadata_fn()
-            return
-        input_t_packing = tokens_hbm.shape[1]
-        input_h_per_t = tokens_hbm.shape[2]
-        bt_start = bt_id * bt
-
-        def _scoped_body(bf16_staging, fp8_staging):
-            pltpu.make_async_copy(
-                src_ref=tokens_hbm.at[
-                    pl.ds(bt_start, bt),
-                    pl.ds(0, input_t_packing),
-                    pl.ds(0, input_h_per_t),
-                ],
-                dst_ref=bf16_staging,
-                sem=prequant_sem,
-            ).start()
-
-            metadata_fn()
-
-            pltpu.make_async_copy(
-                src_ref=bf16_staging,
-                dst_ref=bf16_staging,
-                sem=prequant_sem,
-            ).wait()
-
-            bf16_data = bf16_staging[...]
-            tokens_f32 = bf16_data.reshape(bt, hidden_size).astype(jnp.float32)
-            x_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
-            x_scale = jnp.maximum(x_amax / jnp.float32(FP8_E4M3_MAX),
-                                  jnp.float32(1e-12))
-            x_fp8_flat = (tokens_f32 / x_scale).astype(jnp.float8_e4m3fn)
-            scale_i32 = lax.bitcast_convert_type(
-                x_scale.squeeze(-1), jnp.int32,
-            )
-            b0 = lax.bitcast_convert_type(
-                (scale_i32 & jnp.int32(0xFF)).astype(jnp.int8),
-                jnp.float8_e4m3fn)
-            b1 = lax.bitcast_convert_type(
-                ((scale_i32 >> jnp.int32(8)) & jnp.int32(0xFF)).astype(jnp.int8),
-                jnp.float8_e4m3fn)
-            b2 = lax.bitcast_convert_type(
-                ((scale_i32 >> jnp.int32(16)) & jnp.int32(0xFF)).astype(jnp.int8),
-                jnp.float8_e4m3fn)
-            b3 = lax.bitcast_convert_type(
-                ((scale_i32 >> jnp.int32(24)) & jnp.int32(0xFF)).astype(jnp.int8),
-                jnp.float8_e4m3fn)
-            x_pre = x_fp8_flat[:, :h_per_t - 4]
-            x_post = x_fp8_flat[:, h_per_t:]
-            scale_fp8 = jnp.concatenate(
-                [b0[:, None], b1[:, None], b2[:, None], b3[:, None]], axis=1)
-            x_fp8_flat = jnp.concatenate([x_pre, scale_fp8, x_post], axis=1)
-            fp8_staging[...] = x_fp8_flat.reshape(bt, t_packing, h_per_t)
-            pltpu.make_async_copy(
-                src_ref=fp8_staging,
-                dst_ref=q_tokens_hbm.at[pl.ds(bt_start, bt)],
-                sem=prequant_sem,
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=q_tokens_hbm.at[pl.ds(bt_start, bt)],
-                dst_ref=q_tokens_hbm.at[pl.ds(bt_start, bt)],
-                sem=prequant_sem,
-            ).wait()
-
-        pl.run_scoped(
-            _scoped_body,
-            pltpu.VMEM((bt, input_t_packing, input_h_per_t), jnp.bfloat16),
-            pltpu.VMEM((bt, t_packing, h_per_t), jnp.float8_e4m3fn),
-        )
-
     # ===== run_bt =====
 
     if num_bt >= 1:
@@ -2205,13 +2150,11 @@ def _fused_ep_moe_kernel(
         if can_bt_scatter_overlap:
             @pl.when(jnp.logical_not(current_bt_scatter_prefetched))
             def _():
-                prequant_and_metadata(
-                    bt_id, lambda: prepare_bt_metadata(bt_id, bt_sem_id))
+                prepare_bt_metadata(bt_id, bt_sem_id)
                 if dynamic_activation_quant:
                     start_fetch_se_tokens(bt_id)
         else:
-            prequant_and_metadata(
-                bt_id, lambda: prepare_bt_metadata(bt_id, bt_sem_id))
+            prepare_bt_metadata(bt_id, bt_sem_id)
             if dynamic_activation_quant:
                 start_fetch_se_tokens(bt_id)
 
@@ -2239,9 +2182,7 @@ def _fused_ep_moe_kernel(
 
             @pl.when(next_bt_id < num_bt)
             def _():
-                prequant_and_metadata(
-                    next_bt_id,
-                    lambda: prepare_bt_metadata(next_bt_id, next_bt_sem_id))
+                prepare_bt_metadata(next_bt_id, next_bt_sem_id)
                 if dynamic_activation_quant:
                     start_fetch_se_tokens(next_bt_id)
                 start_a2a_scatter_batch(
@@ -2672,6 +2613,37 @@ def fused_ep_moe_v2(
     use_bt_banking = use_bt_scatter_bank or use_gather_bank
     num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
     smem_banks = num_bt if use_gather_bank else 2
+
+    padded_local = local_num_tokens + pad_local
+    if dynamic_activation_quant:
+        prequant_call = pl.pallas_call(
+            functools.partial(
+                _prequant_tokens_kernel,
+                hidden_size=hidden_size,
+                h_per_t=h_per_t,
+            ),
+            out_shape=jax.ShapeDtypeStruct(
+                (padded_local, t_packing, h_per_t), jnp.float8_e4m3fn,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                grid=(padded_local // bt,),
+                in_specs=[
+                    pl.BlockSpec(
+                        (bt, input_t_packing, input_h_per_t),
+                        lambda i: (i, 0, 0),
+                    ),
+                ],
+                out_specs=pl.BlockSpec(
+                    (bt, t_packing, h_per_t),
+                    lambda i: (i, 0, 0),
+                ),
+            ),
+            name="prequant-tokens",
+        )
+    else:
+        prequant_call = None
+
     use_ffn1_chunked_dequant = (
         ffn1_dequant_mode == "fchunk"
         and not direct_scaled_dot_ffn1
@@ -2801,10 +2773,6 @@ def fused_ep_moe_v2(
             pltpu.VMEM((2, t_packing, bse, h_per_t), w2.dtype)),            # se_w2
         (None if w1_shared is None else
             pltpu.VMEM((smem_banks, bt, hidden_size), jnp.float32)),                 # se_acc
-        # VMEM: pre-quantization staging (DAQ only)
-        None,  # prequant_staging (removed — now pl.run_scoped inside kernel)
-        (None if not dynamic_activation_quant else
-            pltpu.SemaphoreType.DMA),                                          # prequant_sem
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),                                      # x_stage
         pltpu.SemaphoreType.DMA((1,)),                                      # y_store
@@ -2912,7 +2880,6 @@ def fused_ep_moe_v2(
                     None if not needs_jax_allreduce else hbm_spec,          # metadata_starts
                     None if not needs_jax_allreduce else hbm_spec,          # metadata_sizes
                     None if not needs_jax_allreduce else hbm_spec,          # metadata_d2e_counts
-                    None if not dynamic_activation_quant else hbm_spec,    # q_tokens_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -2943,7 +2910,6 @@ def fused_ep_moe_v2(
             P(),                                  # a2a_s
             P(),                                  # a2a_s_acc
             P(),                                  # a2a_g
-            None if not dynamic_activation_quant else P(),  # q_tokens_hbm
             None if w1_shared is None else P(),   # w1_shared
             None if w3_shared is None else P(),   # w3_shared
             None if w2_shared is None else P(),   # w2_shared
@@ -2956,7 +2922,6 @@ def fused_ep_moe_v2(
         w1_scale_arg, w2_scale_arg, w3_scale_arg,
         topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
-        q_tokens_hbm_scratch,
         w1_shared=None, w3_shared=None, w2_shared=None,
     ):
         if pad_local > 0:
@@ -2981,6 +2946,9 @@ def fused_ep_moe_v2(
             md_starts_arg = None
             md_sizes_arg = None
             md_d2e_arg = None
+
+        if prequant_call is not None:
+            tokens = prequant_call(tokens)
 
         out = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
@@ -3007,8 +2975,6 @@ def fused_ep_moe_v2(
             md_starts_arg,
             md_sizes_arg,
             md_d2e_arg,
-            (None if q_tokens_hbm_scratch is None else
-                pltpu.with_memory_space_constraint(q_tokens_hbm_scratch, pltpu.HBM)),
         )
         if pad_local > 0:
             out = out[:orig_local_num_tokens]
@@ -3027,18 +2993,10 @@ def fused_ep_moe_v2(
         a2a_g_shape = (num_bt_banks,) + a2a_g_shape
     a2a_g_hbm_scratch = pl.empty(a2a_g_shape, out_dtype)
 
-    if dynamic_activation_quant:
-        q_tokens_hbm_scratch = pl.empty(
-            (local_num_tokens, t_packing, h_per_t), jnp.float8_e4m3fn,
-        )
-    else:
-        q_tokens_hbm_scratch = None
-
     return kernel(
         tokens, w1, w2, w3,
         w1_scale, w2_scale, w3_scale,
         topk_weights, topk_ids,
         a2a_s_hbm_scratch, a2a_s_acc_hbm_scratch, a2a_g_hbm_scratch,
-        q_tokens_hbm_scratch,
         w1_shared, w3_shared, w2_shared,
     )
