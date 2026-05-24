@@ -363,11 +363,10 @@ def build_eagle_tree_structure_pallas_call(
     ]
 
     tree_mask_dtype = jnp.int32
-    tree_mask_last_dim = 1
 
     out_shape = [
         # tree mask
-        jax.ShapeDtypeStruct(shape=(tree_mask_capacity, tree_mask_last_dim), dtype=tree_mask_dtype),
+        jax.ShapeDtypeStruct(shape=(tree_mask_capacity,), dtype=tree_mask_dtype),
         # positions
         jax.ShapeDtypeStruct(shape=(bs * draft_token_num,), dtype=jnp.int32),
         # retrive_index
@@ -398,12 +397,12 @@ def build_eagle_tree_structure_pallas_call(
     )
     (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling) = kernel(
         *scalar_prefetches,
-        jnp.zeros((tree_mask_capacity, tree_mask_last_dim), dtype=tree_mask_dtype),
-        jnp.ones((tree_mask_capacity, tree_mask_last_dim), dtype=tree_mask_dtype),
+        jnp.zeros((tree_mask_capacity,), dtype=tree_mask_dtype),
+        jnp.ones((tree_mask_capacity,), dtype=tree_mask_dtype),
     )
 
     return (
-        tree_mask.reshape(-1),
+        tree_mask,
         positions,
         retrive_index,
         retrive_next_token,
