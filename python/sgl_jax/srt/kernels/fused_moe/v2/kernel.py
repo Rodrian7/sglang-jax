@@ -334,6 +334,8 @@ def _fused_ep_moe_kernel(
     assert local_num_tokens % bt == 0
     num_bt = local_num_tokens // bt
     use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
+    use_gather_bank = interleave_bt and num_bt > 1
+    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
     use_bt_banking = use_bt_scatter_bank or use_gather_bank
     if use_bt_banking:
         expert_buffer_count = a2a_s_x2_hbm.shape[1]
@@ -378,8 +380,6 @@ def _fused_ep_moe_kernel(
         and expert_buffer_count >= local_num_experts
         and not disable_a2a
     )
-    use_gather_bank = interleave_bt and num_bt > 1
-    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
 
     se_inter_size = 0
     se_total_blocks = 0
