@@ -312,8 +312,6 @@ def _fused_ep_moe_kernel(
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
     enable_bt_scatter_overlap: bool = True,
-    skip_inter_bt_sync: bool = True,
-    interleave_bt: bool = True,
     decode_mode: bool = False,
     direct_scaled_dot: bool = False,
     bt: int,
@@ -335,10 +333,7 @@ def _fused_ep_moe_kernel(
     assert local_num_tokens % bt == 0
     num_bt = local_num_tokens // bt
     use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
-    use_gather_bank = interleave_bt and num_bt > 1
-    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
-    use_bt_banking = use_bt_scatter_bank or use_gather_bank
-    if use_bt_banking:
+    if use_bt_scatter_bank:
         expert_buffer_count = a2a_s_x2_hbm.shape[1]
         a2a_max_tokens = a2a_s_x2_hbm.shape[2]
     else:
@@ -346,10 +341,7 @@ def _fused_ep_moe_kernel(
         a2a_max_tokens = a2a_s_x2_hbm.shape[1]
     assert expert_buffer_count >= 1
     assert expert_buffer_count <= local_num_experts
-    if use_gather_bank:
-        num_experts = a2a_g_hbm.shape[1]
-    else:
-        num_experts = a2a_g_hbm.shape[0]
+    num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
     padded_top_k = t2e_routing_x2_smem.shape[-1]
     assert padded_num_experts == align_to(num_experts, 128)
@@ -393,57 +385,35 @@ def _fused_ep_moe_kernel(
         return (ep_rank // tp_size, ep_rank % tp_size)
 
     def a2a_bank_for_bt(bt_id):
-        if use_gather_bank:
-            return bt_id
         return bt_id & jnp.int32(1)
-
-    def bt_bank_id(bt_id):
-        if use_gather_bank:
-            return bt_id
-        return bt_id & jnp.int32(1)
-
-    def a2a_g_ref(gather_bank_id, e_id, start, size):
-        if use_gather_bank:
-            return a2a_g_hbm.at[gather_bank_id, e_id, pl.ds(start, size)]
-        return a2a_g_hbm.at[e_id, pl.ds(start, size)]
-
-    def gather_send_sem_ref(gather_bank_id, e_sem_id):
-        if use_gather_bank:
-            return gather_send_x2_sems.at[gather_bank_id, e_sem_id]
-        return gather_send_x2_sems.at[e_sem_id]
-
-    def a2a_gather_sem_ref(gather_bank_id):
-        if use_gather_bank:
-            return a2a_gather_sem.at[gather_bank_id]
-        return a2a_gather_sem
 
     def a2a_s_ref(a2a_bank_id, e_sem_id, start, size):
-        if use_bt_banking:
+        if use_bt_scatter_bank:
             return a2a_s_x2_hbm.at[a2a_bank_id, e_sem_id, pl.ds(start, size)]
         return a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, size)]
 
     def a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, size):
-        if use_bt_banking:
+        if use_bt_scatter_bank:
             return a2a_s_acc_x2_hbm.at[a2a_bank_id, e_sem_id, pl.ds(start, size)]
         return a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(start, size)]
 
     def scatter_send_sem(a2a_bank_id, e_sem_id):
-        if use_bt_banking:
+        if use_bt_scatter_bank:
             return send_x2_sems.at[a2a_bank_id, e_sem_id]
         return send_x2_sems.at[e_sem_id]
 
     def scatter_recv_sem(a2a_bank_id, e_sem_id):
-        if use_bt_banking:
+        if use_bt_scatter_bank:
             return recv_x2_sems.at[a2a_bank_id, e_sem_id]
         return recv_x2_sems.at[e_sem_id]
 
     def scatter_sends_get(a2a_bank_id, e_sem_id):
-        if use_bt_banking:
+        if use_bt_scatter_bank:
             return a2a_s_sends_x2_smem[a2a_bank_id, e_sem_id]
         return a2a_s_sends_x2_smem[e_sem_id]
 
     def scatter_sends_set(a2a_bank_id, e_sem_id, value):
-        if use_bt_banking:
+        if use_bt_scatter_bank:
             a2a_s_sends_x2_smem[a2a_bank_id, e_sem_id] = value
         else:
             a2a_s_sends_x2_smem[e_sem_id] = value
@@ -896,7 +866,7 @@ def _fused_ep_moe_kernel(
 
     # ===== A2A gather (static for loop, prefix sum, dst position 0) =====
 
-    def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id, gather_bank_id):
+    def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id):
         if disable_a2a:
             return
         my_e_id = my_id * local_num_experts + local_e_id
@@ -916,8 +886,8 @@ def _fused_ep_moe_kernel(
             ):
                 pltpu.make_async_copy(
                     src_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, local_sz),
-                    dst_ref=a2a_g_ref(gather_bank_id, my_e_id, 0, local_sz),
-                    sem=a2a_gather_sem_ref(gather_bank_id),
+                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                    sem=a2a_gather_sem,
                 ).start()
 
             @pl.when(remote_sz != 0)
@@ -930,16 +900,16 @@ def _fused_ep_moe_kernel(
             ):
                 pltpu.make_async_remote_copy(
                     src_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, remote_sz),
-                    dst_ref=a2a_g_ref(gather_bank_id, my_e_id, 0, remote_sz),
-                    send_sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
-                    recv_sem=a2a_gather_sem_ref(gather_bank_id),
+                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                    send_sem=gather_send_x2_sems.at[e_sem_id],
+                    recv_sem=a2a_gather_sem,
                     device_id=get_mesh_device_id(recv_id),
                     device_id_type=pltpu.DeviceIdType.MESH,
                 ).start()
 
             start += sz
 
-    def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id, gather_bank_id):
+    def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id):
         if disable_a2a or num_devices <= 1:
             return
         my_e_id = my_id * local_num_experts + local_e_id
@@ -953,10 +923,10 @@ def _fused_ep_moe_kernel(
         def _():
             ref = a2a_s_acc_ref(a2a_bank_id, e_sem_id, 0, remote_sz)
             pltpu.make_async_copy(
-                src_ref=ref, dst_ref=ref, sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
+                src_ref=ref, dst_ref=ref, sem=gather_send_x2_sems.at[e_sem_id],
             ).wait()
 
-    def wait_a2a_gather_recv_all(*, bt_sem_id, gather_bank_id):
+    def wait_a2a_gather_recv_all(*, bt_sem_id):
         if disable_a2a:
             return
 
@@ -965,9 +935,9 @@ def _fused_ep_moe_kernel(
 
             @pl.when(sz != 0)
             def _():
-                ref = a2a_g_ref(gather_bank_id, e_id, 0, sz)
+                ref = a2a_g_hbm.at[e_id, pl.ds(0, sz)]
                 pltpu.make_async_copy(
-                    src_ref=ref, dst_ref=ref, sem=a2a_gather_sem_ref(gather_bank_id),
+                    src_ref=ref, dst_ref=ref, sem=a2a_gather_sem,
                 ).wait()
             return None
 
@@ -1163,7 +1133,7 @@ def _fused_ep_moe_kernel(
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id, gather_bank_id):
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id):
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         has_tokens = dyn_sz > 0
@@ -1176,7 +1146,6 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id,
                     local_e_id=local_e_id - expert_buffer_count,
                     a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
                 )
             return start_prefetch_expert_bf0(bt_sem_id, local_e_id + jnp.int32(1))
 
@@ -1480,7 +1449,7 @@ def _fused_ep_moe_kernel(
 
     # ===== Output accumulation =====
 
-    def acc_and_store_output(*, bt_sem_id, out_buf_id, gather_bank_id):
+    def acc_and_store_output(*, bt_sem_id, out_buf_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
         assert bt % acc_bt == 0
         num_acc_tiles = bt // acc_bt
@@ -1498,7 +1467,7 @@ def _fused_ep_moe_kernel(
                         offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
                         expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                         pltpu.make_async_copy(
-                            src_ref=a2a_g_ref(gather_bank_id, e_id, offset, 1),
+                            src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
                             dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
                             sem=a2a_acc_sems.at[0],
                         ).start()
@@ -1571,7 +1540,7 @@ def _fused_ep_moe_kernel(
     # ===== Output DMA =====
 
     def start_send_bo(*, bt_id, priority=0):
-        bt_sem_id = bt_bank_id(bt_id)
+        bt_sem_id = bt_id & jnp.int32(1)
         bt_start = bt_id * bt
         pltpu.make_async_copy(
             src_ref=b_output_x2_vmem.at[bt_sem_id],
@@ -1581,7 +1550,7 @@ def _fused_ep_moe_kernel(
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-        bt_sem_id = bt_bank_id(bt_id)
+        bt_sem_id = bt_id & 1
 
         @pl.when(is_valid)
         def _():
@@ -1662,13 +1631,12 @@ def _fused_ep_moe_kernel(
         start_fetch_topk(bt_id=jnp.int32(0))
         start_fetch_se_tokens(bt_id=jnp.int32(0))
 
-    def run_bt(bt_id, e_sem_id, *, skip_post_gather=False):
+    def run_bt(bt_id, e_sem_id):
         bt_start = bt_id * bt
-        bt_sem_id = bt_bank_id(bt_id)
+        bt_sem_id = bt_id & jnp.int32(1)
         next_bt_id = bt_id + jnp.int32(1)
-        out_buf_id = bt_bank_id(bt_id)
+        out_buf_id = bt_id & jnp.int32(1)
         a2a_bank_id = a2a_bank_for_bt(bt_id)
-        gather_bank_id = bt_id
 
         @pl.when(next_bt_id < num_bt)
         def _():
@@ -1693,17 +1661,14 @@ def _fused_ep_moe_kernel(
         else:
             prepare_bt_metadata(bt_id, bt_sem_id)
 
-        t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
-
-        if not skip_post_gather:
-            wait_store_output(bt_id=bt_id - 2)
+        wait_store_output(bt_id=bt_id - 2)
 
         se_per_expert = (
             max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
         )
         se_before = se_per_expert // 2
         se_after = se_per_expert - se_before
-        next_bt_sem_id = bt_bank_id(next_bt_id)
+        next_bt_sem_id = next_bt_id & jnp.int32(1)
         next_bt_start = next_bt_id * bt
         next_a2a_bank_id = a2a_bank_for_bt(next_bt_id)
 
@@ -1747,12 +1712,11 @@ def _fused_ep_moe_kernel(
                 )
                 next_bf0_prefetched = expert_ffn(
                     bt_sem_id, e_sem_id_local, local_e_id,
-                    bf0_prefetched, a2a_bank_id, gather_bank_id,
+                    bf0_prefetched, a2a_bank_id,
                 )
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
                     local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
                 )
 
                 for _ in range(se_after):
@@ -1772,35 +1736,24 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
-            if not skip_post_gather:
-                wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
+            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
+            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            sync_barrier()
 
-            if not skip_post_gather:
-                wait_a2a_gather_recv_all(
-                    bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
+            if not disable_acc_and_store:
+                acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            start_send_bo(bt_id=bt_id)
+
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_e_id in range(tail_start, local_num_experts):
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id, e_sem_id=tail_e_id,
+                    local_e_id=tail_e_id, a2a_bank_id=a2a_bank_id,
                 )
 
-                if not disable_acc_and_store:
-                    acc_and_store_output(
-                        bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
-                        gather_bank_id=gather_bank_id,
-                    )
-                start_send_bo(bt_id=bt_id)
-
-                tail_start = max(local_num_experts - expert_buffer_count, 0)
-                for tail_e_id in range(tail_start, local_num_experts):
-                    wait_a2a_gather_send(
-                        bt_sem_id=bt_sem_id, e_sem_id=tail_e_id,
-                        local_e_id=tail_e_id, a2a_bank_id=a2a_bank_id,
-                        gather_bank_id=gather_bank_id,
-                    )
-
-                if skip_inter_bt_sync:
-                    pass
-                else:
-                    @pl.when(bt_id + 1 < num_bt)
-                    def _():
-                        sync_barrier()
+            @pl.when(bt_id + 1 < num_bt)
+            def _():
+                sync_barrier()
 
             final_e_sem_id = e_sem_id
 
@@ -1843,12 +1796,11 @@ def _fused_ep_moe_kernel(
                 )
                 next_bf0_prefetched = expert_ffn(
                     bt_sem_id, curr_e_sem_id, local_e_id,
-                    bf0_prefetched, a2a_bank_id, gather_bank_id,
+                    bf0_prefetched, a2a_bank_id,
                 )
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id,
                     local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
                 )
 
                 for _ in range(se_after):
@@ -1872,33 +1824,24 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
-            if not skip_post_gather:
-                wait_a2a_gather_recv_all(
-                    bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
+            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            sync_barrier()
+
+            if not disable_acc_and_store:
+                acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            start_send_bo(bt_id=bt_id)
+
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_e_id in range(tail_start, local_num_experts):
+                tail_sem = (e_sem_id + tail_e_id) % expert_buffer_count
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id, e_sem_id=tail_sem,
+                    local_e_id=tail_e_id, a2a_bank_id=a2a_bank_id,
                 )
 
-                if not disable_acc_and_store:
-                    acc_and_store_output(
-                        bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
-                        gather_bank_id=gather_bank_id,
-                    )
-                start_send_bo(bt_id=bt_id)
-
-                tail_start = max(local_num_experts - expert_buffer_count, 0)
-                for tail_e_id in range(tail_start, local_num_experts):
-                    tail_sem = (e_sem_id + tail_e_id) % expert_buffer_count
-                    wait_a2a_gather_send(
-                        bt_sem_id=bt_sem_id, e_sem_id=tail_sem,
-                        local_e_id=tail_e_id, a2a_bank_id=a2a_bank_id,
-                        gather_bank_id=gather_bank_id,
-                    )
-
-                if skip_inter_bt_sync:
-                    pass
-                else:
-                    @pl.when(bt_id + 1 < num_bt)
-                    def _():
-                        sync_barrier()
+            @pl.when(bt_id + 1 < num_bt)
+            def _():
+                sync_barrier()
 
             final_e_sem_id = final_e_sem_id
 
@@ -1907,45 +1850,9 @@ def _fused_ep_moe_kernel(
     # ===== Kernel start =====
     sync_barrier()
 
-    if use_gather_bank:
-        def _run_bt_expert_only(bt_id, e_sem_id):
-            return run_bt(bt_id, e_sem_id, skip_post_gather=True)
-
-        lax.fori_loop(0, num_bt, _run_bt_expert_only, jnp.int32(0), unroll=False)
-
-        def _run_bt_post_gather(bt_id, _):
-            bt_sem_id = bt_bank_id(bt_id)
-            gather_bank_id = bt_id
-            a2a_bank_id = a2a_bank_for_bt(bt_id)
-            out_buf_id = bt_bank_id(bt_id)
-
-            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
-            wait_a2a_gather_recv_all(
-                bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
-            )
-            acc_and_store_output(
-                bt_sem_id=bt_sem_id, out_buf_id=out_buf_id,
-                gather_bank_id=gather_bank_id,
-            )
-            start_send_bo(bt_id=bt_id)
-
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
-            for tail_e_id in range(tail_start, local_num_experts):
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id, e_sem_id=tail_e_id,
-                    local_e_id=tail_e_id, a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
-                )
-            return None
-
-        lax.fori_loop(0, num_bt, _run_bt_post_gather, None, unroll=False)
-
-        for _bt_i in range(num_bt):
-            wait_store_output(bt_id=jnp.int32(_bt_i))
-    else:
-        lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
-        wait_store_output(bt_id=jnp.int32(num_bt - 2))
-        wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
+    wait_store_output(bt_id=jnp.int32(num_bt - 2))
+    wait_store_output(bt_id=jnp.int32(num_bt - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -2004,8 +1911,6 @@ def jax_allreduce_metadata_by_bt(
         "disable_weight_load", "disable_dynamic_ffn1", "disable_dynamic_ffn2",
         "disable_acc_and_store",
         "use_jax_allreduce_metadata", "enable_bt_scatter_overlap",
-        "skip_inter_bt_sync",
-        "interleave_bt",
         "block_config", "dp_axis_name", "tp_axis_name",
         "quant_block_k", "decode_mode", "direct_scaled_dot",
     ],
@@ -2030,8 +1935,6 @@ def fused_ep_moe_v2(
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
     enable_bt_scatter_overlap: bool = True,
-    skip_inter_bt_sync: bool = True,
-    interleave_bt: bool = True,
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
     w3_shared: jax.Array | None = None,
@@ -2138,9 +2041,6 @@ def fused_ep_moe_v2(
     wb_slots = 1 if decode_mode else 2
     num_bt = local_num_tokens // bt
     use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
-    use_gather_bank = interleave_bt and num_bt > 1
-    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
-    smem_banks = num_bt if use_gather_bank else 2
     use_w1_dequant_scratch = w1_scale is not None and not direct_scaled_dot
     use_w3_dequant_scratch = w3_scale is not None and not direct_scaled_dot
     use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot
@@ -2150,30 +2050,28 @@ def fused_ep_moe_v2(
         scope_name += "-direct_scaled_dot"
     if use_bt_scatter_bank:
         scope_name += "-bt_scatter_overlap"
-    if use_gather_bank:
-        scope_name += "-interleave_bt"
     if w1_shared is not None:
         scope_name += f"-se_bse_{bse}"
 
     scratch_shapes = (
         # SMEM: routing/metadata
-        pltpu.SMEM((smem_banks, bt, padded_top_k), jnp.int32),                      # t2e_routing
-        pltpu.SMEM((smem_banks, num_devices, 1, padded_num_experts), jnp.int32),     # d2e_count
-        pltpu.SMEM((smem_banks, 2, padded_num_experts), jnp.int32),                  # expert_offsets
-        pltpu.SMEM((smem_banks, 1, padded_num_experts), jnp.int32),                  # expert_starts
-        pltpu.SMEM((smem_banks, 1, padded_num_experts), jnp.int32),                  # expert_sizes
+        pltpu.SMEM((2, bt, padded_top_k), jnp.int32),                      # t2e_routing
+        pltpu.SMEM((2, num_devices, 1, padded_num_experts), jnp.int32),     # d2e_count
+        pltpu.SMEM((2, 2, padded_num_experts), jnp.int32),                  # expert_offsets
+        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),                  # expert_starts
+        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),                  # expert_sizes
         (
-            pltpu.SMEM((num_bt_banks, expert_buffer_count), jnp.int32)
-            if (use_bt_scatter_bank or use_gather_bank) else
+            pltpu.SMEM((2, expert_buffer_count), jnp.int32)
+            if use_bt_scatter_bank else
             pltpu.SMEM((expert_buffer_count,), jnp.int32)
         ),                                                                  # a2a_s_sends
         # VMEM: gather accumulation
         pltpu.VMEM((2, top_k, acc_bt, t_packing, h_per_t), t_dtype),       # a2a_g_acc
         # VMEM: topk
-        pltpu.VMEM((smem_banks, bt, padded_top_k), jnp.float32),                    # topk_weights
-        pltpu.VMEM((smem_banks, bt, padded_top_k), jnp.int32),                      # topk_ids
+        pltpu.VMEM((2, bt, padded_top_k), jnp.float32),                    # topk_weights
+        pltpu.VMEM((2, bt, padded_top_k), jnp.int32),                      # topk_ids
         # VMEM: output double buffer
-        pltpu.VMEM((smem_banks, bt, hidden_size), t_dtype),                          # output
+        pltpu.VMEM((2, bt, hidden_size), t_dtype),                          # output
         # VMEM: weight double buffers
         pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w1.dtype),                 # W1
         pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w3.dtype),                 # W3
@@ -2203,7 +2101,7 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, t_packing, h_per_t), t_dtype),                    # y_stage
         # VMEM: shared expert
         (None if w1_shared is None else
-            pltpu.VMEM((smem_banks, 2, bt, t_packing, h_per_t), t_dtype)),           # se_tokens
+            pltpu.VMEM((2, 2, bt, t_packing, h_per_t), t_dtype)),           # se_tokens
         (None if w1_shared is None else
             pltpu.VMEM((2, t_packing, h_per_t, bse), w1.dtype)),            # se_w1
         (None if w3_shared is None else
@@ -2211,31 +2109,23 @@ def fused_ep_moe_v2(
         (None if w2_shared is None else
             pltpu.VMEM((2, t_packing, bse, h_per_t), w2.dtype)),            # se_w2
         (None if w1_shared is None else
-            pltpu.VMEM((smem_banks, bt, hidden_size), jnp.float32)),                 # se_acc
+            pltpu.VMEM((2, bt, hidden_size), jnp.float32)),                 # se_acc
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),                                      # x_stage
         pltpu.SemaphoreType.DMA((1,)),                                      # y_store
-        pltpu.SemaphoreType.DMA((smem_banks, 10)),                                   # local_sems
+        pltpu.SemaphoreType.DMA((2, 10)),                                   # local_sems
         (
-            pltpu.SemaphoreType.DMA((num_bt_banks, expert_buffer_count))
-            if (use_bt_scatter_bank or use_gather_bank) else
+            pltpu.SemaphoreType.DMA((2, expert_buffer_count))
+            if use_bt_scatter_bank else
             pltpu.SemaphoreType.DMA((expert_buffer_count,))
         ),                                                                  # send
         (
-            pltpu.SemaphoreType.DMA((num_bt_banks, expert_buffer_count))
-            if (use_bt_scatter_bank or use_gather_bank) else
+            pltpu.SemaphoreType.DMA((2, expert_buffer_count))
+            if use_bt_scatter_bank else
             pltpu.SemaphoreType.DMA((expert_buffer_count,))
         ),                                                                  # recv
-        (
-            pltpu.SemaphoreType.DMA((num_bt_banks, expert_buffer_count))
-            if use_gather_bank else
-            pltpu.SemaphoreType.DMA((expert_buffer_count,))
-        ),                                                                  # gather_send
-        (
-            pltpu.SemaphoreType.DMA((num_bt_banks,))
-            if use_gather_bank else
-            pltpu.SemaphoreType.DMA
-        ),                                                                  # a2a_gather
+        pltpu.SemaphoreType.DMA((expert_buffer_count,)),                    # gather_send
+        pltpu.SemaphoreType.DMA,                                            # a2a_gather
         pltpu.SemaphoreType.DMA((1,)),                                      # a2a_acc
         pltpu.SemaphoreType.DMA,                                            # md_send
         pltpu.SemaphoreType.DMA,                                            # md_recv
@@ -2259,8 +2149,6 @@ def fused_ep_moe_v2(
                 disable_acc_and_store=disable_acc_and_store,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
-                skip_inter_bt_sync=skip_inter_bt_sync,
-                interleave_bt=use_gather_bank,
                 decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
@@ -2387,16 +2275,13 @@ def fused_ep_moe_v2(
         return out
 
     a2a_s_shape = (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t)
-    if use_gather_bank:
-        a2a_s_shape = (num_bt_banks,) + a2a_s_shape
-    elif use_bt_scatter_bank:
+    if use_bt_scatter_bank:
         a2a_s_shape = (2,) + a2a_s_shape
     a2a_s_hbm_scratch = pl.empty(a2a_s_shape, t_dtype)
     a2a_s_acc_hbm_scratch = pl.empty(a2a_s_shape, t_dtype)
-    a2a_g_shape = (num_experts, bt, t_packing, h_per_t)
-    if use_gather_bank:
-        a2a_g_shape = (num_bt_banks,) + a2a_g_shape
-    a2a_g_hbm_scratch = pl.empty(a2a_g_shape, t_dtype)
+    a2a_g_hbm_scratch = pl.empty(
+        (num_experts, bt, t_packing, h_per_t), t_dtype,
+    )
 
     return kernel(
         tokens, w1, w2, w3,
