@@ -425,6 +425,13 @@ def build_tree_kernel_efficient(
         parent_np, index_np, seq_np, num_verify_tokens, topk
     )
 
+    d = num_verify_tokens
+    tree_mask_capacity = max_seq_len_per_req * d * batch_size + d * d * batch_size
+    if len(tree_mask_np) < tree_mask_capacity:
+        tree_mask_np = np.pad(
+            tree_mask_np, (0, tree_mask_capacity - len(tree_mask_np)), constant_values=0
+        )
+
     rep = NamedSharding(mesh, P())
     tree_mask = jax.device_put(jnp.asarray(tree_mask_np, dtype=jnp.int32), rep)
     positions = jax.device_put(jnp.asarray(pos_np, dtype=jnp.int32), rep)
