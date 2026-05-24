@@ -262,8 +262,8 @@ def get_vmem_estimate_bytes(
     )
 
     if use_custom_mask:
-        # bkvmask_double_buf: (2, bq_sz, bkv_sz, head_dim) in int32
-        total_bits += 2 * bq_sz * bkv_sz * head_dim * 32
+        # bkvmask_double_buf: (2, bq_sz, bkv_sz, 1) in int32
+        total_bits += 2 * bq_sz * bkv_sz * 1 * 32
 
     # Attention compute intermediates (f32). The for-loop over kv_heads is
     # statically unrolled by the compiler, so all heads' intermediates coexist
@@ -1750,7 +1750,7 @@ def ragged_paged_attention(
     if custom_mask is not None:
         if custom_mask.dtype == jnp.bool_:
             custom_mask = custom_mask.astype(jnp.int32)
-        custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
+        custom_mask = jnp.expand_dims(custom_mask, axis=1)
 
         # Prepare cu_seq_mask_lens for custom mask.
         q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -1818,7 +1818,7 @@ def ragged_paged_attention(
             bkvmask_double_buf = None
         else:
             bkvmask_double_buf = pltpu.VMEM(
-                (2, bq_sz, bkv_sz, head_dim),
+                (2, bq_sz, bkv_sz, 1),
                 jnp.int32,
             )
 
@@ -1913,7 +1913,7 @@ def ragged_paged_attention(
             name=scope_name,
         )
 
-        zero_mask = jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32)
+        zero_mask = jnp.zeros((bkv_sz, 1), dtype=jnp.int32)
 
         if tpu_version >= 7:
 

@@ -363,8 +363,7 @@ def build_eagle_tree_structure_pallas_call(
     ]
 
     tree_mask_dtype = jnp.int32
-    # expand an extra dim of 128 at the last dim
-    tree_mask_last_dim = 128
+    tree_mask_last_dim = 1
 
     out_shape = [
         # tree mask
@@ -404,7 +403,7 @@ def build_eagle_tree_structure_pallas_call(
     )
 
     return (
-        tree_mask[:, 0].reshape(-1),
+        tree_mask.reshape(-1),
         positions,
         retrive_index,
         retrive_next_token,
