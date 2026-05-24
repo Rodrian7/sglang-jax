@@ -312,6 +312,7 @@ def _fused_ep_moe_kernel(
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
     enable_bt_scatter_overlap: bool = True,
+    skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     decode_mode: bool = False,
     direct_scaled_dot: bool = False,
@@ -1692,14 +1693,17 @@ def _fused_ep_moe_kernel(
         else:
             prepare_bt_metadata(bt_id, bt_sem_id)
 
-        wait_store_output(bt_id=bt_id - 2)
+        t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
+
+        if not skip_post_gather:
+            wait_store_output(bt_id=bt_id - 2)
 
         se_per_expert = (
             max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
         )
         se_before = se_per_expert // 2
         se_after = se_per_expert - se_before
-        next_bt_sem_id = next_bt_id & jnp.int32(1)
+        next_bt_sem_id = bt_bank_id(next_bt_id)
         next_bt_start = next_bt_id * bt
         next_a2a_bank_id = a2a_bank_for_bt(next_bt_id)
 
@@ -1770,10 +1774,11 @@ def _fused_ep_moe_kernel(
 
             if not skip_post_gather:
                 wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
+
+            if not skip_post_gather:
                 wait_a2a_gather_recv_all(
                     bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
                 )
-                sync_barrier()
 
                 if not disable_acc_and_store:
                     acc_and_store_output(
@@ -1790,9 +1795,12 @@ def _fused_ep_moe_kernel(
                         gather_bank_id=gather_bank_id,
                     )
 
-                @pl.when(bt_id + 1 < num_bt)
-                def _():
-                    sync_barrier()
+                if skip_inter_bt_sync:
+                    pass
+                else:
+                    @pl.when(bt_id + 1 < num_bt)
+                    def _():
+                        sync_barrier()
 
             final_e_sem_id = e_sem_id
 
@@ -1868,7 +1876,6 @@ def _fused_ep_moe_kernel(
                 wait_a2a_gather_recv_all(
                     bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
                 )
-                sync_barrier()
 
                 if not disable_acc_and_store:
                     acc_and_store_output(
@@ -1886,9 +1893,12 @@ def _fused_ep_moe_kernel(
                         gather_bank_id=gather_bank_id,
                     )
 
-                @pl.when(bt_id + 1 < num_bt)
-                def _():
-                    sync_barrier()
+                if skip_inter_bt_sync:
+                    pass
+                else:
+                    @pl.when(bt_id + 1 < num_bt)
+                    def _():
+                        sync_barrier()
 
             final_e_sem_id = final_e_sem_id
 
@@ -1994,6 +2004,8 @@ def jax_allreduce_metadata_by_bt(
         "disable_weight_load", "disable_dynamic_ffn1", "disable_dynamic_ffn2",
         "disable_acc_and_store",
         "use_jax_allreduce_metadata", "enable_bt_scatter_overlap",
+        "skip_inter_bt_sync",
+        "interleave_bt",
         "block_config", "dp_axis_name", "tp_axis_name",
         "quant_block_k", "decode_mode", "direct_scaled_dot",
     ],
@@ -2018,6 +2030,7 @@ def fused_ep_moe_v2(
     disable_acc_and_store: bool = False,
     use_jax_allreduce_metadata: bool = True,
     enable_bt_scatter_overlap: bool = True,
+    skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
@@ -2246,6 +2259,7 @@ def fused_ep_moe_v2(
                 disable_acc_and_store=disable_acc_and_store,
                 use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
+                skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=use_gather_bank,
                 decode_mode=decode_mode,
                 direct_scaled_dot=direct_scaled_dot,
