@@ -1162,7 +1162,7 @@ def _fused_ep_moe_kernel(
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id):
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id, gather_bank_id):
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         has_tokens = dyn_sz > 0
@@ -1175,6 +1175,7 @@ def _fused_ep_moe_kernel(
                     e_sem_id=e_sem_id,
                     local_e_id=local_e_id - expert_buffer_count,
                     a2a_bank_id=a2a_bank_id,
+                    gather_bank_id=gather_bank_id,
                 )
             return start_prefetch_expert_bf0(bt_sem_id, local_e_id + jnp.int32(1))
 
@@ -1742,7 +1743,7 @@ def _fused_ep_moe_kernel(
                 )
                 next_bf0_prefetched = expert_ffn(
                     bt_sem_id, e_sem_id_local, local_e_id,
-                    bf0_prefetched, a2a_bank_id,
+                    bf0_prefetched, a2a_bank_id, gather_bank_id,
                 )
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
@@ -1834,7 +1835,7 @@ def _fused_ep_moe_kernel(
                 )
                 next_bf0_prefetched = expert_ffn(
                     bt_sem_id, curr_e_sem_id, local_e_id,
-                    bf0_prefetched, a2a_bank_id,
+                    bf0_prefetched, a2a_bank_id, gather_bank_id,
                 )
                 start_a2a_gather(
                     bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id,
