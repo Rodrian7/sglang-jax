@@ -639,7 +639,7 @@ def generate_tune_candidates(
     enable_bt_scatter_overlap=True,
     vmem_budget=64 * 1024 * 1024,
     vmem_headroom=0.95,
-    max_configs=16,
+    max_configs=48,
     bse=256,
     verbose=False,
 ):
