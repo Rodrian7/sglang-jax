@@ -22,9 +22,6 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
-from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
-    build_eagle_tree_structure,
-)
 from sgl_jax.srt.kernels.speculative.kernel import (
     create_extend_after_decode_spec_info,
     top_k_renorm_prob,
@@ -296,6 +293,85 @@ def build_tree_mask_for_draft_decode(
     return jnp.asarray(concatenated, dtype=jnp.int32)
 
 
+def _build_tree_structure_numpy(
+    parent_list: np.ndarray,
+    selected_index: np.ndarray,
+    seq_lens: np.ndarray,
+    draft_token_num: int,
+    topk: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Host-side tree structure computation replacing the Pallas kernel.
+
+    Produces the same outputs as build_eagle_tree_structure but runs on CPU,
+    avoiding Pallas scratch memory allocation that OOMs at large batch sizes.
+    """
+    bs = parent_list.shape[0]
+    mask_entries = []
+    offset = 0
+    positions = np.zeros(bs * draft_token_num, dtype=np.int32)
+    retrive_index = np.full((bs, draft_token_num), -1, dtype=np.int32)
+    retrive_next_token = np.full((bs, draft_token_num), -1, dtype=np.int32)
+    retrive_next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int32)
+
+    for bid in range(bs):
+        sl = int(seq_lens[bid])
+        kv_len = sl + draft_token_num
+        mask = np.ones((draft_token_num, kv_len), dtype=np.int32)
+
+        for tid in range(draft_token_num):
+            global_idx = bid * draft_token_num + tid
+            if tid == 0:
+                positions[global_idx] = sl
+                retrive_index[bid, tid] = global_idx
+                for i in range(draft_token_num - 1, 0, -1):
+                    retrive_index[bid, i] = bid * draft_token_num + i
+                    parent_tb_idx = int(selected_index[bid, i - 1]) // topk
+                    if parent_tb_idx > 0:
+                        token_idx = int(parent_list[bid, parent_tb_idx])
+                        parent_pos = 0
+                        for j in range(draft_token_num - 1):
+                            if int(selected_index[bid, j]) == token_idx:
+                                parent_pos = j + 1
+                                break
+                    else:
+                        parent_pos = 0
+                    if parent_pos < draft_token_num:
+                        if retrive_next_token[bid, parent_pos] == -1:
+                            retrive_next_token[bid, parent_pos] = i
+                        else:
+                            retrive_next_sibling[bid, i] = retrive_next_token[bid, parent_pos]
+                            retrive_next_token[bid, parent_pos] = i
+                retrive_index[bid, 0] = bid * draft_token_num
+            else:
+                mask[tid, sl + 1 : sl + draft_token_num] = 0
+                mask[tid, sl] = 1
+                cur_pos = tid - 1
+                position = 0
+                while True:
+                    position += 1
+                    if cur_pos < draft_token_num - 1:
+                        mask[tid, sl + 1 + cur_pos] = 1
+                    parent_tb_idx = int(selected_index[bid, cur_pos]) // topk
+                    if parent_tb_idx == 0:
+                        break
+                    token_idx = int(parent_list[bid, parent_tb_idx])
+                    found = False
+                    for j in range(draft_token_num - 1):
+                        if int(selected_index[bid, j]) == token_idx:
+                            cur_pos = j
+                            found = True
+                            break
+                    if not found:
+                        break
+                positions[global_idx] = position + sl
+
+        mask_entries.append(mask.flatten())
+        offset += draft_token_num * kv_len
+
+    tree_mask = np.concatenate(mask_entries)
+    return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: jax.Array,
@@ -341,30 +417,20 @@ def build_tree_kernel_efficient(
         speculative_num_steps,
     )
 
-    # Get batch size
-    # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-    # on jax >=0.7.1, we need to use set_mesh.
-    try:
-        ctx = jax.sharding.use_mesh(mesh)
-    except AttributeError:
-        try:
-            ctx = jax.set_mesh(mesh)
-        except AttributeError:
-            ctx = mesh
-    with ctx:
+    parent_np = np.array(jax.device_get(parent_list))
+    index_np = np.array(jax.device_get(top_scores_index))
+    seq_np = np.array(jax.device_get(seq_lens))
 
-        tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
-            build_eagle_tree_structure(
-                parent_list=parent_list,
-                selected_index=top_scores_index,
-                verified_seq_len=seq_lens,
-                draft_token_num=num_verify_tokens,
-                topk=topk,
-                seq_lens_sum=seq_lens_sum,
-                max_context_len=max_seq_len_per_req,
-                tree_mask_mode=0,  # FULL_MASK
-            )
-        )
+    tree_mask_np, pos_np, ret_idx, ret_next, ret_sib = _build_tree_structure_numpy(
+        parent_np, index_np, seq_np, num_verify_tokens, topk
+    )
+
+    rep = NamedSharding(mesh, P())
+    tree_mask = jax.device_put(jnp.asarray(tree_mask_np, dtype=jnp.int32), rep)
+    positions = jax.device_put(jnp.asarray(pos_np, dtype=jnp.int32), rep)
+    retrive_index = jax.device_put(jnp.asarray(ret_idx, dtype=jnp.int32), rep)
+    retrive_next_token = jax.device_put(jnp.asarray(ret_next, dtype=jnp.int32), rep)
+    retrive_next_sibling = jax.device_put(jnp.asarray(ret_sib, dtype=jnp.int32), rep)
 
     return (
         tree_mask,
