@@ -245,7 +245,7 @@ def _fused_ep_moe_kernel(
     expert_offsets_x2_smem,    # (2, 2, padded_num_experts)
     expert_starts_x2_smem,    # (2, 1, padded_num_experts)
     expert_sizes_x2_smem,     # (2, 1, padded_num_experts)
-    a2a_g_offsets_x2_smem,    # (smem_banks, bt, top_k)
+    a2a_s_sends_x2_smem,      # (expert_buffer_count,) or (2, expert_buffer_count)
     # --- VMEM scratch ---
     a2a_g_acc_vmem,        # (2, top_k, acc_bt, t_packing, h_per_t)
     b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
@@ -473,6 +473,17 @@ def _fused_ep_moe_kernel(
         if use_bt_banking:
             return recv_x2_sems.at[a2a_bank_id, e_sem_id]
         return recv_x2_sems.at[e_sem_id]
+
+    def scatter_sends_get(a2a_bank_id, e_sem_id):
+        if use_bt_banking:
+            return a2a_s_sends_x2_smem[a2a_bank_id, e_sem_id]
+        return a2a_s_sends_x2_smem[e_sem_id]
+
+    def scatter_sends_set(a2a_bank_id, e_sem_id, value):
+        if use_bt_banking:
+            a2a_s_sends_x2_smem[a2a_bank_id, e_sem_id] = value
+        else:
+            a2a_s_sends_x2_smem[e_sem_id] = value
 
     def a2a_g_ref(gather_bank_id, e_id, start, size):
         if use_gather_bank:
@@ -783,6 +794,12 @@ def _fused_ep_moe_kernel(
 
     # ===== A2A scatter (batch — all experts at once) =====
 
+    def init_a2a_scatter_batch(*, a2a_bank_id):
+        if disable_a2a or disable_a2a_scatter:
+            return
+        for slot in range(expert_buffer_count):
+            scatter_sends_set(a2a_bank_id, slot, jnp.int32(0))
+
     def start_a2a_scatter_batch_range(*, bt_sem_id, bt_start, a2a_bank_id,
                                       token_start, token_end):
         if disable_a2a or disable_a2a_scatter:
@@ -801,9 +818,11 @@ def _fused_ep_moe_kernel(
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
-                a2a_g_offsets_x2_smem[bt_sem_id, t_id, k_id] = offset
                 expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
                 start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
+                if not disable_a2a_scatter_remote_copy:
+                    cur_sends = scatter_sends_get(a2a_bank_id, e_sem_id_k)
+                    scatter_sends_set(a2a_bank_id, e_sem_id_k, cur_sends + remote_sz)
 
                 if not disable_a2a_scatter_local_copy:
                     @pl.when(local_sz != 0)
@@ -839,6 +858,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(token_start, token_end, _scatter_one_batch, None, unroll=False)
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start, a2a_bank_id):
+        init_a2a_scatter_batch(a2a_bank_id=a2a_bank_id)
         start_a2a_scatter_batch_range(
             bt_sem_id=bt_sem_id,
             bt_start=bt_start,
@@ -849,15 +869,7 @@ def _fused_ep_moe_kernel(
 
     # ===== A2A scatter wait =====
 
-    def scatter_remote_send_count(*, bt_sem_id, e_sem_id):
-        send_count = jnp.int32(0)
-        for recv_id in range(num_devices):
-            e_id = jnp.int32(recv_id * local_num_experts) + e_sem_id
-            sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
-            send_count += lax.select(jnp.int32(recv_id) == my_id, jnp.int32(0), sz)
-        return send_count
-
-    def wait_a2a_scatter_send_batch(*, bt_sem_id, a2a_bank_id):
+    def wait_a2a_scatter_send_batch(*, a2a_bank_id):
         if (
             disable_a2a
             or disable_a2a_scatter
@@ -867,9 +879,7 @@ def _fused_ep_moe_kernel(
             return
 
         def _wait_one(slot, _):
-            scatter_send_sz = scatter_remote_send_count(
-                bt_sem_id=bt_sem_id, e_sem_id=slot,
-            )
+            scatter_send_sz = scatter_sends_get(a2a_bank_id, slot)
 
             @pl.when(scatter_send_sz != 0)
             def _():
@@ -1802,7 +1812,8 @@ def _fused_ep_moe_kernel(
                 def _():
                     for k_id in range(top_k):
                         e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                        offset = a2a_g_offsets_x2_smem[bt_sem_id, t_id, k_id]
+                        offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                         pltpu.make_async_copy(
                             src_ref=a2a_g_ref(gather_bank_id, e_id, offset, 1),
                             dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
@@ -2086,9 +2097,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
         if not skip_post_gather:
-            wait_a2a_scatter_send_batch(
-                bt_sem_id=bt_sem_id, a2a_bank_id=a2a_bank_id,
-            )
+            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
 
         if not skip_post_gather:
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id)
@@ -2129,9 +2138,7 @@ def _fused_ep_moe_kernel(
             a2a_bank_id = a2a_bank_for_bt(bt_id)
             out_buf_id = bt_bank_id(bt_id)
 
-            wait_a2a_scatter_send_batch(
-                bt_sem_id=bt_sem_id, a2a_bank_id=a2a_bank_id,
-            )
+            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
             wait_a2a_gather_recv_all(
                 bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
             )
@@ -2519,7 +2526,11 @@ def fused_ep_moe_v2(
         pltpu.SMEM((smem_banks, 2, padded_num_experts), jnp.int32),                  # expert_offsets
         pltpu.SMEM((smem_banks, 1, padded_num_experts), jnp.int32),                  # expert_starts
         pltpu.SMEM((smem_banks, 1, padded_num_experts), jnp.int32),                  # expert_sizes
-        pltpu.SMEM((smem_banks, bt, top_k), jnp.int32),                     # a2a_g_offsets
+        (
+            pltpu.SMEM((num_bt_banks, expert_buffer_count), jnp.int32)
+            if use_bt_banking else
+            pltpu.SMEM((expert_buffer_count,), jnp.int32)
+        ),                                                                  # a2a_s_sends
         # VMEM: gather accumulation
         pltpu.VMEM((2, top_k, acc_bt, t_packing, h_per_t), t_dtype),       # a2a_g_acc
         # VMEM: topk
