@@ -3,7 +3,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -527,8 +527,10 @@ class FusedEPMoEV2(FusedEPMoE):
         hidden_states: jax.Array,
         topk_weights: jax.Array,
         topk_ids: jax.Array,
+        token_valid_mask: jax.Array | None = None,
         *,
         block_config=None,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
@@ -536,6 +538,8 @@ class FusedEPMoEV2(FusedEPMoE):
         )
 
         assert hidden_states.ndim == 2
+        if token_valid_mask is not None:
+            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -592,5 +596,6 @@ class FusedEPMoEV2(FusedEPMoE):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
         return output
