@@ -39,6 +39,25 @@ def make_reduce_sharding(
     of size.
     """
     if enable_sp and should_scatter(arr.shape[scatter_dim], mesh.shape["tensor"]):
+        # VERIFY-ONLY SENTINEL: catch Bug 1 (divisibility) and Bug 2 (threshold
+        # device count). Production code passes only `tensor` to should_scatter,
+        # but the actual scatter runs across `data * tensor`. If either invariant
+        # fails on `world`, the SP path was wrongly approved.
+        dim = arr.shape[scatter_dim]
+        world = mesh.shape["data"] * mesh.shape["tensor"]
+        threshold = global_config.tpu_scatter_min_local_size
+        assert dim % world == 0, (
+            f"[BUG1] should_scatter approved dim={dim} but dim % world={world} != 0 "
+            f"(tensor={mesh.shape['tensor']}, data={mesh.shape['data']}); "
+            f"JAX reshard on ('data','tensor') will fail."
+        )
+        per_device = dim // world
+        assert per_device >= threshold, (
+            f"[BUG2] should_scatter approved SP with per-device={per_device} "
+            f"< threshold={threshold} (dim={dim}, world={world}, "
+            f"tensor={mesh.shape['tensor']}, data={mesh.shape['data']}). "
+            f"should_scatter used tensor not world as num_devices."
+        )
         axes: str | tuple[str, ...] = ("data", "tensor")
     else:
         axes = "data"
