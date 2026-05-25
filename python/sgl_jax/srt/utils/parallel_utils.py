@@ -43,6 +43,20 @@ def make_reduce_sharding(
     """
     scatter_devices = mesh.shape["data"] * mesh.shape["tensor"]
     if enable_sp and should_scatter(arr.shape[scatter_dim], scatter_devices):
+        # VERIFY-ONLY SENTINEL: confirm fix actually works. With the fix,
+        # should_scatter is called with scatter_devices=world, so per-device
+        # MUST be >= threshold and dim MUST divide world whenever SP fires.
+        # If either assert trips, the fix is wrong.
+        dim = arr.shape[scatter_dim]
+        threshold = global_config.tpu_scatter_min_local_size
+        assert dim % scatter_devices == 0, (
+            f"[BUG1 STILL] fix did NOT catch: dim={dim} % world={scatter_devices} != 0"
+        )
+        per_device = dim // scatter_devices
+        assert per_device >= threshold, (
+            f"[BUG2 STILL] fix did NOT catch: per-device={per_device} < threshold={threshold} "
+            f"(dim={dim}, world={scatter_devices})"
+        )
         axes: str | tuple[str, ...] = ("data", "tensor")
     else:
         axes = "data"
