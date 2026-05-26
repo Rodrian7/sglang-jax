@@ -105,6 +105,7 @@ def main():
             local_num_experts=local_num_experts,
             num_devices=num_devices,
             a2a_max_tokens=a2a_max_tokens,
+            padded_num_experts=padded_num_experts,
             dp_axis_name="data",
             tp_axis_name="tensor",
             mesh=mesh,
