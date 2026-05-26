@@ -155,8 +155,10 @@ def sc_bt0_scatter(
         out_shape=out_shape,
         mesh=plsc.ScalarSubcoreMesh(axis_name="core", num_cores=1),
         scratch_shapes=[
-            pltpu.VMEM((bt, top_k), jnp.int32),
-            pltpu.VMEM((padded_num_experts,), jnp.int32),
+            plsc.MemoryRef((bt, top_k), jnp.int32,
+                           memory_space=pltpu.MemorySpace.SMEM),
+            plsc.MemoryRef((padded_num_experts,), jnp.int32,
+                           memory_space=pltpu.MemorySpace.SMEM),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
