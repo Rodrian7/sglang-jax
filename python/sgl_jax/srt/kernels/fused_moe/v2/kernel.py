@@ -1390,8 +1390,8 @@ def _fused_ep_moe_kernel(
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d1 = jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
-                                        s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        return gate_acc + jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(1, bf)
+                                        return gate_acc + d1 * jnp.broadcast_to(s1, d1.shape)
                                     gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                             return None
@@ -1409,8 +1409,8 @@ def _fused_ep_moe_kernel(
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w3_tile = b_w3_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d3 = jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
-                                        s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        return up_acc + jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(1, bf)
+                                        return up_acc + d3 * jnp.broadcast_to(s3, d3.shape)
                                     up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
@@ -1456,8 +1456,8 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_id, 1),
                                             0,
                                             pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        gate_acc += jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        ].reshape(1, bf)
+                                        gate_acc += d1 * jnp.broadcast_to(s1, d1.shape)
 
                                         d3 = jnp.dot(
                                             x_slice, w3_tile,
@@ -1469,8 +1469,8 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_id, 1),
                                             0,
                                             pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        up_acc += jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        ].reshape(1, bf)
+                                        up_acc += d3 * jnp.broadcast_to(s3, d3.shape)
                                         return gate_acc, up_acc
 
                                     gate, up = lax.fori_loop(
@@ -1716,8 +1716,8 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_id, 1),
                                             0,
                                             pl.ds(0, h_per_t),
-                                        ].reshape(h_per_t)
-                                        return partial_acc + jnp.stack([d[i] * s for i in range(btc)], axis=0)
+                                        ].reshape(1, h_per_t)
+                                        return partial_acc + d * jnp.broadcast_to(s, d.shape)
 
                                     partial = lax.fori_loop(
                                         0,
