@@ -254,10 +254,6 @@ def _fused_ep_moe_kernel(
     b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
     b_topk_ids_x2_vmem,      # (2, bt, padded_top_k)
     b_output_x2_vmem,        # (2, bt, hidden_size)
-    # Weight double buffers — (2, t_packing, h_per_t, bf) or (2, t_packing, bf, h_per_t)
-    b_w1_x2_vmem,          # (2, t_packing, h_per_t, bf)
-    b_w3_x2_vmem,          # (2, t_packing, h_per_t, bf)
-    b_w2_x2_vmem,          # (2, t_packing, bf, h_per_t)
     # Scale double buffers (None when not quantized)
     b_w1_scale_x2_vmem,    # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
     b_w3_scale_x2_vmem,    # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
@@ -378,6 +374,12 @@ def _fused_ep_moe_kernel(
     t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
     h_per_t = hidden_size // t_packing
+
+    # Weight double buffers — allocated via run_scoped inside expert loop,
+    # not permanent scratch, so they free VMEM during shared expert phase.
+    b_w1_x2_vmem = None
+    b_w3_x2_vmem = None
+    b_w2_x2_vmem = None
 
     num_bf = cdiv(intermediate_size, bf)
     ffn1_use_chunked_dequant = (
@@ -2193,30 +2195,43 @@ def _fused_ep_moe_kernel(
 
         run_shared_expert_full(bt_id, out_buf_id)
 
-        init_carry = jnp.bool_(False)
+        def _expert_loop_with_weights(_w1_buf, _w3_buf, _w2_buf):
+            nonlocal b_w1_x2_vmem, b_w3_x2_vmem, b_w2_x2_vmem
+            b_w1_x2_vmem = _w1_buf
+            b_w3_x2_vmem = _w3_buf
+            b_w2_x2_vmem = _w2_buf
 
-        def compute_expert_batch(local_e_id, carry):
-            bf0_w13_prefetched = carry
-            e_sem_id_local = local_e_id
+            init_carry = jnp.bool_(False)
 
-            wait_a2a_scatter_recv(
-                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
-                local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
+            def compute_expert_batch(local_e_id, carry):
+                bf0_w13_prefetched = carry
+                e_sem_id_local = local_e_id
+
+                wait_a2a_scatter_recv(
+                    bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
+                )
+                next_bf0_w13_prefetched = expert_ffn(
+                    bt_sem_id, e_sem_id_local, local_e_id,
+                    bf0_w13_prefetched, a2a_bank_id,
+                )
+                start_a2a_gather(
+                    bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
+                    gather_bank_id=gather_bank_id,
+                )
+
+                return next_bf0_w13_prefetched
+
+            _ = lax.fori_loop(
+                0, local_num_experts, compute_expert_batch, init_carry, unroll=False,
             )
-            next_bf0_w13_prefetched = expert_ffn(
-                bt_sem_id, e_sem_id_local, local_e_id,
-                bf0_w13_prefetched, a2a_bank_id,
-            )
-            start_a2a_gather(
-                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
-                local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
-                gather_bank_id=gather_bank_id,
-            )
 
-            return next_bf0_w13_prefetched
-
-        _ = lax.fori_loop(
-            0, local_num_experts, compute_expert_batch, init_carry, unroll=False,
+        pl.run_scoped(
+            _expert_loop_with_weights,
+            pltpu.VMEM((2, t_packing, h_per_t, bf), w1_hbm.dtype),
+            pltpu.VMEM((2, t_packing, h_per_t, bf), w3_hbm.dtype),
+            pltpu.VMEM((2, t_packing, bf, h_per_t), w2_hbm.dtype),
         )
 
         if not skip_post_gather:
@@ -2666,10 +2681,6 @@ def fused_ep_moe_v2(
         pltpu.VMEM((smem_banks, bt, padded_top_k), jnp.int32),                      # topk_ids
         # VMEM: output double buffer
         pltpu.VMEM((smem_banks, bt, hidden_size), t_dtype),                          # output
-        # VMEM: weight double buffers
-        pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w1.dtype),                 # W1
-        pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w3.dtype),                 # W3
-        pltpu.VMEM((wb_slots, t_packing, bf, h_per_t), w2.dtype),                 # W2
         # VMEM: scale double buffers (None when not quantized)
         (None if w1_scale is None else
             pltpu.VMEM((wb_slots, t_packing, h_per_t // quant_block_k, 1, bf), jnp.float32)),  # W1 scale
