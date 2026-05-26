@@ -66,6 +66,10 @@ def _make_kernel(
         copy_es.wait()
 
         # Scan tokens × topk, issue DMAs with correct dst offsets.
+        # Use synchronous DMA (start + wait per iteration) to guarantee all
+        # writes are complete by kernel exit. This serializes DMAs but is
+        # correct; concurrent versions need a precise valid-count drain loop
+        # (next-step optimization, requires SMEM-int dynamic loop bound).
         def _scatter_one_token(t_id, _):
             for k_id in range(top_k):
                 e_id = topk_vmem[t_id, k_id]
@@ -83,11 +87,13 @@ def _make_kernel(
 
                 @pl.when(jnp.logical_and(is_valid, target_dev == my_id))
                 def _local(t_id=t_id, target_local_e=target_local_e, dst_pos=dst_pos):
-                    pltpu.make_async_copy(
+                    dma = pltpu.make_async_copy(
                         tokens_hbm.at[pl.ds(bt_start + t_id, 1)],
                         a2a_out_hbm.at[target_local_e, pl.ds(dst_pos, 1)],
                         recv_sem,
-                    ).start()
+                    )
+                    dma.start()
+                    dma.wait()
 
                 @pl.when(jnp.logical_and(is_valid, target_dev != my_id))
                 def _remote(
@@ -96,26 +102,18 @@ def _make_kernel(
                 ):
                     dp_idx = target_dev // tp_size
                     tp_idx = target_dev % tp_size
-                    pltpu.make_async_remote_copy(
+                    dma = pltpu.make_async_remote_copy(
                         tokens_hbm.at[pl.ds(bt_start + t_id, 1)],
                         a2a_out_hbm.at[target_local_e, pl.ds(dst_pos, 1)],
                         send_sem, recv_sem,
                         device_id=(dp_idx, tp_idx),
                         device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+                    )
+                    dma.start()
+                    dma.wait()
             return None
 
         lax.fori_loop(0, bt, _scatter_one_token, None, unroll=False)
-
-        # Drain: wait recv_sem exactly valid_count times.
-        n_drain = valid_count_vmem[0]
-
-        def _drain_one(i, _):
-            ref = a2a_out_hbm.at[0, pl.ds(0, 1)]
-            pltpu.make_async_copy(ref, ref, recv_sem).wait()
-            return None
-
-        lax.fori_loop(0, n_drain, _drain_one, None, unroll=False)
 
     return body
 
