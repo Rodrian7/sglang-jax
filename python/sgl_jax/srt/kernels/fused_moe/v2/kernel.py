@@ -1924,20 +1924,24 @@ def _fused_ep_moe_kernel(
         def _se_body(se_tokens, gate_acc, up_acc):
             bt_sem = bt_bank_id(bt_id)
 
-            for p_id in range(t_packing):
-                pltpu.make_async_copy(
-                    src_ref=tokens_hbm.at[
-                        pl.ds(bt_start, bt), p_id, pl.ds(0, h_per_t)
-                    ],
-                    dst_ref=se_tokens.at[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)],
-                    sem=local_sems.at[bt_sem, 0],
-                ).start()
-            for p_id in range(t_packing):
-                pltpu.make_async_copy(
-                    src_ref=se_tokens.at[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)],
-                    dst_ref=se_tokens.at[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)],
-                    sem=local_sems.at[bt_sem, 0],
-                ).wait()
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[
+                    pl.ds(bt_start, bt), pl.ds(0, t_packing), pl.ds(0, h_per_t)
+                ],
+                dst_ref=se_tokens.at[
+                    pl.ds(0, bt), pl.ds(0, t_packing), pl.ds(0, h_per_t)
+                ],
+                sem=local_sems.at[bt_sem, 0],
+            ).start()
+            pltpu.make_async_copy(
+                src_ref=se_tokens.at[
+                    pl.ds(0, bt), pl.ds(0, t_packing), pl.ds(0, h_per_t)
+                ],
+                dst_ref=se_tokens.at[
+                    pl.ds(0, bt), pl.ds(0, t_packing), pl.ds(0, h_per_t)
+                ],
+                sem=local_sems.at[bt_sem, 0],
+            ).wait()
 
             for p_id in range(t_packing):
                 t_slice = se_tokens[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)]
