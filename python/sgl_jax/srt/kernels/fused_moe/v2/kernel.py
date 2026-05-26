@@ -2279,6 +2279,7 @@ def jax_allreduce_metadata_by_bt(
         "w2_fetch_order", "w2_fetch_priority",
         "skip_inter_bt_sync",
         "interleave_bt",
+        "skip_bt0_scatter",
     ],
 )
 def fused_ep_moe_v2(
