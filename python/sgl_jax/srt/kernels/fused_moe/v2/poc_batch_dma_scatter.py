@@ -13,7 +13,7 @@ Row = (2, 3072) bf16 = 12KB.  Total = 2048 rows = 24MB.
 Routing data is passed via scalar_prefetch (auto-placed in SMEM).
 """
 
-import os, sys, time, functools
+import os, sys, time, functools, traceback
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import jax
@@ -129,9 +129,9 @@ def _make_per_token():
 
         def _scatter(t_id, _):
             for k_id in range(TOP_K):
-                e_id = topk_ref[t_id * TOP_K + k_id]
+                e_id = topk_ref[0, t_id * TOP_K + k_id]
                 offset = offsets_smem[e_id]
-                start = starts_ref[e_id] + offset
+                start = starts_ref[0, e_id] + offset
                 offsets_smem[e_id] = offset + jnp.int32(1)
                 pltpu.make_async_copy(
                     src_ref=src.at[pl.ds(t_id, 1)],
@@ -168,8 +168,8 @@ def _make_batched_fori():
     )
     def f(counts_ref, starts_ref, src, dst, out, sem):
         def _scatter(e_id, cursor):
-            count = counts_ref[e_id]
-            start = starts_ref[e_id]
+            count = counts_ref[0, e_id]
+            start = starts_ref[0, e_id]
             @pl.when(count > 0)
             def _(cursor=cursor, count=count, start=start):
                 pltpu.make_async_copy(
@@ -208,8 +208,8 @@ def _make_batched_static():
     def f(counts_ref, starts_ref, src, dst, out, sem):
         cursor = jnp.int32(0)
         for e_id in range(PADDED_E):
-            count = counts_ref[e_id]
-            start = starts_ref[e_id]
+            count = counts_ref[0, e_id]
+            start = starts_ref[0, e_id]
             @pl.when(count > 0)
             def _(cursor=cursor, count=count, start=start):
                 pltpu.make_async_copy(
@@ -273,6 +273,7 @@ def main():
         print(f"  1 DMA × {NUM_ENTRIES} rows:     {med:>7.0f} μs  [{s}]", flush=True)
     except Exception as e:
         print(f"  1 DMA: ERR {e}", flush=True)
+        traceback.print_exc()
 
     try:
         fn = _make_dma_fori_per_token()
@@ -281,6 +282,7 @@ def main():
         print(f"  fori×{NUM_ENTRIES}, 1-row each: {med:>7.0f} μs  [{s}]", flush=True)
     except Exception as e:
         print(f"  fori×{NUM_ENTRIES}: ERR {e}", flush=True)
+        traceback.print_exc()
 
     # 2) Per-token scatter with SMEM routing
     print("\n--- Per-token scatter (fori×256, inner×8, SMEM routing) ---", flush=True)
@@ -291,6 +293,7 @@ def main():
         print(f"  per_token:           {med:>7.0f} μs  [{s}]", flush=True)
     except Exception as e:
         print(f"  per_token: ERR {e}", flush=True)
+        traceback.print_exc()
 
     # 3) Batched scatter with SMEM routing
     print("\n--- Batched scatter (multi-row DMAs, SMEM routing) ---", flush=True)
@@ -301,6 +304,7 @@ def main():
         print(f"  batched_fori×{PADDED_E}:    {med:>7.0f} μs  [{s}]", flush=True)
     except Exception as e:
         print(f"  batched_fori: ERR {e}", flush=True)
+        traceback.print_exc()
 
     try:
         fn = _make_batched_static()
@@ -309,6 +313,7 @@ def main():
         print(f"  batched_static×{PADDED_E}: {med:>7.0f} μs  [{s}]", flush=True)
     except Exception as e:
         print(f"  batched_static: ERR {e}", flush=True)
+        traceback.print_exc()
 
     print(f"\n[p0] done", flush=True)
 
