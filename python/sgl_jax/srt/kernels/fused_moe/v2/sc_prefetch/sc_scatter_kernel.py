@@ -39,6 +39,7 @@ def _make_kernel(
         topk_vmem,
         es_vmem,
         cursor_vmem,
+        valid_count_vmem,
         load_sem,
         send_sem,
         recv_sem,
@@ -47,10 +48,10 @@ def _make_kernel(
         tp_rank = lax.axis_index(tp_axis_name)
         my_id = dp_rank * tp_size + tp_rank
 
-        # Init cursor to 0 (per-expert running count of sent tokens).
-        # Python loop unrolled — padded_num_experts is static.
+        # Init cursor and valid_count.
         for e in range(padded_num_experts):
             cursor_vmem[e] = jnp.int32(0)
+        valid_count_vmem[0] = jnp.int32(0)
 
         # Load topk_ids + expert_starts to SMEM.
         copy_topk = pltpu.make_async_copy(
@@ -73,10 +74,10 @@ def _make_kernel(
                 target_dev = e_id_safe // local_num_experts
                 target_local_e = e_id_safe % local_num_experts
 
-                # Read-modify-write cursor for this expert.
                 cur_off = cursor_vmem[e_id_safe]
                 inc = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
                 cursor_vmem[e_id_safe] = cur_off + inc
+                valid_count_vmem[0] = valid_count_vmem[0] + inc
 
                 dst_pos = es_vmem[e_id_safe] + cur_off
 
@@ -106,26 +107,15 @@ def _make_kernel(
 
         lax.fori_loop(0, bt, _scatter_one_token, None, unroll=False)
 
-        # Drain all in-flight DMAs by waiting on send_sem and recv_sem
-        # the right number of times. Use dummy ref-self-copy wait pattern.
-        # Need bt * top_k waits total (each DMA signals once).
-        # Both local (recv_sem only) and remote (send_sem + recv_sem) DMAs
-        # signal recv_sem. So we expect ~bt * top_k recv_sem signals
-        # (minus invalid (-1) ones).
-        # For correctness, use a coarse barrier: wait bt * top_k times.
-        # NOTE: this serializes; better optimization is to count and wait exactly.
+        # Drain: wait recv_sem exactly valid_count times.
+        n_drain = valid_count_vmem[0]
+
         def _drain_one(i, _):
             ref = a2a_out_hbm.at[0, pl.ds(0, 1)]
             pltpu.make_async_copy(ref, ref, recv_sem).wait()
             return None
 
-        # We over-wait — wait `bt * top_k` times even though some were invalid.
-        # Invalid (-1) topk_ids skip DMA via @pl.when, so recv_sem signals
-        # are < bt * top_k. This would hang.
-        # Safe alternative: count valid ones in advance.
-        # For POC: trust caller passes only valid topk_ids and wait full count.
-        # TODO: properly handle invalid topk_ids in the wait count.
-        pass
+        lax.fori_loop(0, n_drain, _drain_one, None, unroll=False)
 
     return body
 
@@ -172,6 +162,8 @@ def sc_bt0_scatter(
                            memory_space=pltpu.MemorySpace.SMEM),
             plsc.MemoryRef((padded_num_experts,), jnp.int32,
                            memory_space=pltpu.MemorySpace.SMEM),
+            plsc.MemoryRef((1,), jnp.int32,
+                           memory_space=pltpu.MemorySpace.SMEM),
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
@@ -180,13 +172,13 @@ def sc_bt0_scatter(
     def kernel(
         tokens_hbm, topk_ids_hbm, expert_starts_hbm,
         a2a_out_hbm,
-        topk_vmem, es_vmem, cursor_vmem,
+        topk_vmem, es_vmem, cursor_vmem, valid_count_vmem,
         load_sem, send_sem, recv_sem,
     ):
         body(
             tokens_hbm, topk_ids_hbm, expert_starts_hbm,
             a2a_out_hbm,
-            topk_vmem, es_vmem, cursor_vmem,
+            topk_vmem, es_vmem, cursor_vmem, valid_count_vmem,
             load_sem, send_sem, recv_sem,
         )
 
