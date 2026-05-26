@@ -1965,8 +1965,10 @@ def _fused_ep_moe_kernel(
                             dst_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
                             sem=local_sems.at[bt_sem, 1],
                         ).wait()
-                        gate_acc.at[pl.ds(0, bt), pl.ds(n_start, se_n_chunk)][...] += jnp.dot(
+                        part = jnp.dot(
                             t_slice, w_buf[...], preferred_element_type=jnp.float32)
+                        g = gate_acc[...]
+                        gate_acc[...] = g.at[:, n_start:n_start+se_n_chunk].add(part)
 
                     pl.run_scoped(_gate, pltpu.VMEM((h_per_t, se_n_chunk), w_dtype))
 
@@ -1983,8 +1985,10 @@ def _fused_ep_moe_kernel(
                             dst_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
                             sem=local_sems.at[bt_sem, 1],
                         ).wait()
-                        up_acc.at[pl.ds(0, bt), pl.ds(n_start, se_n_chunk)][...] += jnp.dot(
+                        part = jnp.dot(
                             t_slice, w_buf[...], preferred_element_type=jnp.float32)
+                        u = up_acc[...]
+                        up_acc[...] = u.at[:, n_start:n_start+se_n_chunk].add(part)
 
                     pl.run_scoped(_up, pltpu.VMEM((h_per_t, se_n_chunk), w_dtype))
 
@@ -2048,7 +2052,7 @@ def _fused_ep_moe_kernel(
                             dst_ref=w_buf.at[pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)],
                             sem=local_sems.at[bt_sem, 1],
                         ).wait()
-                        act_chunk = act[pl.ds(0, bt), pl.ds(n_start, se_n_chunk)]
+                        act_chunk = act[:, n_start:n_start+se_n_chunk]
                         partial = jnp.dot(
                             act_chunk, w_buf[...], preferred_element_type=jnp.float32)
                         if w2_shared_scale_hbm is not None:
