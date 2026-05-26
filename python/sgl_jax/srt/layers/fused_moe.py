@@ -561,6 +561,9 @@ class FusedEPMoEV2(FusedEPMoE):
 
         direct_scaled_dot = w1_scale is not None
 
+        import os
+        skip_bt0 = os.environ.get("SGLJAX_SKIP_BT0_SCATTER", "0") == "1"
+
         output = fused_ep_moe_v2(
             self.mesh,
             hidden_states,
@@ -579,6 +582,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
             use_jax_allreduce_metadata=False,
+            skip_bt0_scatter=skip_bt0,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
