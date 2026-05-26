@@ -21,6 +21,7 @@ Env vars:
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
+  BENCH_SC_PRESORT — 1 to use SC presort (SC metadata+gather, TC group DMA scatter)
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
@@ -251,6 +252,11 @@ ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
 ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
+per_expert_scatter = os.environ.get("BENCH_PER_EXPERT_SCATTER", "0") == "1"
+interleaved_scatter = os.environ.get("BENCH_INTERLEAVED_SCATTER", "0") == "1"
+if interleaved_scatter:
+    per_expert_scatter = True
+use_sc_presort = os.environ.get("BENCH_SC_PRESORT", "0") == "1"
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
 next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
 w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
@@ -418,6 +424,12 @@ if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
+if use_sc_presort:
+    log("sc_presort=True (SC metadata+gather, TC group DMA scatter)")
+if interleaved_scatter:
+    log("interleaved_scatter=True (scatter groups 1-11 dispatched inline during expert FFN)")
+elif per_expert_scatter:
+    log("per_expert_scatter=True (scatter plan build+dispatch all groups upfront)")
 log(
     "cross_expert_prefetch="
     f"{cross_expert_prefetch_modes} next_w2_priority={next_w2_prologue_priorities}"
@@ -1041,6 +1053,9 @@ for num_tokens in token_candidates:
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                per_expert_scatter=per_expert_scatter,
+                interleaved_scatter=interleaved_scatter,
+                use_sc_presort=use_sc_presort,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
@@ -1065,7 +1080,9 @@ for num_tokens in token_candidates:
                     else:
                         log(f"  {tag_resolved}: no timing data")
         except Exception as e:
+            import traceback
             log(f"  FAIL {tag}: {e}")
+            traceback.print_exc()
             continue
 
 # --- Summary ---
@@ -1123,6 +1140,9 @@ if check_correctness:
             skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+            per_expert_scatter=per_expert_scatter,
+            interleaved_scatter=interleaved_scatter,
+            use_sc_presort=use_sc_presort,
             use_jax_allreduce_metadata=not inkernel_metadata,
         )
         ref_kwargs = {}

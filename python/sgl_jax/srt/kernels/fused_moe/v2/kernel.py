@@ -237,6 +237,8 @@ def _fused_ep_moe_kernel(
     metadata_starts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
     metadata_sizes_hbm,   # None | (num_bt, 1, padded_num_experts) int32
     metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, padded_num_experts) int32
+    scatter_plan_hbm,         # None | (num_bt, bt * top_k) int32 — packed scatter plan
+    scatter_group_bounds_hbm, # None | (num_bt, local_num_experts + 1) int32
     # --- HBM output ---
     output_hbm,           # (local_num_tokens, hidden_size)
     # --- SMEM scratch ---
@@ -246,6 +248,9 @@ def _fused_ep_moe_kernel(
     expert_starts_x2_smem,    # (2, 1, padded_num_experts)
     expert_sizes_x2_smem,     # (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,      # (expert_buffer_count,) or (2, expert_buffer_count)
+    scatter_plan_smem,         # None | (smem_banks, bt * top_k) int32
+    scatter_plan_group_bounds_smem,  # None | (smem_banks, local_num_experts + 1) int32
+    scatter_cursor_smem,       # None | (smem_banks, 2) int32
     # --- VMEM scratch ---
     a2a_g_acc_vmem,        # (2, top_k, acc_bt, t_packing, h_per_t)
     b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
@@ -339,6 +344,9 @@ def _fused_ep_moe_kernel(
     ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
+    per_expert_scatter: bool = False,
+    interleaved_scatter: bool = False,
+    use_sc_presort: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -548,7 +556,7 @@ def _fused_ep_moe_kernel(
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
 
-        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+        if (use_jax_allreduce_metadata or use_sc_presort) and metadata_starts_hbm is not None:
             def _copy_precomputed(
                 t2e_routing_vmem,
                 d2e_count_vmem,
@@ -866,6 +874,145 @@ def _fused_ep_moe_kernel(
             token_start=jnp.int32(0),
             token_end=jnp.int32(bt),
         )
+
+    # ===== Per-expert scatter plan =====
+
+    num_experts_global = local_num_experts * num_devices if (per_expert_scatter or interleaved_scatter or use_sc_presort) else 0
+
+    def build_scatter_plan(*, bt_sem_id, bt_id, a2a_bank_id):
+        if not (per_expert_scatter or interleaved_scatter or use_sc_presort):
+            return
+
+        if use_sc_presort and scatter_plan_hbm is not None:
+            pltpu.async_copy(
+                src_ref=scatter_plan_hbm.at[bt_id],
+                dst_ref=scatter_plan_smem.at[bt_sem_id],
+                sem=local_sems.at[bt_sem_id, 3],
+            ).wait()
+            pltpu.async_copy(
+                src_ref=scatter_group_bounds_hbm.at[bt_id],
+                dst_ref=scatter_plan_group_bounds_smem.at[bt_sem_id],
+                sem=local_sems.at[bt_sem_id, 4],
+            ).wait()
+            _precompute_scatter_sends(
+                bt_sem_id=bt_sem_id, a2a_bank_id=a2a_bank_id,
+            )
+            return
+
+        local_ne = local_num_experts
+
+        acc = jnp.int32(0)
+        for g in range(local_ne):
+            scatter_plan_group_bounds_smem[bt_sem_id, g] = acc
+            for e_off in range(num_experts_global // local_ne):
+                e_id = g + e_off * local_ne
+                acc = acc + d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+        scatter_plan_group_bounds_smem[bt_sem_id, local_ne] = acc
+
+        for g in range(local_ne):
+            expert_offsets_x2_smem[bt_sem_id, 1, g] = jnp.int32(0)
+
+        def _fill_pass(t_id, _):
+            for k_id in range(top_k):
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                e_sem_id = lax.select(
+                    is_valid, e_id_safe % jnp.int32(local_ne), jnp.int32(0),
+                )
+
+                @pl.when(is_valid)
+                def _(e_sem_id=e_sem_id, t_id=t_id, e_id_safe=e_id_safe):
+                    idx = expert_offsets_x2_smem[bt_sem_id, 1, e_sem_id]
+                    pos = scatter_plan_group_bounds_smem[bt_sem_id, e_sem_id] + idx
+
+                    offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
+                    start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
+                    expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + 1
+
+                    recv_id = e_id_safe // jnp.int32(local_ne)
+
+                    packed = (
+                        (start & jnp.int32(0x3FFF))
+                        | ((recv_id & jnp.int32(0x1F)) << jnp.int32(14))
+                        | ((e_sem_id & jnp.int32(0xF)) << jnp.int32(19))
+                        | ((t_id & jnp.int32(0xFF)) << jnp.int32(23))
+                    )
+                    scatter_plan_smem[bt_sem_id, pos] = packed
+                    expert_offsets_x2_smem[bt_sem_id, 1, e_sem_id] = idx + 1
+
+            return None
+
+        lax.fori_loop(0, jnp.int32(bt), _fill_pass, None, unroll=False)
+
+        for g in range(local_ne):
+            expert_offsets_x2_smem[bt_sem_id, 1, g] = jnp.int32(0)
+
+        _precompute_scatter_sends(bt_sem_id=bt_sem_id, a2a_bank_id=a2a_bank_id)
+
+    def _precompute_scatter_sends(*, bt_sem_id, a2a_bank_id):
+        if disable_a2a or disable_a2a_scatter or disable_a2a_scatter_remote_copy:
+            return
+        if not (per_expert_scatter or interleaved_scatter or use_sc_presort):
+            return
+        local_ne = local_num_experts
+        for g in range(local_ne):
+            total_remote = jnp.int32(0)
+            for e_off in range(num_experts_global // local_ne):
+                e_id = g + e_off * local_ne
+                count = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+                is_remote = jnp.int32(e_off) != my_id
+                total_remote = total_remote + lax.select(
+                    is_remote, count, jnp.int32(0),
+                )
+            scatter_sends_set(a2a_bank_id, g, total_remote)
+
+    def issue_one_scatter_entry(packed, bt_start, a2a_bank_id):
+        start = packed & jnp.int32(0x3FFF)
+        recv_id = (packed >> jnp.int32(14)) & jnp.int32(0x1F)
+        e_sem_id_k = (packed >> jnp.int32(19)) & jnp.int32(0xF)
+        t_id = (packed >> jnp.int32(23)) & jnp.int32(0xFF)
+        src_t_id = bt_start + t_id
+        is_remote = recv_id != my_id
+
+        if not disable_a2a_scatter_remote_copy:
+            @pl.when(is_remote)
+            def _(
+                src_t_id=src_t_id, start=start,
+                e_sem_id_k=e_sem_id_k, recv_id=recv_id,
+            ):
+                pltpu.make_async_remote_copy(
+                    src_ref=tokens_hbm.at[pl.ds(src_t_id, 1)],
+                    dst_ref=a2a_s_ref(a2a_bank_id, e_sem_id_k, start, 1),
+                    send_sem=scatter_send_sem(a2a_bank_id, e_sem_id_k),
+                    recv_sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+
+        if not disable_a2a_scatter_local_copy:
+            @pl.when(jnp.logical_not(is_remote))
+            def _(src_t_id=src_t_id, start=start, e_sem_id_k=e_sem_id_k):
+                pltpu.make_async_copy(
+                    src_ref=tokens_hbm.at[pl.ds(src_t_id, 1)],
+                    dst_ref=a2a_s_ref(a2a_bank_id, e_sem_id_k, start, 1),
+                    sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
+                ).start()
+
+    def scatter_for_group(*, bt_sem_id, group_id, a2a_bank_id, bt_start):
+        if disable_a2a or disable_a2a_scatter or not (per_expert_scatter or interleaved_scatter or use_sc_presort):
+            return
+
+        plan_start = scatter_plan_group_bounds_smem[bt_sem_id, group_id]
+        plan_end = scatter_plan_group_bounds_smem[bt_sem_id, group_id + 1]
+
+        def _scatter_one(idx, _):
+            packed = scatter_plan_smem[bt_sem_id, plan_start + idx]
+            issue_one_scatter_entry(packed, bt_start, a2a_bank_id)
+            return None
+
+        group_size = plan_end - plan_start
+        lax.fori_loop(0, group_size, _scatter_one, None, unroll=False)
 
     # ===== A2A scatter wait =====
 
@@ -1298,7 +1445,14 @@ def _fused_ep_moe_kernel(
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id):
+    if per_expert_scatter or interleaved_scatter:
+        _btc_iters_per_expert = (bts // btc) * num_bf * 2
+        scatter_entries_per_btc = (bt + _btc_iters_per_expert - 1) // _btc_iters_per_expert
+    else:
+        scatter_entries_per_btc = 0
+
+    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id,
+                   *, bt_start=jnp.int32(0)):
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         has_tokens = dyn_sz > 0
@@ -1317,6 +1471,18 @@ def _fused_ep_moe_kernel(
             dyn_sz_i32 = dyn_sz.astype(jnp.int32)
             num_bts_tiles = (dyn_sz_i32 + (bts - 1)) // bts
             num_btc_per_bts = bts // btc
+
+            def _inline_scatter_batch():
+                if not (per_expert_scatter or interleaved_scatter) or disable_a2a or disable_a2a_scatter:
+                    return
+                for _si in range(scatter_entries_per_btc):
+                    _cur_pos = scatter_cursor_smem[bt_sem_id, 0]
+                    _cur_end = scatter_cursor_smem[bt_sem_id, 1]
+                    @pl.when(_cur_pos < _cur_end)
+                    def _(_cur_pos=_cur_pos):
+                        packed = scatter_plan_smem[bt_sem_id, _cur_pos]
+                        issue_one_scatter_entry(packed, bt_start, a2a_bank_id)
+                        scatter_cursor_smem[bt_sem_id, 0] = _cur_pos + 1
 
             def wait_expert_store_slot(stage_slot):
                 del stage_slot
@@ -1391,7 +1557,7 @@ def _fused_ep_moe_kernel(
                                         w1_tile = b_w1_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d1 = jnp.dot(x_slice, w1_tile, preferred_element_type=jnp.float32)
                                         s1 = b_w1_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        return gate_acc + jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        return gate_acc + d1 * s1[None, :]
                                     gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                             return None
@@ -1410,7 +1576,7 @@ def _fused_ep_moe_kernel(
                                         w3_tile = b_w3_x2_vmem[slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)]
                                         d3 = jnp.dot(x_slice, w3_tile, preferred_element_type=jnp.float32)
                                         s3 = b_w3_scale_x2_vmem[slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)].reshape(bf)
-                                        return up_acc + jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        return up_acc + d3 * s3[None, :]
                                     up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
@@ -1421,6 +1587,7 @@ def _fused_ep_moe_kernel(
                         wait_fetch_w3(slot)
 
                         def gate_up_btc_direct(btc_id, ___):
+                            _inline_scatter_batch()
                             gate = jnp.zeros((btc, bf), dtype=jnp.float32)
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
                             if not disable_dynamic_ffn1:
@@ -1457,7 +1624,7 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, bf),
                                         ].reshape(bf)
-                                        gate_acc += jnp.stack([d1[i] * s1 for i in range(btc)], axis=0)
+                                        gate_acc += d1 * s1[None, :]
 
                                         d3 = jnp.dot(
                                             x_slice, w3_tile,
@@ -1470,7 +1637,7 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, bf),
                                         ].reshape(bf)
-                                        up_acc += jnp.stack([d3[i] * s3 for i in range(btc)], axis=0)
+                                        up_acc += d3 * s3[None, :]
                                         return gate_acc, up_acc
 
                                     gate, up = lax.fori_loop(
@@ -1680,6 +1847,7 @@ def _fused_ep_moe_kernel(
 
                     # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
+                        _inline_scatter_batch()
                         use_direct_w2 = direct_scaled_dot_ffn2 and w2_scale_hbm is not None
                         if not use_direct_w2:
                             gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
@@ -1717,7 +1885,7 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, h_per_t),
                                         ].reshape(h_per_t)
-                                        return partial_acc + jnp.stack([d[i] * s for i in range(btc)], axis=0)
+                                        return partial_acc + d * s[None, :]
 
                                     partial = lax.fori_loop(
                                         0,
@@ -2033,7 +2201,40 @@ def _fused_ep_moe_kernel(
         next_bt_start = next_bt_id * bt
         next_a2a_bank_id = a2a_bank_for_bt(next_bt_id)
         # === BATCH SCATTER ===
-        if can_bt_scatter_overlap:
+        if use_sc_presort or per_expert_scatter or interleaved_scatter:
+            def _fire_all_scatter_groups(_bt_sem_id, _bt_id, _a2a_bank_id, _bt_start):
+                init_a2a_scatter_batch(a2a_bank_id=_a2a_bank_id)
+                build_scatter_plan(bt_sem_id=_bt_sem_id, bt_id=_bt_id, a2a_bank_id=_a2a_bank_id)
+                if interleaved_scatter:
+                    scatter_for_group(
+                        bt_sem_id=_bt_sem_id, group_id=jnp.int32(0),
+                        a2a_bank_id=_a2a_bank_id, bt_start=_bt_start,
+                    )
+                    scatter_cursor_smem[_bt_sem_id, 0] = scatter_plan_group_bounds_smem[_bt_sem_id, 1]
+                    scatter_cursor_smem[_bt_sem_id, 1] = lax.select(
+                        jnp.int32(local_num_experts) > jnp.int32(1),
+                        scatter_plan_group_bounds_smem[_bt_sem_id, 2],
+                        scatter_plan_group_bounds_smem[_bt_sem_id, 1],
+                    )
+                else:
+                    for _g in range(local_num_experts):
+                        scatter_for_group(
+                            bt_sem_id=_bt_sem_id, group_id=jnp.int32(_g),
+                            a2a_bank_id=_a2a_bank_id, bt_start=_bt_start,
+                        )
+
+            if can_bt_scatter_overlap:
+                @pl.when(jnp.logical_not(current_bt_scatter_prefetched))
+                def _():
+                    _fire_all_scatter_groups(bt_sem_id, bt_id, a2a_bank_id, bt_start)
+
+                @pl.when(next_bt_id < num_bt)
+                def _():
+                    prepare_bt_metadata(next_bt_id, next_bt_sem_id)
+                    _fire_all_scatter_groups(next_bt_sem_id, next_bt_id, next_a2a_bank_id, next_bt_start)
+            else:
+                _fire_all_scatter_groups(bt_sem_id, bt_id, a2a_bank_id, bt_start)
+        elif can_bt_scatter_overlap:
             @pl.when(jnp.logical_not(current_bt_scatter_prefetched))
             def _():
                 start_a2a_scatter_batch(
@@ -2065,6 +2266,12 @@ def _fused_ep_moe_kernel(
                 run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
                 curr_se_block += 1
 
+            if per_expert_scatter:
+                pass
+
+            if interleaved_scatter:
+                pass
+
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
                 local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
@@ -2072,7 +2279,29 @@ def _fused_ep_moe_kernel(
             next_bf0_w13_prefetched = expert_ffn(
                 bt_sem_id, e_sem_id_local, local_e_id,
                 bf0_w13_prefetched, a2a_bank_id,
+                bt_start=bt_start,
             )
+
+            if interleaved_scatter:
+                next_g = local_e_id + jnp.int32(2)
+                _ilv_valid = next_g < jnp.int32(local_num_experts)
+                _ilv_safe_g = lax.select(_ilv_valid, next_g, jnp.int32(0))
+                _ilv_safe_g1 = lax.select(
+                    _ilv_valid, next_g + jnp.int32(1), jnp.int32(0),
+                )
+                _ilv_start = scatter_plan_group_bounds_smem[bt_sem_id, _ilv_safe_g]
+                _ilv_end = lax.select(
+                    _ilv_valid,
+                    scatter_plan_group_bounds_smem[bt_sem_id, _ilv_safe_g1],
+                    _ilv_start,
+                )
+                scatter_cursor_smem[bt_sem_id, 0] = lax.select(
+                    _ilv_valid, _ilv_start, jnp.int32(0),
+                )
+                scatter_cursor_smem[bt_sem_id, 1] = lax.select(
+                    _ilv_valid, _ilv_end, jnp.int32(0),
+                )
+
             start_a2a_gather(
                 bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
                 local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
@@ -2246,6 +2475,9 @@ def jax_allreduce_metadata_by_bt(
         "w2_fetch_order", "w2_fetch_priority",
         "skip_inter_bt_sync",
         "interleave_bt",
+        "per_expert_scatter",
+        "interleaved_scatter",
+        "use_sc_presort",
     ],
 )
 def fused_ep_moe_v2(
@@ -2310,6 +2542,9 @@ def fused_ep_moe_v2(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
+    per_expert_scatter: bool = False,
+    interleaved_scatter: bool = False,
+    use_sc_presort: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -2339,6 +2574,7 @@ def fused_ep_moe_v2(
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     num_devices = ep_size
+    tp_size = mesh.shape[tp_axis_name]
 
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
@@ -2420,6 +2656,7 @@ def fused_ep_moe_v2(
             )
 
     needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1
+    needs_precomputed_metadata = needs_jax_allreduce or use_sc_presort
 
     padded_num_experts = align_to(num_experts, 128)
     pad_topk_to_128 = _env_bool("FUSED_MOE_V2_PAD_TOPK_TO_128", True)
@@ -2520,6 +2757,10 @@ def fused_ep_moe_v2(
         scope_name += "-interleave_bt"
     if w1_shared is not None:
         scope_name += f"-se_bse_{bse}"
+    if per_expert_scatter:
+        scope_name += "-per_expert_scatter"
+    if interleaved_scatter:
+        scope_name += "-interleaved_scatter"
 
     scratch_shapes = (
         # SMEM: routing/metadata
@@ -2533,6 +2774,19 @@ def fused_ep_moe_v2(
             if use_bt_banking else
             pltpu.SMEM((expert_buffer_count,), jnp.int32)
         ),                                                                  # a2a_s_sends
+        # SMEM: per-expert scatter plan
+        (
+            pltpu.SMEM((smem_banks, bt * top_k), jnp.int32)
+            if (per_expert_scatter or interleaved_scatter or use_sc_presort) else None
+        ),                                                                  # scatter_plan
+        (
+            pltpu.SMEM((smem_banks, local_num_experts + 1), jnp.int32)
+            if (per_expert_scatter or interleaved_scatter or use_sc_presort) else None
+        ),                                                                  # scatter_plan_group_bounds
+        (
+            pltpu.SMEM((smem_banks, 2), jnp.int32)
+            if (per_expert_scatter or interleaved_scatter or use_sc_presort) else None
+        ),                                                                  # scatter_cursor
         # VMEM: gather accumulation
         pltpu.VMEM((2, top_k, acc_bt, t_packing, h_per_t), t_dtype),       # a2a_g_acc
         # VMEM: topk
@@ -2662,6 +2916,9 @@ def fused_ep_moe_v2(
                 ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                per_expert_scatter=per_expert_scatter,
+                interleaved_scatter=interleaved_scatter,
+                use_sc_presort=use_sc_presort,
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
             ),
@@ -2684,9 +2941,11 @@ def fused_ep_moe_v2(
                     None if w1_shared is None else hbm_spec,                # w1_shared
                     None if w3_shared is None else hbm_spec,                # w3_shared
                     None if w2_shared is None else hbm_spec,                # w2_shared
-                    None if not needs_jax_allreduce else hbm_spec,          # metadata_starts
-                    None if not needs_jax_allreduce else hbm_spec,          # metadata_sizes
-                    None if not needs_jax_allreduce else hbm_spec,          # metadata_d2e_counts
+                    None if not needs_precomputed_metadata else hbm_spec,   # metadata_starts
+                    None if not needs_precomputed_metadata else hbm_spec,   # metadata_sizes
+                    None if not needs_precomputed_metadata else hbm_spec,   # metadata_d2e_counts
+                    None if not use_sc_presort else hbm_spec,               # scatter_plan
+                    None if not use_sc_presort else hbm_spec,               # scatter_group_bounds
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -2742,7 +3001,33 @@ def fused_ep_moe_v2(
                 constant_values=-1,
             )
 
-        if needs_jax_allreduce:
+        if use_sc_presort:
+            try:
+                from .sc_presort import sc_presort_scatter_plan
+            except ImportError:
+                from sc_presort import sc_presort_scatter_plan
+            md_starts, md_sizes, md_d2e, plan_packed, group_bounds, _rc = (
+                sc_presort_scatter_plan(
+                    topk_ids,
+                    bt=bt, top_k=top_k, padded_top_k=padded_top_k,
+                    num_devices=num_devices, padded_num_experts=padded_num_experts,
+                    local_num_experts=local_num_experts,
+                    num_bt=num_bt,
+                    tp_size=tp_size,
+                    dp_axis_name=dp_axis_name,
+                    tp_axis_name=tp_axis_name,
+                )
+            )
+            md_starts_arg = pltpu.with_memory_space_constraint(md_starts, pltpu.HBM)
+            md_sizes_arg = pltpu.with_memory_space_constraint(md_sizes, pltpu.HBM)
+            md_d2e_arg = pltpu.with_memory_space_constraint(md_d2e, pltpu.HBM)
+            scatter_plan_arg = pltpu.with_memory_space_constraint(
+                plan_packed, pltpu.HBM,
+            )
+            scatter_gb_arg = pltpu.with_memory_space_constraint(
+                group_bounds[:, :local_num_experts + 1], pltpu.HBM,
+            )
+        elif needs_jax_allreduce:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k], padded_num_experts, bt,
                 num_devices, dp_axis_name, tp_axis_name,
@@ -2750,10 +3035,14 @@ def fused_ep_moe_v2(
             md_starts_arg = pltpu.with_memory_space_constraint(md_starts, pltpu.HBM)
             md_sizes_arg = pltpu.with_memory_space_constraint(md_sizes, pltpu.HBM)
             md_d2e_arg = pltpu.with_memory_space_constraint(md_d2e, pltpu.HBM)
+            scatter_plan_arg = None
+            scatter_gb_arg = None
         else:
             md_starts_arg = None
             md_sizes_arg = None
             md_d2e_arg = None
+            scatter_plan_arg = None
+            scatter_gb_arg = None
 
         out = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),
@@ -2780,6 +3069,8 @@ def fused_ep_moe_v2(
             md_starts_arg,
             md_sizes_arg,
             md_d2e_arg,
+            scatter_plan_arg,
+            scatter_gb_arg,
         )
         if pad_local > 0:
             out = out[:orig_local_num_tokens]
