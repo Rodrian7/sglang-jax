@@ -21,6 +21,7 @@ from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
     build_tree_kernel_efficient,
+    build_tree_kernel_efficient_preprocess,
     build_tree_mask_for_draft_decode,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -136,6 +137,63 @@ class EagleDraftWorker(BaseDraftWorker):
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         verified_seq_lens = model_worker_batch.seq_lens - 1
+
+        if self.topk == 1:
+            self._draft_linear_chain(
+                model_worker_batch, score_list, token_list, parents_list, verified_seq_lens
+            )
+        else:
+            self._draft_tree(
+                model_worker_batch, score_list, token_list, parents_list, verified_seq_lens
+            )
+
+    def _draft_linear_chain(
+        self, model_worker_batch, score_list, token_list, parents_list, verified_seq_lens
+    ):
+        """topk=1 fast path: skip Pallas tree build, use causal FA masking."""
+        bs = model_worker_batch.seq_lens.shape[0]
+        q = self.speculative_num_draft_tokens
+
+        rep = NamedSharding(self.mesh, P())
+        verified_id, sl, tl, pl = jax.device_put(
+            (
+                model_worker_batch.spec_info_padded.verified_id,
+                score_list,
+                token_list,
+                parents_list,
+            ),
+            rep,
+        )
+        _, _, draft_tokens = build_tree_kernel_efficient_preprocess(
+            verified_id, sl, tl, pl, q, bs, model_worker_batch.speculative_num_steps
+        )
+
+        positions = np.repeat(verified_seq_lens, q) + np.tile(np.arange(q), bs)
+        retrive_index = np.arange(bs * q, dtype=np.int32).reshape(bs, q)
+        retrive_next_token = retrive_index + 1
+        retrive_next_token[:, -1] = -1
+        retrive_next_sibling = np.full((bs, q), -1, dtype=np.int32)
+
+        model_worker_batch.spec_info_padded = EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=None,
+            positions=jax.device_put(jnp.asarray(positions), rep),
+            retrive_index=jax.device_put(jnp.asarray(retrive_index), rep),
+            retrive_next_token=jax.device_put(jnp.asarray(retrive_next_token), rep),
+            retrive_next_sibling=jax.device_put(jnp.asarray(retrive_next_sibling), rep),
+            retrive_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=q,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            seq_lens_sum=model_worker_batch.seq_lens_sum,
+            seq_lens_cpu=model_worker_batch.seq_lens,
+        )
+
+    def _draft_tree(
+        self, model_worker_batch, score_list, token_list, parents_list, verified_seq_lens
+    ):
+        """topk>1: full tree build with Pallas kernel."""
         max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
         max_context_len = self._pick_context_len(max_seq_len)
         (
