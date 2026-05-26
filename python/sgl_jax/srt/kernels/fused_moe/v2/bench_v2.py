@@ -230,6 +230,7 @@ E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 bse = int(os.environ.get("BENCH_BSE", "256"))
+se_f = int(os.environ.get("BENCH_SE_F", "0"))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
@@ -770,7 +771,8 @@ if tune_mode:
 
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
-log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}")
+log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}" +
+    (f" se_f={se_f}" if se_f > 0 else ""))
 if routing_mode != "random":
     log(f"routing_mode={routing_mode}")
 log(f"sweep: tokens={token_candidates} bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}")
@@ -846,6 +848,37 @@ if use_fp8:
     w3, w3_scale_s = quantize_shard_map(w3)
     qbk_arg = quant_block_k
     log("fp8 quantization done")
+
+w1_shared_s = w2_shared_s = w3_shared_s = None
+w1_shared_scale_s = w2_shared_scale_s = w3_shared_scale_s = None
+if se_f > 0:
+    log(f"creating shared expert weights (se_f={se_f})...")
+    rep_sharding = jax.sharding.NamedSharding(mesh, P())
+    k_se1, k_se2, k_se3 = jax.random.split(jax.random.key(123), 3)
+    w1_se_bf16 = jax.device_put(
+        jax.random.normal(k_se1, (d, se_f), dtype=jnp.bfloat16) * 0.01, rep_sharding)
+    w3_se_bf16 = jax.device_put(
+        jax.random.normal(k_se2, (d, se_f), dtype=jnp.bfloat16) * 0.01, rep_sharding)
+    w2_se_bf16 = jax.device_put(
+        jax.random.normal(k_se3, (se_f, d), dtype=jnp.bfloat16) * 0.01, rep_sharding)
+    if use_fp8:
+        @jax.jit
+        def quantize_se_perchannel(w):
+            K, N = w.shape
+            w_f32 = w.astype(jnp.float32)
+            amax = jnp.max(jnp.abs(w_f32), axis=0, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            return w_q, scale.reshape(N).astype(jnp.bfloat16)
+
+        w1_shared_s, w1_shared_scale_s = quantize_se_perchannel(w1_se_bf16)
+        w3_shared_s, w3_shared_scale_s = quantize_se_perchannel(w3_se_bf16)
+        w2_shared_s, w2_shared_scale_s = quantize_se_perchannel(w2_se_bf16)
+    else:
+        w1_shared_s = w1_se_bf16
+        w3_shared_s = w3_se_bf16
+        w2_shared_s = w2_se_bf16
+    log("shared expert weights ready")
 
 log("weights ready")
 
@@ -1042,6 +1075,12 @@ for num_tokens in token_candidates:
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
+                w1_shared=w1_shared_s,
+                w2_shared=w2_shared_s,
+                w3_shared=w3_shared_s,
+                w1_shared_scale=w1_shared_scale_s,
+                w3_shared_scale=w3_shared_scale_s,
+                w2_shared_scale=w2_shared_scale_s,
             )
 
         try:
@@ -1124,6 +1163,12 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
+            w1_shared=w1_shared_s,
+            w2_shared=w2_shared_s,
+            w3_shared=w3_shared_s,
+            w1_shared_scale=w1_shared_scale_s,
+            w3_shared_scale=w3_shared_scale_s,
+            w2_shared_scale=w2_shared_scale_s,
         )
         ref_kwargs = {}
         if use_fp8:
@@ -1131,6 +1176,18 @@ if check_correctness:
             ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)
             ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
             ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
+        if se_f > 0:
+            if use_fp8:
+                w1_se_deq = (w1_shared_s.astype(jnp.float32) * w1_shared_scale_s.astype(jnp.float32).reshape(1, se_f)).astype(jnp.bfloat16)
+                w3_se_deq = (w3_shared_s.astype(jnp.float32) * w3_shared_scale_s.astype(jnp.float32).reshape(1, se_f)).astype(jnp.bfloat16)
+                w2_se_deq = (w2_shared_s.astype(jnp.float32) * w2_shared_scale_s.astype(jnp.float32).reshape(1, d)).astype(jnp.bfloat16)
+                ref_kwargs["w1_shared"] = jax.device_get(w1_se_deq)
+                ref_kwargs["w2_shared"] = jax.device_get(w2_se_deq)
+                ref_kwargs["w3_shared"] = jax.device_get(w3_se_deq)
+            else:
+                ref_kwargs["w1_shared"] = jax.device_get(w1_shared_s)
+                ref_kwargs["w2_shared"] = jax.device_get(w2_shared_s)
+                ref_kwargs["w3_shared"] = jax.device_get(w3_shared_s)
         ref = ref_moe(
             jax.device_get(tokens_c), jax.device_get(w1), jax.device_get(w2), jax.device_get(w3),
             jax.device_get(twts), jax.device_get(tidx), top_k,
