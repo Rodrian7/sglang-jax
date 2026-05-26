@@ -302,6 +302,7 @@ def _fused_ep_moe_kernel(
     disable_a2a_scatter_remote_copy: bool = False,
     disable_a2a_scatter_recv_wait: bool = False,
     disable_a2a_scatter_send_wait: bool = False,
+    skip_bt0_scatter: bool = False,  # Task 4: assume bt0 scatter prefetched
     disable_a2a_gather: bool = False,
     disable_a2a_gather_local_copy: bool = False,
     disable_a2a_gather_remote_copy: bool = False,
@@ -857,7 +858,23 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(token_start, token_end, _scatter_one_batch, None, unroll=False)
 
-    def start_a2a_scatter_batch(*, bt_sem_id, bt_start, a2a_bank_id):
+    def start_a2a_scatter_batch(*, bt_sem_id, bt_start, a2a_bank_id, bt_id=None):
+        if disable_a2a or disable_a2a_scatter:
+            return
+        # Task 4: skip bt0 scatter if assumed prefetched externally (SC kernel).
+        if skip_bt0_scatter and bt_id is not None:
+            init_a2a_scatter_batch(a2a_bank_id=a2a_bank_id)
+
+            @pl.when(bt_id != jnp.int32(0))
+            def _():
+                start_a2a_scatter_batch_range(
+                    bt_sem_id=bt_sem_id,
+                    bt_start=bt_start,
+                    a2a_bank_id=a2a_bank_id,
+                    token_start=jnp.int32(0),
+                    token_end=jnp.int32(bt),
+                )
+            return
         init_a2a_scatter_batch(a2a_bank_id=a2a_bank_id)
         start_a2a_scatter_batch_range(
             bt_sem_id=bt_sem_id,
@@ -869,7 +886,7 @@ def _fused_ep_moe_kernel(
 
     # ===== A2A scatter wait =====
 
-    def wait_a2a_scatter_send_batch(*, a2a_bank_id):
+    def wait_a2a_scatter_send_batch(*, a2a_bank_id, bt_id=None):
         if (
             disable_a2a
             or disable_a2a_scatter
@@ -881,7 +898,13 @@ def _fused_ep_moe_kernel(
         def _wait_one(slot, _):
             scatter_send_sz = scatter_sends_get(a2a_bank_id, slot)
 
-            @pl.when(scatter_send_sz != 0)
+            # Task 4: bt0 has no in-kernel send if prefetched, skip wait.
+            if skip_bt0_scatter and bt_id is not None:
+                cond = jnp.logical_and(scatter_send_sz != 0, bt_id != jnp.int32(0))
+            else:
+                cond = scatter_send_sz != 0
+
+            @pl.when(cond)
             def _():
                 ref = a2a_s_ref(a2a_bank_id, slot, 0, scatter_send_sz)
                 pltpu.make_async_copy(
@@ -892,7 +915,7 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
 
-    def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id):
+    def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id, bt_id=None):
         if disable_a2a or disable_a2a_scatter or disable_a2a_scatter_recv_wait:
             return
         e_id = my_id * local_num_experts + local_e_id
@@ -908,7 +931,13 @@ def _fused_ep_moe_kernel(
         else:
             sz = total_sz
 
-        @pl.when(sz != 0)
+        # Task 4: bt0 buffer assumed prefetched, skip the recv wait.
+        if skip_bt0_scatter and bt_id is not None:
+            cond = jnp.logical_and(sz != 0, bt_id != jnp.int32(0))
+        else:
+            cond = sz != 0
+
+        @pl.when(cond)
         def _():
             ref = a2a_s_ref(a2a_bank_id, e_sem_id, 0, sz)
             pltpu.make_async_copy(
@@ -2039,6 +2068,7 @@ def _fused_ep_moe_kernel(
                 start_a2a_scatter_batch(
                     bt_sem_id=bt_sem_id, bt_start=bt_start,
                     a2a_bank_id=a2a_bank_id,
+                    bt_id=bt_id,
                 )
 
             @pl.when(next_bt_id < num_bt)
@@ -2048,11 +2078,13 @@ def _fused_ep_moe_kernel(
                     bt_sem_id=next_bt_sem_id,
                     bt_start=next_bt_start,
                     a2a_bank_id=next_a2a_bank_id,
+                    bt_id=next_bt_id,
                 )
         else:
             start_a2a_scatter_batch(
                 bt_sem_id=bt_sem_id, bt_start=bt_start,
                 a2a_bank_id=a2a_bank_id,
+                bt_id=bt_id,
             )
 
         init_carry = (jnp.int32(0), jnp.bool_(False))
@@ -2068,6 +2100,7 @@ def _fused_ep_moe_kernel(
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=e_sem_id_local,
                 local_e_id=local_e_id, a2a_bank_id=a2a_bank_id,
+                bt_id=bt_id,
             )
             next_bf0_w13_prefetched = expert_ffn(
                 bt_sem_id, e_sem_id_local, local_e_id,
@@ -2097,7 +2130,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
         if not skip_post_gather:
-            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
+            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id, bt_id=bt_id)
 
         if not skip_post_gather:
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id)
@@ -2139,7 +2172,7 @@ def _fused_ep_moe_kernel(
             a2a_bank_id = a2a_bank_for_bt(bt_id)
             out_buf_id = bt_bank_id(bt_id)
 
-            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
+            wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id, bt_id=bt_id)
             wait_a2a_gather_recv_all(
                 bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id,
             )
@@ -2265,6 +2298,7 @@ def fused_ep_moe_v2(
     disable_a2a_scatter_remote_copy: bool = False,
     disable_a2a_scatter_recv_wait: bool = False,
     disable_a2a_scatter_send_wait: bool = False,
+    skip_bt0_scatter: bool = False,  # Task 4: assume bt0 scatter prefetched
     disable_a2a_gather: bool = False,
     disable_a2a_gather_local_copy: bool = False,
     disable_a2a_gather_remote_copy: bool = False,
@@ -2625,6 +2659,7 @@ def fused_ep_moe_v2(
                 disable_a2a_scatter_remote_copy=disable_a2a_scatter_remote_copy,
                 disable_a2a_scatter_recv_wait=disable_a2a_scatter_recv_wait,
                 disable_a2a_scatter_send_wait=disable_a2a_scatter_send_wait,
+                skip_bt0_scatter=skip_bt0_scatter,
                 disable_a2a_gather=disable_a2a_gather,
                 disable_a2a_gather_local_copy=disable_a2a_gather_local_copy,
                 disable_a2a_gather_remote_copy=disable_a2a_gather_remote_copy,

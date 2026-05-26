@@ -331,6 +331,7 @@ disable_a2a_scatter_recv_wait = (
 disable_a2a_scatter_send_wait = (
     all_disable or os.environ.get("DISABLE_A2A_SCATTER_SEND_WAIT", "0") == "1"
 )
+skip_bt0_scatter = os.environ.get("SKIP_BT0_SCATTER", "0") == "1"
 disable_a2a_gather = all_disable or os.environ.get("DISABLE_A2A_GATHER", "0") == "1"
 disable_a2a_gather_local_copy = (
     all_disable or os.environ.get("DISABLE_A2A_GATHER_LOCAL_COPY", "0") == "1"
@@ -1006,6 +1007,7 @@ for num_tokens in token_candidates:
                 disable_a2a_scatter_remote_copy=disable_a2a_scatter_remote_copy,
                 disable_a2a_scatter_recv_wait=disable_a2a_scatter_recv_wait,
                 disable_a2a_scatter_send_wait=disable_a2a_scatter_send_wait,
+                skip_bt0_scatter=skip_bt0_scatter,
                 disable_a2a_gather=disable_a2a_gather,
                 disable_a2a_gather_local_copy=disable_a2a_gather_local_copy,
                 disable_a2a_gather_remote_copy=disable_a2a_gather_remote_copy,
@@ -1124,6 +1126,7 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
+            skip_bt0_scatter=skip_bt0_scatter,
         )
         ref_kwargs = {}
         if use_fp8:
