@@ -1104,6 +1104,7 @@ for num_tokens in token_candidates:
                     else:
                         log(f"  {tag_resolved}: no timing data")
         except Exception as e:
+            import traceback; traceback.print_exc()
             log(f"  FAIL {tag}: {e}")
             continue
 
