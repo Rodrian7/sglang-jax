@@ -123,9 +123,13 @@ def _sc_scatter_kernel_body(
                         dst_slice=dst_slice,
                         target_dev=target_dev,
                     ):
+                        # 2-D mesh device_id: (dp_idx, tp_idx)
+                        dp_idx = target_dev // tp_size
+                        tp_idx = target_dev % tp_size
                         pltpu.make_async_remote_copy(
                             src_slice, dst_slice, send_sem, recv_sem,
-                            device_id=target_dev,
+                            device_id=(dp_idx, tp_idx),
+                            device_id_type=pltpu.DeviceIdType.MESH,
                         ).start()
 
             return dma_count + jnp.int32(1)
