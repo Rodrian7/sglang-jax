@@ -1924,7 +1924,7 @@ def _fused_ep_moe_kernel(
         se_n_chunk = min(1024, se_inter_size)
         se_n_chunks = se_inter_size // se_n_chunk
 
-        def _se_body(se_tokens, gate_acc, up_acc):
+        def _se_outer(se_tokens):
             bt_sem = bt_bank_id(bt_id)
 
             pltpu.make_async_copy(
@@ -1946,143 +1946,183 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[bt_sem, 0],
             ).wait()
 
-            for p_id in range(t_packing):
-                t_slice = se_tokens[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)]
+            for c_id in range(se_n_chunks):
+                n_start = c_id * se_n_chunk
 
-                for c_id in range(se_n_chunks):
-                    n_start = c_id * se_n_chunk
+                def _se_chunk(gate_chunk, up_chunk, c_id=c_id, n_start=n_start):
+                    for p_id in range(t_packing):
+                        t_slice = se_tokens[pl.ds(0, bt), p_id, pl.ds(0, h_per_t)]
 
-                    def _gate(w_buf, t_slice=t_slice, p_id=p_id, n_start=n_start):
-                        pltpu.make_async_copy(
-                            src_ref=w1_shared_hbm.at[
-                                pl.ds(p_id * h_per_t, h_per_t), pl.ds(n_start, se_n_chunk)
-                            ],
-                            dst_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
-                            sem=local_sems.at[bt_sem, 1],
-                        ).start()
-                        pltpu.make_async_copy(
-                            src_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
-                            dst_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
-                            sem=local_sems.at[bt_sem, 1],
-                        ).wait()
-                        part = jnp.dot(
-                            t_slice, w_buf[...], preferred_element_type=jnp.float32)
-                        g = gate_acc[...]
-                        gate_acc[...] = g.at[:, n_start:n_start+se_n_chunk].add(part)
-
-                    pl.run_scoped(_gate, pltpu.VMEM((h_per_t, se_n_chunk), w_dtype))
-
-                    def _up(w_buf, t_slice=t_slice, p_id=p_id, n_start=n_start):
-                        pltpu.make_async_copy(
-                            src_ref=w3_shared_hbm.at[
-                                pl.ds(p_id * h_per_t, h_per_t), pl.ds(n_start, se_n_chunk)
-                            ],
-                            dst_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
-                            sem=local_sems.at[bt_sem, 1],
-                        ).start()
-                        pltpu.make_async_copy(
-                            src_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
-                            dst_ref=w_buf.at[pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)],
-                            sem=local_sems.at[bt_sem, 1],
-                        ).wait()
-                        part = jnp.dot(
-                            t_slice, w_buf[...], preferred_element_type=jnp.float32)
-                        u = up_acc[...]
-                        up_acc[...] = u.at[:, n_start:n_start+se_n_chunk].add(part)
-
-                    pl.run_scoped(_up, pltpu.VMEM((h_per_t, se_n_chunk), w_dtype))
-
-            if w1_shared_scale_hbm is not None:
-                def _apply_scale(w1s, w3s):
-                    pltpu.make_async_copy(
-                        src_ref=w1_shared_scale_hbm.at[pl.ds(0, se_inter_size)],
-                        dst_ref=w1s.at[pl.ds(0, se_inter_size)],
-                        sem=local_sems.at[bt_sem, 1],
-                    ).start()
-                    pltpu.make_async_copy(
-                        src_ref=w3_shared_scale_hbm.at[pl.ds(0, se_inter_size)],
-                        dst_ref=w3s.at[pl.ds(0, se_inter_size)],
-                        sem=local_sems.at[bt_sem, 1],
-                    ).start()
-                    pltpu.make_async_copy(
-                        src_ref=w1s.at[pl.ds(0, se_inter_size)],
-                        dst_ref=w1s.at[pl.ds(0, se_inter_size)],
-                        sem=local_sems.at[bt_sem, 1],
-                    ).wait()
-                    pltpu.make_async_copy(
-                        src_ref=w3s.at[pl.ds(0, se_inter_size)],
-                        dst_ref=w3s.at[pl.ds(0, se_inter_size)],
-                        sem=local_sems.at[bt_sem, 1],
-                    ).wait()
-                    w1_scale = w1s[...].astype(jnp.float32).reshape(1, se_inter_size)
-                    w3_scale = w3s[...].astype(jnp.float32).reshape(1, se_inter_size)
-                    gate_acc[...] = gate_acc[...] * w1_scale
-                    up_acc[...] = up_acc[...] * w3_scale
-
-                pl.run_scoped(
-                    _apply_scale,
-                    pltpu.VMEM((se_inter_size,), jnp.bfloat16),
-                    pltpu.VMEM((se_inter_size,), jnp.bfloat16),
-                )
-
-            act = activation_fn(gate_acc[...], up_acc[...], act_fn)
-
-            for p_id in range(t_packing):
-                for c_id in range(se_n_chunks):
-                    n_start = c_id * se_n_chunk
-
-                    def _down(w_buf, w2s, act=act, p_id=p_id, c_id=c_id, n_start=n_start):
-                        pltpu.make_async_copy(
-                            src_ref=w2_shared_hbm.at[
-                                pl.ds(n_start, se_n_chunk), pl.ds(p_id * h_per_t, h_per_t)
-                            ],
-                            dst_ref=w_buf.at[pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)],
-                            sem=local_sems.at[bt_sem, 1],
-                        ).start()
-                        if w2_shared_scale_hbm is not None:
+                        def _gate(w_buf, t_slice=t_slice, p_id=p_id):
                             pltpu.make_async_copy(
-                                src_ref=w2_shared_scale_hbm.at[
-                                    pl.ds(p_id * h_per_t, h_per_t)
+                                src_ref=w1_shared_hbm.at[
+                                    pl.ds(p_id * h_per_t, h_per_t),
+                                    pl.ds(n_start, se_n_chunk),
                                 ],
-                                dst_ref=w2s.at[pl.ds(0, h_per_t)],
-                                sem=local_sems.at[bt_sem, 2],
+                                dst_ref=w_buf.at[
+                                    pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)
+                                ],
+                                sem=local_sems.at[bt_sem, 1],
                             ).start()
-                        pltpu.make_async_copy(
-                            src_ref=w_buf.at[pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)],
-                            dst_ref=w_buf.at[pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)],
-                            sem=local_sems.at[bt_sem, 1],
-                        ).wait()
-                        act_chunk = act[:, n_start:n_start+se_n_chunk]
-                        partial = jnp.dot(
-                            act_chunk, w_buf[...], preferred_element_type=jnp.float32)
-                        if w2_shared_scale_hbm is not None:
                             pltpu.make_async_copy(
-                                src_ref=w2s.at[pl.ds(0, h_per_t)],
-                                dst_ref=w2s.at[pl.ds(0, h_per_t)],
-                                sem=local_sems.at[bt_sem, 2],
+                                src_ref=w_buf.at[
+                                    pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)
+                                ],
+                                dst_ref=w_buf.at[
+                                    pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)
+                                ],
+                                sem=local_sems.at[bt_sem, 1],
                             ).wait()
-                            w2_scale = w2s[...].astype(jnp.float32).reshape(1, h_per_t)
-                            partial = partial * w2_scale
-                        out_ref = b_output_x2_vmem.at[
-                            out_buf_id, pl.ds(0, bt), pl.ds(p_id * h_per_t, h_per_t)
-                        ]
-                        if c_id == 0:
-                            out_ref[...] = partial.astype(t_dtype)
-                        else:
-                            prev = out_ref[...].astype(jnp.float32)
-                            out_ref[...] = (prev + partial).astype(t_dtype)
+                            gate_chunk[...] += jnp.dot(
+                                t_slice, w_buf[...],
+                                preferred_element_type=jnp.float32,
+                            )
 
-                    pl.run_scoped(
-                        _down,
-                        pltpu.VMEM((se_n_chunk, h_per_t), w2_shared_hbm.dtype),
-                        pltpu.VMEM((h_per_t,), jnp.bfloat16),
+                        pl.run_scoped(
+                            _gate, pltpu.VMEM((h_per_t, se_n_chunk), w_dtype)
+                        )
+
+                        def _up(w_buf, t_slice=t_slice, p_id=p_id):
+                            pltpu.make_async_copy(
+                                src_ref=w3_shared_hbm.at[
+                                    pl.ds(p_id * h_per_t, h_per_t),
+                                    pl.ds(n_start, se_n_chunk),
+                                ],
+                                dst_ref=w_buf.at[
+                                    pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)
+                                ],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).start()
+                            pltpu.make_async_copy(
+                                src_ref=w_buf.at[
+                                    pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)
+                                ],
+                                dst_ref=w_buf.at[
+                                    pl.ds(0, h_per_t), pl.ds(0, se_n_chunk)
+                                ],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).wait()
+                            up_chunk[...] += jnp.dot(
+                                t_slice, w_buf[...],
+                                preferred_element_type=jnp.float32,
+                            )
+
+                        pl.run_scoped(
+                            _up, pltpu.VMEM((h_per_t, se_n_chunk), w_dtype)
+                        )
+
+                    if w1_shared_scale_hbm is not None:
+                        def _apply_scale(w1s, w3s):
+                            pltpu.make_async_copy(
+                                src_ref=w1_shared_scale_hbm.at[
+                                    pl.ds(n_start, se_n_chunk)
+                                ],
+                                dst_ref=w1s.at[pl.ds(0, se_n_chunk)],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).start()
+                            pltpu.make_async_copy(
+                                src_ref=w3_shared_scale_hbm.at[
+                                    pl.ds(n_start, se_n_chunk)
+                                ],
+                                dst_ref=w3s.at[pl.ds(0, se_n_chunk)],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).start()
+                            pltpu.make_async_copy(
+                                src_ref=w1s.at[pl.ds(0, se_n_chunk)],
+                                dst_ref=w1s.at[pl.ds(0, se_n_chunk)],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).wait()
+                            pltpu.make_async_copy(
+                                src_ref=w3s.at[pl.ds(0, se_n_chunk)],
+                                dst_ref=w3s.at[pl.ds(0, se_n_chunk)],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).wait()
+                            s1 = w1s[...].astype(jnp.float32).reshape(1, se_n_chunk)
+                            s3 = w3s[...].astype(jnp.float32).reshape(1, se_n_chunk)
+                            gate_chunk[...] = gate_chunk[...] * s1
+                            up_chunk[...] = up_chunk[...] * s3
+
+                        pl.run_scoped(
+                            _apply_scale,
+                            pltpu.VMEM((se_n_chunk,), jnp.bfloat16),
+                            pltpu.VMEM((se_n_chunk,), jnp.bfloat16),
+                        )
+
+                    act_chunk = activation_fn(
+                        gate_chunk[...], up_chunk[...], act_fn
                     )
 
+                    for p_id in range(t_packing):
+                        def _down(w_buf, w2s, act_chunk=act_chunk, p_id=p_id, c_id=c_id):
+                            pltpu.make_async_copy(
+                                src_ref=w2_shared_hbm.at[
+                                    pl.ds(n_start, se_n_chunk),
+                                    pl.ds(p_id * h_per_t, h_per_t),
+                                ],
+                                dst_ref=w_buf.at[
+                                    pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)
+                                ],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).start()
+                            if w2_shared_scale_hbm is not None:
+                                pltpu.make_async_copy(
+                                    src_ref=w2_shared_scale_hbm.at[
+                                        pl.ds(p_id * h_per_t, h_per_t)
+                                    ],
+                                    dst_ref=w2s.at[pl.ds(0, h_per_t)],
+                                    sem=local_sems.at[bt_sem, 2],
+                                ).start()
+                            pltpu.make_async_copy(
+                                src_ref=w_buf.at[
+                                    pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)
+                                ],
+                                dst_ref=w_buf.at[
+                                    pl.ds(0, se_n_chunk), pl.ds(0, h_per_t)
+                                ],
+                                sem=local_sems.at[bt_sem, 1],
+                            ).wait()
+                            partial = jnp.dot(
+                                act_chunk, w_buf[...],
+                                preferred_element_type=jnp.float32,
+                            )
+                            if w2_shared_scale_hbm is not None:
+                                pltpu.make_async_copy(
+                                    src_ref=w2s.at[pl.ds(0, h_per_t)],
+                                    dst_ref=w2s.at[pl.ds(0, h_per_t)],
+                                    sem=local_sems.at[bt_sem, 2],
+                                ).wait()
+                                w2_scale = w2s[...].astype(jnp.float32).reshape(
+                                    1, h_per_t
+                                )
+                                partial = partial * w2_scale
+                            out_ref = b_output_x2_vmem.at[
+                                out_buf_id,
+                                pl.ds(0, bt),
+                                pl.ds(p_id * h_per_t, h_per_t),
+                            ]
+                            if c_id == 0:
+                                out_ref[...] = partial.astype(t_dtype)
+                            else:
+                                prev = out_ref[...].astype(jnp.float32)
+                                out_ref[...] = (prev + partial).astype(t_dtype)
+
+                        pl.run_scoped(
+                            _down,
+                            pltpu.VMEM(
+                                (se_n_chunk, h_per_t), w2_shared_hbm.dtype
+                            ),
+                            pltpu.VMEM((h_per_t,), jnp.bfloat16),
+                        )
+
+                pl.run_scoped(
+                    _se_chunk,
+                    pltpu.VMEM((bt, se_n_chunk), jnp.float32),
+                    pltpu.VMEM((bt, se_n_chunk), jnp.float32),
+                )
+
         pl.run_scoped(
-            _se_body,
+            _se_outer,
             pltpu.VMEM((bt, t_packing, h_per_t), t_dtype),
-            pltpu.VMEM((bt, se_inter_size), jnp.float32),
-            pltpu.VMEM((bt, se_inter_size), jnp.float32),
         )
 
     # ===== run_bt =====
