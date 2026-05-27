@@ -588,7 +588,7 @@ class FusedEPMoEV2(FusedEPMoE):
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",
-            enable_act_quant=True,  # hardcode for testing
+            enable_act_quant=False,  # hardcode off for A/B comparison
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
