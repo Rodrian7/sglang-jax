@@ -1363,7 +1363,9 @@ def _fused_ep_moe_kernel(
                     scale_bytes = b_x_vmem[
                         pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4),
                     ]
-                    scale_f32 = pltpu.bitcast(scale_bytes, jnp.float32)
+                    scale_f32 = pltpu.bitcast(
+                        scale_bytes[:, :, jnp.newaxis], jnp.float32,
+                    ).reshape(bts, 1)
                     b_x_scale_vmem.at[
                         pl.ds(0, bts), pl.ds(0, 1),
                     ][...] = scale_f32
@@ -2111,8 +2113,8 @@ def _fused_ep_moe_kernel(
                 q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
                 q = q.reshape(pq_chunk, t_packing, h_per_t)
                 scale_as_fp8 = pltpu.bitcast(
-                    x_scale, jnp.float8_e4m3fn,
-                )
+                    x_scale[:, :, jnp.newaxis], jnp.float8_e4m3fn,
+                ).reshape(pq_chunk, 4)
                 q = q.at[:, 0, h_per_t - 4:h_per_t].set(scale_as_fp8)
                 pq_fp8_buf[...] = q
 
