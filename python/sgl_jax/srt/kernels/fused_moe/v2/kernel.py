@@ -1359,7 +1359,7 @@ def _fused_ep_moe_kernel(
 
                 if enable_act_quant:
                     scale_raw = b_x_vmem[pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4)]
-                    x_scales = jnp.bitcast_convert_type(
+                    x_scales = jax.lax.bitcast_convert_type(
                         scale_raw.reshape(bts, 4), jnp.float32,
                     ).reshape(bts, 1)
                     b_x_scale_vmem.at[pl.ds(0, bts), pl.ds(0, 1)][...] = x_scales
@@ -2108,7 +2108,7 @@ def _fused_ep_moe_kernel(
                 packed = q.reshape(pq_chunk, t_packing, h_per_t)
 
                 pq_fp8_buf[...] = packed
-                scale_bytes = jnp.bitcast_convert_type(
+                scale_bytes = jax.lax.bitcast_convert_type(
                     scale.reshape(pq_chunk, 1), jnp.float8_e4m3fn,
                 )
                 pq_fp8_buf.at[:, 0, pl.ds(h_per_t - 4, 4)][...] = scale_bytes
