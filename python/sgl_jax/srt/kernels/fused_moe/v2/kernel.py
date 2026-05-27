@@ -334,6 +334,7 @@ def _fused_ep_moe_kernel(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
+    wb_slots: int = 2,
     direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool = False,
     direct_scaled_dot_ffn2: bool = False,
@@ -423,6 +424,7 @@ def _fused_ep_moe_kernel(
         and not disable_weight_load
         and num_bf >= 2
         and num_bf % 2 == 0
+        and wb_slots >= 2
     )
     # Same legality envelope as cross-expert prefetch: this experiment reuses
     # W1/W3 VMEM slots before W2 is dead. W1/W3 are dead after gate/up in both
@@ -1374,13 +1376,13 @@ def _fused_ep_moe_kernel(
                         )
                 else:
                     start_fetch_w13_w2(local_e_id, 0, 0)
-                if num_bf >= 2:
+                if num_bf >= 2 and wb_slots >= 2:
                     start_fetch_w13_w2(local_e_id, 1, 1)
 
                 for bf_id in range(num_bf):
-                    slot = bf_id % 2
+                    slot = bf_id % wb_slots
 
-                    next_bf_id = bf_id + 2
+                    next_bf_id = bf_id + wb_slots
 
                     if direct_scaled_dot_ffn1 and w1_scale_hbm is not None and bt <= 16:
                         wait_fetch_w1(slot)
@@ -2251,6 +2253,7 @@ def jax_allreduce_metadata_by_bt(
         "w2_fetch_order", "w2_fetch_priority",
         "skip_inter_bt_sync",
         "interleave_bt",
+        "wb_slots",
     ],
 )
 def fused_ep_moe_v2(
@@ -2315,6 +2318,7 @@ def fused_ep_moe_v2(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
+    wb_slots: int = 2,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -2322,6 +2326,11 @@ def fused_ep_moe_v2(
         raise ValueError(
             f"Unsupported {cross_expert_prefetch_mode=}; "
             "expected one of 'none', 'full', or 'w13'."
+        )
+    if wb_slots not in (1, 2):
+        raise ValueError(
+            f"Unsupported {wb_slots=}; expected 1 (single-buf weight, no cross-bf "
+            "weight DMA overlap) or 2 (double-buffered)."
         )
     if ffn1_dequant_mode not in ("full", "fchunk"):
         raise ValueError(
@@ -2470,7 +2479,6 @@ def fused_ep_moe_v2(
 
     acc_bt = math.gcd(bt, 16)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-    wb_slots = 2
     num_bt = local_num_tokens // bt
     use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
     use_gather_bank = interleave_bt and num_bt > 1
@@ -2514,6 +2522,8 @@ def fused_ep_moe_v2(
     if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
         scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
+    if wb_slots != 2:
+        scope_name += f"-wb{wb_slots}"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
     if route_smem_topk_only:
@@ -2677,6 +2687,7 @@ def fused_ep_moe_v2(
                 w2_fetch_priority=w2_fetch_priority,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
+                wb_slots=wb_slots,
                 direct_scaled_dot=direct_scaled_dot,
                 direct_scaled_dot_ffn1=direct_scaled_dot_ffn1,
                 direct_scaled_dot_ffn2=direct_scaled_dot_ffn2,

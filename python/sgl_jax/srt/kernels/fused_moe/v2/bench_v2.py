@@ -20,6 +20,7 @@ Env vars:
   BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_WB_SLOTS — comma-separated 1/2: weight double-buffer slots (1 = single-buffer, halves weight VMEM but disables cross-bf weight DMA overlap)
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -262,6 +263,7 @@ skip_inter_bt_sync_modes = parse_csv_bool(
 interleave_bt_modes = parse_csv_bool(
     "BENCH_INTERLEAVE_BT", [True],
 )
+wb_slots_list = parse_csv_int("BENCH_WB_SLOTS", [2])
 valid_ffn1_dequant_modes = {"full", "fchunk"}
 invalid_ffn1_dequant_modes = [
     mode for mode in ffn1_dequant_modes if mode not in valid_ffn1_dequant_modes
@@ -930,6 +932,7 @@ for num_tokens in token_candidates:
             w2_fetch_priorities,
             skip_inter_bt_sync_modes,
             interleave_bt_modes,
+            wb_slots_list,
         )
     ]
     seen_resolved_configs = set()
@@ -946,6 +949,7 @@ for num_tokens in token_candidates:
         w2_fetch_priority,
         skip_inter_bt_sync,
         interleave_bt,
+        wb_slots,
     ) in configs_to_try:
         if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
             continue
@@ -1061,6 +1065,7 @@ for num_tokens in token_candidates:
                 w2_fetch_priority=w2_fetch_priority,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
+                wb_slots=wb_slots,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
             )
@@ -1143,6 +1148,7 @@ if check_correctness:
             w2_fetch_priority=w2_fetch_priorities[0],
             skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
             interleave_bt=interleave_bt_modes[0],
+            wb_slots=wb_slots_list[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
         )
