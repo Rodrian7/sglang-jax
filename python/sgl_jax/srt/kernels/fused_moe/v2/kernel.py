@@ -2067,11 +2067,13 @@ def _fused_ep_moe_kernel(
 
                         if w1_shared_scale_hbm is not None:
                             scale_off = n_start % 1024
-                            s1 = w1s_buf[pl.ds(scale_off, se_n_chunk)].astype(
-                                jnp.float32
+                            s1_full = w1s_buf[...].astype(jnp.float32)
+                            s1 = lax.dynamic_slice(
+                                s1_full, (scale_off,), (se_n_chunk,)
                             ).reshape(1, se_n_chunk)
-                            s3 = w3s_buf[pl.ds(scale_off, se_n_chunk)].astype(
-                                jnp.float32
+                            s3_full = w3s_buf[...].astype(jnp.float32)
+                            s3 = lax.dynamic_slice(
+                                s3_full, (scale_off,), (se_n_chunk,)
                             ).reshape(1, se_n_chunk)
                             gate_chunk[...] = gate_chunk[...] * s1
                             up_chunk[...] = up_chunk[...] * s3
