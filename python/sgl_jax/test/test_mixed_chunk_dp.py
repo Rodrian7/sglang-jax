@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
-from sgl_jax.srt.managers.schedule_policy import PrefillAdder
+from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -18,6 +19,48 @@ class _DummyTreeCache:
         return 0
 
 
+class _DummySWAAllocator(SWATokenToKVPoolAllocator):
+    def __init__(self, full_available: int | list[int], swa_available: int | list[int]):
+        self.full_available = full_available
+        self.swa_available = swa_available
+
+    def _get(self, values: int | list[int], dp_rank: int):
+        if isinstance(values, list):
+            return values[dp_rank]
+        return values
+
+    def full_available_size(self, dp_rank: int = 0):
+        return self._get(self.full_available, dp_rank)
+
+    def swa_available_size(self, dp_rank: int = 0):
+        return self._get(self.swa_available, dp_rank)
+
+    def available_size(self, dp_rank: int = 0):
+        return min(
+            self.full_available_size(dp_rank=dp_rank),
+            self.swa_available_size(dp_rank=dp_rank),
+        )
+
+
+class _DummySWATreeCache(_DummyTreeCache):
+    disable = False
+
+    def __init__(self, sliding_window_size: int):
+        self.sliding_window_size = sliding_window_size
+
+    def full_evictable_size(self, dp_rank: int = 0):
+        return 0
+
+    def swa_evictable_size(self, dp_rank: int = 0):
+        return 0
+
+    def inc_lock_ref(self, last_node):
+        return "swa-lock"
+
+    def dec_lock_ref(self, last_node, swa_uuid_for_lock=None):
+        pass
+
+
 def _make_req(rid: str, dp_rank: int, input_len: int = 4, output_len: int = 2) -> Req:
     req = Req(
         rid=rid,
@@ -29,6 +72,29 @@ def _make_req(rid: str, dp_rank: int, input_len: int = 4, output_len: int = 2) -
         vocab_size=32000,
     )
     req.output_ids = list(range(output_len))
+    return req
+
+
+def _make_prefill_req(
+    rid: str,
+    dp_rank: int,
+    input_len: int,
+    max_new_tokens: int = 8,
+) -> Req:
+    req = Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=list(range(input_len)),
+        sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+        dp_rank=dp_rank,
+        eos_token_ids={2},
+        vocab_size=32000,
+    )
+    req.fill_ids = req.origin_input_ids
+    req.prefix_indices = np.empty(0, dtype=np.int32)
+    req.extend_input_len = input_len
+    req.host_hit_length = 0
+    req.last_node = object()
     return req
 
 
@@ -163,6 +229,46 @@ class TestMixedChunkDP(unittest.TestCase):
         self.assertEqual(adder.cur_rem_token_offset, [3, 1])
         self.assertEqual(adder.rem_input_tokens, 96)
         self.assertEqual(adder.rem_chunk_tokens_list, [17, 19])
+
+    def test_hybrid_prefill_budget_is_not_limited_by_full_input_swa_size(self):
+        adder = PrefillAdder(
+            page_size=256,
+            tree_cache=_DummySWATreeCache(sliding_window_size=128),
+            token_to_kv_pool_allocator=_DummySWAAllocator(
+                full_available=100_000,
+                swa_available=8_192,
+            ),
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=2_048,
+            dp_size=1,
+        )
+        req = _make_prefill_req("long-prefill", dp_rank=0, input_len=16_384)
+
+        self.assertEqual(adder.cur_rem_tokens_for_dp(0), 100_000)
+        self.assertEqual(adder._swa_budget_for_req(req.extend_input_len, 0), 2_304)
+        self.assertEqual(adder.add_one_req(req), AddReqResult.CONTINUE)
+        self.assertEqual(req.extend_input_len, 2_048)
+        self.assertEqual(adder.rem_swa_token_offset[0], 2_304)
+
+    def test_hybrid_prefill_rejects_when_swa_budget_is_really_insufficient(self):
+        adder = PrefillAdder(
+            page_size=256,
+            tree_cache=_DummySWATreeCache(sliding_window_size=128),
+            token_to_kv_pool_allocator=_DummySWAAllocator(
+                full_available=100_000,
+                swa_available=2_304,
+            ),
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100_000,
+            rem_chunk_tokens=2_048,
+            dp_size=1,
+        )
+        req = _make_prefill_req("long-prefill", dp_rank=0, input_len=16_384)
+
+        self.assertEqual(adder.add_one_req(req), AddReqResult.NO_TOKEN)
 
 
 if __name__ == "__main__":
