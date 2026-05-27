@@ -1970,14 +1970,16 @@ def _fused_ep_moe_kernel(
                     ).wait()
 
                 if w1_shared_scale_hbm is not None:
+                    se_scale_tile = 1024
+                    scale_tile_start = (n_start // se_scale_tile) * se_scale_tile
                     pltpu.make_async_copy(
-                        src_ref=w1_shared_scale_hbm.at[pl.ds(n_start, se_n_chunk)],
-                        dst_ref=w1s_buf.at[pl.ds(0, se_n_chunk)],
+                        src_ref=w1_shared_scale_hbm.at[pl.ds(scale_tile_start, se_scale_tile)],
+                        dst_ref=w1s_buf.at[pl.ds(0, se_scale_tile)],
                         sem=local_sems.at[se_sem_slot, 2],
                     ).start()
                     pltpu.make_async_copy(
-                        src_ref=w3_shared_scale_hbm.at[pl.ds(n_start, se_n_chunk)],
-                        dst_ref=w3s_buf.at[pl.ds(0, se_n_chunk)],
+                        src_ref=w3_shared_scale_hbm.at[pl.ds(scale_tile_start, se_scale_tile)],
+                        dst_ref=w3s_buf.at[pl.ds(0, se_scale_tile)],
                         sem=local_sems.at[se_sem_slot, 2],
                     ).start()
                     for p_id, dst in ((0, w2s_p0_buf), (1, w2s_p1_buf)):
@@ -1990,8 +1992,8 @@ def _fused_ep_moe_kernel(
                         ).start()
                     for _ in range(4):
                         pltpu.make_async_copy(
-                            src_ref=w1s_buf.at[pl.ds(0, se_n_chunk)],
-                            dst_ref=w1s_buf.at[pl.ds(0, se_n_chunk)],
+                            src_ref=w1s_buf.at[pl.ds(0, se_scale_tile)],
+                            dst_ref=w1s_buf.at[pl.ds(0, se_scale_tile)],
                             sem=local_sems.at[se_sem_slot, 2],
                         ).wait()
 
@@ -2064,12 +2066,13 @@ def _fused_ep_moe_kernel(
                         )
 
                         if w1_shared_scale_hbm is not None:
-                            s1 = w1s_buf[...].astype(jnp.float32).reshape(
-                                1, se_n_chunk
-                            )
-                            s3 = w3s_buf[...].astype(jnp.float32).reshape(
-                                1, se_n_chunk
-                            )
+                            scale_off = n_start % 1024
+                            s1 = w1s_buf[pl.ds(scale_off, se_n_chunk)].astype(
+                                jnp.float32
+                            ).reshape(1, se_n_chunk)
+                            s3 = w3s_buf[pl.ds(scale_off, se_n_chunk)].astype(
+                                jnp.float32
+                            ).reshape(1, se_n_chunk)
                             gate_chunk[...] = gate_chunk[...] * s1
                             up_chunk[...] = up_chunk[...] * s3
 
@@ -2141,8 +2144,8 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM((h_per_t, se_n_chunk), w_dtype),
                 pltpu.VMEM((se_n_chunk, h_per_t), w_dtype),
                 pltpu.VMEM((se_n_chunk, h_per_t), w_dtype),
-                pltpu.VMEM((se_n_chunk,), jnp.bfloat16),
-                pltpu.VMEM((se_n_chunk,), jnp.bfloat16),
+                pltpu.VMEM((1024,), jnp.bfloat16),
+                pltpu.VMEM((1024,), jnp.bfloat16),
                 pltpu.VMEM((h_per_t,), jnp.bfloat16),
                 pltpu.VMEM((h_per_t,), jnp.bfloat16),
             )
