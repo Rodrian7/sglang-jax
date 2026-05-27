@@ -181,6 +181,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = [[] for _ in range(dp_size)]
         self.is_not_in_free_group = True
 
+        # Bitmap for O(1) page-availability checks in free().
+        # _page_avail[rank][page_id] == True  ⟹  page is in free_pages or release_pages.
+        # Replaces O(n log n) np.setdiff1d calls with O(k) boolean indexing.
+        self._page_avail = []
+        for rank in range(dp_size):
+            ba = np.zeros(self.pages_per_rank + 1, dtype=bool)
+            ba[self.free_pages[rank]] = True
+            self._page_avail.append(ba)
+
     def alloc(self, need_size: int, dp_rank: int = 0) -> np.ndarray | None:
         """Page-aligned allocation."""
         assert need_size % self.page_size == 0, "The allocation size should be page-aligned"
@@ -193,6 +202,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[dp_rank][:num_pages].copy()
         self.free_pages[dp_rank] = self.free_pages[dp_rank][num_pages:]
+        self._page_avail[dp_rank][out_pages] = False
 
         # Generate contiguous indices using numpy internally
         page_indices = out_pages[:, None] * self.page_size + np.arange(self.page_size)
@@ -297,6 +307,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             allocated_pages, prefix_lens_np, extend_lens, last_loc_np, extend_num_tokens
         )
         self.free_pages[dp_rank] = self.free_pages[dp_rank][pages_used:]
+        self._page_avail[dp_rank][allocated_pages[:pages_used]] = False
         return out_indices
 
     def _alloc_decode_impl(
@@ -353,6 +364,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             allocated_pages, needs_new_page, last_loc_np, batch_size
         )
         self.free_pages[dp_rank] = self.free_pages[dp_rank][pages_used:]
+        self._page_avail[dp_rank][allocated_pages[:pages_used]] = False
         return out_indices
 
     def free(self, free_index: np.ndarray, dp_rank: int = 0):
@@ -361,12 +373,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_pages = np.unique(free_index // self.page_size)
-            rel_pages = self.release_pages[dp_rank]
-            f_pages = self.free_pages[dp_rank]
-            free_pages = np.setdiff1d(free_pages, rel_pages)
-            free_pages = np.setdiff1d(free_pages, f_pages)
-            if len(free_pages) > 0:
-                self.release_pages[dp_rank] = np.concatenate([free_pages, rel_pages])
+            # O(k) bitmap check replaces two O(n log n) setdiff1d calls.
+            avail = self._page_avail[dp_rank]
+            mask = ~avail[free_pages]
+            new_pages = free_pages[mask]
+            if len(new_pages) > 0:
+                avail[new_pages] = True
+                self.release_pages[dp_rank] = np.concatenate(
+                    [new_pages, self.release_pages[dp_rank]]
+                )
         else:
             self.free_group[dp_rank].append(free_index)
 
@@ -390,6 +405,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages[rank] = np.arange(1, self.pages_per_rank + 1, dtype=np.int32)
             self.release_pages[rank] = np.empty(0, dtype=np.int32)
             self.free_group[rank] = []
+            self._page_avail[rank][:] = False
+            self._page_avail[rank][self.free_pages[rank]] = True
         self.is_not_in_free_group = True
 
     def get_cpu_copy(self, indices):
@@ -397,6 +414,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def backup_state(self):
+        return (self.free_pages, self.release_pages, [a.copy() for a in self._page_avail])
+
+    def restore_state(self, state):
+        self.free_pages, self.release_pages, self._page_avail = state
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
