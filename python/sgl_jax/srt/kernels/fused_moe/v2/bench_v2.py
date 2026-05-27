@@ -255,6 +255,7 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
 enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
+skip_prequant_compute = os.environ.get("BENCH_SKIP_PREQUANT_COMPUTE", "0") == "1"
 ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
 ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
@@ -1099,6 +1100,7 @@ for num_tokens in token_candidates:
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
                 enable_act_quant=enable_act_quant,
+                skip_prequant_compute=skip_prequant_compute,
             )
 
         try:

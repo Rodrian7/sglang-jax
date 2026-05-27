@@ -335,6 +335,7 @@ def _fused_ep_moe_kernel(
     bse: int,
     quant_block_k: int | None = None,
     enable_act_quant: bool = False,
+    skip_prequant_compute: bool = False,  # debug: skip prequant kernel body (garbage data, perf-only)
 ):
     # ===== Dimension extraction =====
     dp_rank = lax.axis_index(dp_axis_name)
@@ -1954,7 +1955,7 @@ def _fused_ep_moe_kernel(
 
     # ===== standalone prequant (act_quant) =====
 
-    if enable_act_quant:
+    if enable_act_quant and not skip_prequant_compute:
         def _prequant_tokens(
             pq_bf16_buf, pq_fp8_buf, pq_load_sem, pq_store_sem,
         ):
@@ -2272,6 +2273,7 @@ def jax_allreduce_metadata_by_bt(
         "skip_inter_bt_sync",
         "interleave_bt",
         "enable_act_quant",
+        "skip_prequant_compute",
     ],
 )
 def fused_ep_moe_v2(
@@ -2335,6 +2337,7 @@ def fused_ep_moe_v2(
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
     enable_act_quant: bool = False,
+    skip_prequant_compute: bool = False,
 ):
     if cross_expert_prefetch_mode not in ("none", "full", "w13"):
         raise ValueError(
@@ -2714,6 +2717,7 @@ def fused_ep_moe_v2(
                 bt=bt, bf=bf, btc=btc, bts=bts, bse=bse,
                 quant_block_k=quant_block_k,
                 enable_act_quant=enable_act_quant,
+                skip_prequant_compute=skip_prequant_compute,
             ),
             out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), out_dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
