@@ -1921,7 +1921,7 @@ def _fused_ep_moe_kernel(
             return
 
         w_dtype = w1_shared_hbm.dtype
-        se_n_chunk = min(1024, se_inter_size)
+        se_n_chunk = min(512, se_inter_size)
         se_n_chunks = se_inter_size // se_n_chunk
         se_sem_slot = jnp.int32(0)
 
