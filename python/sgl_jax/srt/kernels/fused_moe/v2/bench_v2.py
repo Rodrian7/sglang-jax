@@ -11,7 +11,7 @@ Env vars:
   BENCH_BTS     — comma-separated bts candidates (default: auto)
   BENCH_BSE     — bse value (default: 256)
   BENCH_FP8     — 1 to enable fp8 weights
-  BENCH_QBK     — quant_block_k for fp8 (default: 128)
+  BENCH_QBK     — quant_block_k for fp8 (default: 128, 0=per-channel)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_DIRECT_SCALED_DOT_FFN1/FFN2 — optional comma-separated 0/1 hybrid sweep
   BENCH_FFN1_DEQUANT_MODE — full or fchunk when FFN1 direct-scaled-dot is off
@@ -20,6 +20,7 @@ Env vars:
   BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_ACT_QUANT — 1 to enable in-kernel bf16->fp8 act quantization
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -230,12 +231,11 @@ E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 bse = int(os.environ.get("BENCH_BSE", "256"))
-se_f = int(os.environ.get("BENCH_SE_F", "0"))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
 use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
-quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
+quant_block_k = int(os.environ.get("BENCH_QBK", "128")) or None
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
@@ -248,6 +248,7 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 )
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
+enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
 ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
 ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
@@ -397,6 +398,8 @@ if active_ablation:
     log(f"ablation flags: {active_ablation}")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
+if enable_act_quant:
+    log("enable_act_quant=True (bf16->fp8 per-token prequant, scatter BW halved, fp8xfp8 FFN1)")
 if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
     log(
         "input cast controls: "
@@ -534,9 +537,11 @@ def _estimate_vmem_bytes_v2(
     b_w3_scale = 0
     b_w2_scale = 0
     if use_fp8:
-        b_w1_scale = 2 * t_packing * (h_per_t // quant_block_k) * bf * 4
+        _n_sg = 1 if quant_block_k is None else h_per_t // quant_block_k
+        _n_sg2 = 1 if quant_block_k is None else bf // quant_block_k
+        b_w1_scale = 2 * t_packing * _n_sg * bf * 4
         b_w3_scale = b_w1_scale
-        b_w2_scale = 2 * t_packing * (bf // quant_block_k) * h_per_t * 4
+        b_w2_scale = 2 * t_packing * _n_sg2 * h_per_t * 4
 
     # Dequant scratch (fp8 + not direct_scaled_dot)
     b_w1_dq = 0
@@ -551,11 +556,14 @@ def _estimate_vmem_bytes_v2(
     b_gate_acc = bts * bf * 4
     b_up_acc = bts * bf * 4
     # Token staging: (bts, t_packing, h_per_t) t_dtype
-    b_x = bts * hidden_size * token_bytes
-    # Output accumulator: (bts, t_packing, h_per_t) f32
+    x_token_bytes = 1 if enable_act_quant else token_bytes
+    b_x = bts * hidden_size * x_token_bytes
+    # Output accumulator: (bts, out_packing, h_per_out) f32
     b_y_acc = bts * hidden_size * 4
-    # Output staging: (bts, t_packing, h_per_t) t_dtype
+    # Output staging: (bts, out_packing, h_per_out) out_dtype
     b_y_stage = bts * hidden_size * token_bytes
+    # Per-token activation scale (act_quant only): (bts, 128) f32
+    b_x_scale = bts * 128 * 4 if enable_act_quant else 0
 
     # Scoped metadata temporaries (run_scoped, only one path active)
     local_num_experts = num_experts // ep_size
@@ -591,7 +599,7 @@ def _estimate_vmem_bytes_v2(
         + b_w1 + b_w3 + b_w2
         + b_w1_scale + b_w3_scale + b_w2_scale
         + b_w1_dq + b_w3_dq + b_w2_dq
-        + b_gate_acc + b_up_acc + b_x + b_y_acc + b_y_stage
+        + b_gate_acc + b_up_acc + b_x + b_y_acc + b_y_stage + b_x_scale
         + b_scoped + b_sems
     )
 
@@ -771,8 +779,7 @@ if tune_mode:
 
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
-log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}" +
-    (f" se_f={se_f}" if se_f > 0 else ""))
+log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}")
 if routing_mode != "random":
     log(f"routing_mode={routing_mode}")
 log(f"sweep: tokens={token_candidates} bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}")
@@ -824,7 +831,7 @@ w3 = make_sharded(k4, (E, d, f), jnp.bfloat16, 0.01)
 w1_scale_s = w2_scale_s = w3_scale_s = None
 qbk_arg = None
 if use_fp8:
-    log(f"quantizing weights to fp8 (quant_block_k={quant_block_k})...")
+    log(f"quantizing weights to fp8 ({('per-channel' if quant_block_k is None else f'quant_block_k={quant_block_k}')})...")
 
     @jax.jit
     @jax.shard_map(
@@ -836,49 +843,25 @@ if use_fp8:
     def quantize_shard_map(w):
         local_w = w
         E_loc, K_dim, N_dim = local_w.shape
-        w_f32 = local_w.astype(jnp.float32).reshape(E_loc, K_dim // quant_block_k, quant_block_k, N_dim)
-        amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
-        scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
-        w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
-        w_q = w_q.reshape(E_loc, K_dim, N_dim)
-        return w_q, scale.astype(jnp.float32)
+        if quant_block_k is None:
+            w_f32 = local_w.astype(jnp.float32)
+            amax = jnp.max(jnp.abs(w_f32), axis=1, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            return w_q, scale[:, jnp.newaxis, :, :]
+        else:
+            w_f32 = local_w.astype(jnp.float32).reshape(E_loc, K_dim // quant_block_k, quant_block_k, N_dim)
+            amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            w_q = w_q.reshape(E_loc, K_dim, N_dim)
+            return w_q, scale.astype(jnp.float32)
 
     w1, w1_scale_s = quantize_shard_map(w1)
     w2, w2_scale_s = quantize_shard_map(w2)
     w3, w3_scale_s = quantize_shard_map(w3)
     qbk_arg = quant_block_k
     log("fp8 quantization done")
-
-w1_shared_s = w2_shared_s = w3_shared_s = None
-w1_shared_scale_s = w2_shared_scale_s = w3_shared_scale_s = None
-if se_f > 0:
-    log(f"creating shared expert weights (se_f={se_f})...")
-    rep_sharding = jax.sharding.NamedSharding(mesh, P())
-    k_se1, k_se2, k_se3 = jax.random.split(jax.random.key(123), 3)
-    w1_se_bf16 = jax.device_put(
-        jax.random.normal(k_se1, (d, se_f), dtype=jnp.bfloat16) * 0.01, rep_sharding)
-    w3_se_bf16 = jax.device_put(
-        jax.random.normal(k_se2, (d, se_f), dtype=jnp.bfloat16) * 0.01, rep_sharding)
-    w2_se_bf16 = jax.device_put(
-        jax.random.normal(k_se3, (se_f, d), dtype=jnp.bfloat16) * 0.01, rep_sharding)
-    if use_fp8:
-        @jax.jit
-        def quantize_se_perchannel(w):
-            K, N = w.shape
-            w_f32 = w.astype(jnp.float32)
-            amax = jnp.max(jnp.abs(w_f32), axis=0, keepdims=True)
-            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
-            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
-            return w_q, scale.reshape(N).astype(jnp.bfloat16)
-
-        w1_shared_s, w1_shared_scale_s = quantize_se_perchannel(w1_se_bf16)
-        w3_shared_s, w3_shared_scale_s = quantize_se_perchannel(w3_se_bf16)
-        w2_shared_s, w2_shared_scale_s = quantize_se_perchannel(w2_se_bf16)
-    else:
-        w1_shared_s = w1_se_bf16
-        w3_shared_s = w3_se_bf16
-        w2_shared_s = w2_se_bf16
-    log("shared expert weights ready")
 
 log("weights ready")
 
@@ -1075,12 +1058,7 @@ for num_tokens in token_candidates:
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
-                w1_shared=w1_shared_s,
-                w2_shared=w2_shared_s,
-                w3_shared=w3_shared_s,
-                w1_shared_scale=w1_shared_scale_s,
-                w3_shared_scale=w3_shared_scale_s,
-                w2_shared_scale=w2_shared_scale_s,
+                enable_act_quant=enable_act_quant,
             )
 
         try:
@@ -1164,12 +1142,7 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
-            w1_shared=w1_shared_s,
-            w2_shared=w2_shared_s,
-            w3_shared=w3_shared_s,
-            w1_shared_scale=w1_shared_scale_s,
-            w3_shared_scale=w3_shared_scale_s,
-            w2_shared_scale=w2_shared_scale_s,
+            enable_act_quant=enable_act_quant,
         )
         ref_kwargs = {}
         if use_fp8:
@@ -1177,18 +1150,6 @@ if check_correctness:
             ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)
             ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
             ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
-        if se_f > 0:
-            if use_fp8:
-                w1_se_deq = (w1_shared_s.astype(jnp.float32) * w1_shared_scale_s.astype(jnp.float32).reshape(1, se_f)).astype(jnp.bfloat16)
-                w3_se_deq = (w3_shared_s.astype(jnp.float32) * w3_shared_scale_s.astype(jnp.float32).reshape(1, se_f)).astype(jnp.bfloat16)
-                w2_se_deq = (w2_shared_s.astype(jnp.float32) * w2_shared_scale_s.astype(jnp.float32).reshape(1, d)).astype(jnp.bfloat16)
-                ref_kwargs["w1_shared"] = jax.device_get(w1_se_deq)
-                ref_kwargs["w2_shared"] = jax.device_get(w2_se_deq)
-                ref_kwargs["w3_shared"] = jax.device_get(w3_se_deq)
-            else:
-                ref_kwargs["w1_shared"] = jax.device_get(w1_shared_s)
-                ref_kwargs["w2_shared"] = jax.device_get(w2_shared_s)
-                ref_kwargs["w3_shared"] = jax.device_get(w3_shared_s)
         ref = ref_moe(
             jax.device_get(tokens_c), jax.device_get(w1), jax.device_get(w2), jax.device_get(w3),
             jax.device_get(twts), jax.device_get(tidx), top_k,
@@ -1201,8 +1162,9 @@ if check_correctness:
         max_err = np.max(np.abs(result_f32 - ref_f32))
         rel_err = float(max_err / (np.max(np.abs(ref_f32)) + 1e-6))
         log(f"max_abs_err={max_err:.4f}, rel_err={rel_err:.6f}")
-        if rel_err > 0.05:
-            log("FAIL: relative error too high")
+        rel_threshold = 0.10 if enable_act_quant else 0.05
+        if rel_err > rel_threshold:
+            log(f"FAIL: relative error too high (threshold={rel_threshold})")
             sys.exit(1)
         log("PASS")
 
