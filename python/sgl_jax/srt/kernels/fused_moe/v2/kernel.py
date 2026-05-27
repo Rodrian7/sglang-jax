@@ -1360,18 +1360,15 @@ def _fused_ep_moe_kernel(
                     ).wait()
 
                 if enable_act_quant:
-                    scale_bytes = b_x_vmem[
-                        pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4),
+                    scale_f32 = b_x_vmem.bitcast(jnp.float32)[
+                        pl.ds(0, bts), 0, h_per_t - 1,
                     ]
-                    scale_f32 = pltpu.bitcast(
-                        scale_bytes[:, :, jnp.newaxis], jnp.float32,
-                    ).reshape(bts, 1)
                     b_x_scale_vmem.at[
                         pl.ds(0, bts), pl.ds(0, 1),
-                    ][...] = scale_f32
+                    ][...] = scale_f32[:, jnp.newaxis]
                     b_x_vmem.at[
-                        pl.ds(0, bts), 0, pl.ds(h_per_t - 4, 4),
-                    ][...] = jnp.zeros((bts, 4), jnp.float8_e4m3fn)
+                        pl.ds(0, bts), pl.ds(0, t_packing), h_per_t - 1,
+                    ][...] = jnp.zeros((bts, t_packing), jnp.float8_e4m3fn)
 
                 if can_cross_expert_prefetch:
                     use_prefetched_bf0 = jnp.logical_and(
@@ -2112,12 +2109,9 @@ def _fused_ep_moe_kernel(
                 )
                 q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
                 pq_fp8_buf[...] = q.reshape(pq_chunk, t_packing, h_per_t)
-                scale_as_fp8 = pltpu.bitcast(
-                    x_scale[:, :, jnp.newaxis], jnp.float8_e4m3fn,
-                ).reshape(pq_chunk, 4)
-                pq_fp8_buf.at[
-                    pl.ds(0, pq_chunk), 0, pl.ds(h_per_t - 4, 4),
-                ][...] = scale_as_fp8
+                pq_fp8_buf.bitcast(jnp.float32).at[
+                    pl.ds(0, pq_chunk), 0, h_per_t - 1,
+                ][...] = x_scale.reshape(pq_chunk)
 
                 pltpu.make_async_copy(
                     src_ref=pq_fp8_buf,
