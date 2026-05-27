@@ -578,50 +578,50 @@ class FusedEPMoEV2(FusedEPMoE):
             bc = block_config.effective_for(
                 num_tokens=hidden_states.shape[0], ep_size=self.ep_size,
             )
-            local_num_experts = self.num_experts // self.ep_size
             local_num_tokens = hidden_states.shape[0] // self.ep_size
-            padded_num_experts = ((self.num_experts + 127) // 128) * 128
-            # Reshape tokens to (n, t_packing, h_per_t) matching fused_moe layout.
-            t_dtype = hidden_states.dtype
-            t_packing = 32 // (jnp.dtype(t_dtype).itemsize * 8)
-            h_per_t = self.hidden_size // t_packing
-            tokens_reshaped = hidden_states.reshape(-1, t_packing, h_per_t)
-            # Per-bt metadata. We only need bt0's starts.
-            # Must run inside shard_map for axis_index("data"/"tensor") to be bound.
-            def _compute_starts(topk_ids_in):
-                starts, _, _ = jax_allreduce_metadata_by_bt(
-                    topk_ids_in, padded_num_experts, bc.bt,
-                    self.ep_size, "data", "tensor",
-                )
-                return starts[0, 0]  # bt0's expert_starts, (padded_num_experts,)
-
-            bt0_starts = jax.shard_map(
-                _compute_starts,
-                mesh=self.mesh,
-                in_specs=P(("data", "tensor")),
-                out_specs=P(),
-                check_vma=False,
-            )(topk_ids)
-            # a2a_max_tokens matches fused_moe internal calc.
-            import math as _math
-            def _align_to(a, b):
-                return ((a + b - 1) // b) * b
-            a2a_max_tokens = _align_to(bc.bt * self.ep_size, bc.bts)
             num_bt = local_num_tokens // bc.bt
-            num_bt_banks = num_bt if num_bt > 1 else 2  # match use_gather_bank logic
-            prefetched_a2a_s = sc_bt0_scatter(
-                tokens_reshaped, topk_ids, bt0_starts,
-                bt=bc.bt, bt_start=0, top_k=self.num_experts_per_tok,
-                local_num_experts=local_num_experts,
-                num_devices=self.ep_size,
-                a2a_max_tokens=a2a_max_tokens,
-                padded_num_experts=padded_num_experts,
-                num_bt_banks=num_bt_banks,
-                bt0_bank=0,
-                dp_axis_name="data",
-                tp_axis_name="tensor",
-                mesh=self.mesh,
-            )
+            # SC prefetch only helps when num_bt >= 2 (bt0 overlap exists).
+            # When num_bt == 1, fused_moe uses 4D a2a_s (no banking), prefetch is
+            # impossible and would cause shape mismatch.
+            if num_bt >= 2:
+                local_num_experts = self.num_experts // self.ep_size
+                padded_num_experts = ((self.num_experts + 127) // 128) * 128
+                t_dtype = hidden_states.dtype
+                t_packing = 32 // (jnp.dtype(t_dtype).itemsize * 8)
+                h_per_t = self.hidden_size // t_packing
+                tokens_reshaped = hidden_states.reshape(-1, t_packing, h_per_t)
+                # Per-bt metadata in shard_map to bind axes.
+                def _compute_starts(topk_ids_in):
+                    starts, _, _ = jax_allreduce_metadata_by_bt(
+                        topk_ids_in, padded_num_experts, bc.bt,
+                        self.ep_size, "data", "tensor",
+                    )
+                    return starts[0, 0]
+
+                bt0_starts = jax.shard_map(
+                    _compute_starts,
+                    mesh=self.mesh,
+                    in_specs=P(("data", "tensor")),
+                    out_specs=P(),
+                    check_vma=False,
+                )(topk_ids)
+
+                def _align_to(a, b):
+                    return ((a + b - 1) // b) * b
+                a2a_max_tokens = _align_to(bc.bt * self.ep_size, bc.bts)
+                prefetched_a2a_s = sc_bt0_scatter(
+                    tokens_reshaped, topk_ids, bt0_starts,
+                    bt=bc.bt, bt_start=0, top_k=self.num_experts_per_tok,
+                    local_num_experts=local_num_experts,
+                    num_devices=self.ep_size,
+                    a2a_max_tokens=a2a_max_tokens,
+                    padded_num_experts=padded_num_experts,
+                    num_bt_banks=num_bt,
+                    bt0_bank=0,
+                    dp_axis_name="data",
+                    tp_axis_name="tensor",
+                    mesh=self.mesh,
+                )
 
         output = fused_ep_moe_v2(
             self.mesh,
@@ -640,8 +640,8 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_weight_load=self.disable_weight_load,
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
-            use_jax_allreduce_metadata=enable_sc_prefetch,  # needed for jax_allreduce starts to match
-            skip_bt0_scatter=skip_bt0 or enable_sc_prefetch,
+            use_jax_allreduce_metadata=prefetched_a2a_s is not None,  # need matching metadata source
+            skip_bt0_scatter=skip_bt0 or (prefetched_a2a_s is not None),
             prefetched_a2a_s=prefetched_a2a_s,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
