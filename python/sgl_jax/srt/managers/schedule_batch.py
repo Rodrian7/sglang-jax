@@ -1897,14 +1897,7 @@ class ScheduleBatch:
             total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-
-        # Reuse scratch buffer from the pool to avoid per-step 4MB malloc.
-        # Grows monotonically to the largest bucket we've seen.
-        pool = self.req_to_token_pool
-        if pool._cache_loc_buf is None or pool._cache_loc_buf.size < total_cache_loc_size:
-            pool._cache_loc_buf = np.empty(max(cache_loc_paddings), dtype=np.int32)
-        cache_loc_cpu = pool._cache_loc_buf[:total_cache_loc_size]
-        cache_loc_cpu.fill(0)  # gap/tail must stay 0 — kernel reads them
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
 
