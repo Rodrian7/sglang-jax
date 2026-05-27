@@ -587,12 +587,21 @@ class FusedEPMoEV2(FusedEPMoE):
             h_per_t = self.hidden_size // t_packing
             tokens_reshaped = hidden_states.reshape(-1, t_packing, h_per_t)
             # Per-bt metadata. We only need bt0's starts.
-            starts_per_bt, _, _ = jax_allreduce_metadata_by_bt(
-                topk_ids, padded_num_experts, bc.bt,
-                self.ep_size, "data", "tensor",
-            )
-            # starts_per_bt: (num_bt, 1, padded_num_experts) → take bt0
-            bt0_starts = starts_per_bt[0, 0]  # (padded_num_experts,)
+            # Must run inside shard_map for axis_index("data"/"tensor") to be bound.
+            def _compute_starts(topk_ids_in):
+                starts, _, _ = jax_allreduce_metadata_by_bt(
+                    topk_ids_in, padded_num_experts, bc.bt,
+                    self.ep_size, "data", "tensor",
+                )
+                return starts[0, 0]  # bt0's expert_starts, (padded_num_experts,)
+
+            bt0_starts = jax.shard_map(
+                _compute_starts,
+                mesh=self.mesh,
+                in_specs=P(("data", "tensor")),
+                out_specs=P(),
+                check_vma=False,
+            )(topk_ids)
             # a2a_max_tokens matches fused_moe internal calc.
             import math as _math
             def _align_to(a, b):
