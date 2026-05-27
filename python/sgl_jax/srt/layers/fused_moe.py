@@ -76,6 +76,7 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         use_jax_allreduce_metadata: bool = True,
+        enable_act_quant: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -105,6 +106,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
+        self.enable_act_quant = enable_act_quant
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -586,6 +588,7 @@ class FusedEPMoEV2(FusedEPMoE):
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",
+            enable_act_quant=self.enable_act_quant,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))

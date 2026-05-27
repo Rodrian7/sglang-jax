@@ -120,6 +120,7 @@ class MiMoV2Moe(nnx.Module):
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
                 use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", True),
+                enable_act_quant=getattr(config, "enable_act_quant", False),
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(

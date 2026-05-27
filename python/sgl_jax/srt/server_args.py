@@ -136,6 +136,7 @@ class ServerArgs:
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
+    enable_act_quant: bool = False
 
     grammar_backend: str | None = None
 
@@ -966,6 +967,13 @@ class ServerArgs:
                 "fall back to the Pallas DMA-based allgather. "
                 "Default uses JAX path (recommended)."
             ),
+        )
+
+        parser.add_argument(
+            "--enable-act-quant",
+            action="store_true",
+            default=ServerArgs.enable_act_quant,
+            help="Enable activation quantization (bf16->fp8) in fused EP-MoE v2 kernel.",
         )
 
         parser.add_argument(
