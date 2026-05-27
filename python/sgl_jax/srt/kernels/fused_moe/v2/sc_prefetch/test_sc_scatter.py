@@ -106,6 +106,8 @@ def main():
             num_devices=num_devices,
             a2a_max_tokens=a2a_max_tokens,
             padded_num_experts=padded_num_experts,
+            num_bt_banks=2,
+            bt0_bank=0,
             dp_axis_name="data",
             tp_axis_name="tensor",
             mesh=mesh,
