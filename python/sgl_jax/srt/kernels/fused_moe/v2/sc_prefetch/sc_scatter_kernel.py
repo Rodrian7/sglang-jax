@@ -106,26 +106,20 @@ def _make_kernel(
 
         lax.fori_loop(0, bt, _scatter_one_token, None, unroll=False)
 
-        # Drain all in-flight DMAs by waiting on send_sem and recv_sem
-        # the right number of times. Use dummy ref-self-copy wait pattern.
-        # Need bt * top_k waits total (each DMA signals once).
-        # Both local (recv_sem only) and remote (send_sem + recv_sem) DMAs
-        # signal recv_sem. So we expect ~bt * top_k recv_sem signals
-        # (minus invalid (-1) ones).
-        # For correctness, use a coarse barrier: wait bt * top_k times.
-        # NOTE: this serializes; better optimization is to count and wait exactly.
+        # Drain: wait recv_sem exactly bt * top_k times.
+        # This assumes all topk_ids are valid (>= 0). If invalid topk_ids
+        # exist, we manually signal recv_sem to balance via _signal_invalid
+        # inside _scatter_one_token (TODO).
+        # Static fori_loop bound (bt*top_k) avoids the SMEM-dynamic bound
+        # issue that caused v4 to hang.
+        n_drain_static = bt * top_k
+
         def _drain_one(i, _):
             ref = a2a_out_hbm.at[0, pl.ds(0, 1)]
             pltpu.make_async_copy(ref, ref, recv_sem).wait()
             return None
 
-        # We over-wait — wait `bt * top_k` times even though some were invalid.
-        # Invalid (-1) topk_ids skip DMA via @pl.when, so recv_sem signals
-        # are < bt * top_k. This would hang.
-        # Safe alternative: count valid ones in advance.
-        # For POC: trust caller passes only valid topk_ids and wait full count.
-        # TODO: properly handle invalid topk_ids in the wait count.
-        pass
+        lax.fori_loop(0, n_drain_static, _drain_one, None, unroll=False)
 
     return body
 
