@@ -368,15 +368,17 @@ def _fused_ep_moe_kernel(
     assert padded_num_experts == align_to(num_experts, 128)
     assert routing_smem_top_k in (top_k, align_to(top_k, 128))
 
-    t_dtype = tokens_hbm.dtype
-    t_packing = get_dtype_packing(t_dtype)
-    h_per_t = hidden_size // t_packing
-
     if enable_act_quant:
+        t_dtype = jnp.float8_e4m3fn
+        t_packing = get_dtype_packing(t_dtype)
+        h_per_t = hidden_size // t_packing
         out_dtype = output_hbm.dtype
         out_packing = get_dtype_packing(out_dtype)
         h_per_out = hidden_size // out_packing
     else:
+        t_dtype = tokens_hbm.dtype
+        t_packing = get_dtype_packing(t_dtype)
+        h_per_t = hidden_size // t_packing
         out_dtype = t_dtype
         out_packing = t_packing
         h_per_out = h_per_t
