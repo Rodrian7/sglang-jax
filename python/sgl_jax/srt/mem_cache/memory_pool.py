@@ -85,11 +85,6 @@ class ReqToTokenPool:
         # Use simple list to manage free slots
         self.free_slots = list(range(size))
 
-        # Scratch buffer for per-step cache_loc construction. Lazy-alloc on
-        # first use, reused across steps to avoid 4MB malloc/free churn.
-        # Not part of pytree (transient scratch).
-        self._cache_loc_buf: np.ndarray | None = None
-
     def tree_flatten(self):
         children = (self.req_to_token,)
         aux_data = {
@@ -110,7 +105,6 @@ class ReqToTokenPool:
         obj.free_slots = aux_data["free_slots"]
 
         obj.req_to_token = children[0]
-        obj._cache_loc_buf = None  # reset transient scratch on unflatten
 
         return obj
 
