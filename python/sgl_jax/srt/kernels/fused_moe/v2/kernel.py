@@ -874,85 +874,13 @@ def _fused_ep_moe_kernel(
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start, a2a_bank_id):
         init_a2a_scatter_batch(a2a_bank_id=a2a_bank_id)
-        if enable_act_quant:
-            bt_pq_chunks = bt // pq_chunk
-            assert bt % pq_chunk == 0
-
-            def _pq_and_scatter(
-                pq_bf16_buf, pq_fp8_buf, pq_load_sem, pq_store_sem,
-            ):
-                pltpu.make_async_copy(
-                    src_ref=tokens_hbm.at[pl.ds(bt_start, pq_chunk)],
-                    dst_ref=pq_bf16_buf,
-                    sem=pq_load_sem,
-                ).start()
-
-                for chunk_id in range(bt_pq_chunks):
-                    hbm_off = bt_start + chunk_id * pq_chunk
-
-                    pltpu.make_async_copy(
-                        src_ref=pq_bf16_buf, dst_ref=pq_bf16_buf,
-                        sem=pq_load_sem,
-                    ).wait()
-
-                    chunk_f32 = pq_bf16_buf[...].reshape(
-                        pq_chunk, hidden_size,
-                    ).astype(jnp.float32)
-                    x_amax = jnp.max(
-                        jnp.abs(chunk_f32), axis=-1, keepdims=True,
-                    )
-                    x_scale = jnp.maximum(
-                        x_amax / jnp.float32(448.0),
-                        jnp.float32(1e-12),
-                    )
-                    q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
-                    pq_fp8_buf[...] = q.reshape(pq_chunk, t_packing, h_per_t)
-                    pq_fp8_buf.bitcast(jnp.float32).at[
-                        pl.ds(0, pq_chunk), 0, h_per_t - 1,
-                    ][...] = x_scale.reshape(pq_chunk)
-
-                    pltpu.make_async_copy(
-                        src_ref=pq_fp8_buf,
-                        dst_ref=tokens_fp8_hbm.at[pl.ds(hbm_off, pq_chunk)],
-                        sem=pq_store_sem,
-                    ).start()
-
-                    if chunk_id + 1 < bt_pq_chunks:
-                        next_off = bt_start + (chunk_id + 1) * pq_chunk
-                        pltpu.make_async_copy(
-                            src_ref=tokens_hbm.at[pl.ds(next_off, pq_chunk)],
-                            dst_ref=pq_bf16_buf,
-                            sem=pq_load_sem,
-                        ).start()
-
-                    pltpu.make_async_copy(
-                        src_ref=pq_fp8_buf, dst_ref=pq_fp8_buf,
-                        sem=pq_store_sem,
-                    ).wait()
-
-                    start_a2a_scatter_batch_range(
-                        bt_sem_id=bt_sem_id,
-                        bt_start=bt_start,
-                        a2a_bank_id=a2a_bank_id,
-                        token_start=jnp.int32(chunk_id * pq_chunk),
-                        token_end=jnp.int32((chunk_id + 1) * pq_chunk),
-                    )
-
-            pl.run_scoped(
-                _pq_and_scatter,
-                pltpu.VMEM((pq_chunk, out_packing, h_per_out), jnp.bfloat16),
-                pltpu.VMEM((pq_chunk, t_packing, h_per_t), jnp.float8_e4m3fn),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-            )
-        else:
-            start_a2a_scatter_batch_range(
-                bt_sem_id=bt_sem_id,
-                bt_start=bt_start,
-                a2a_bank_id=a2a_bank_id,
-                token_start=jnp.int32(0),
-                token_end=jnp.int32(bt),
-            )
+        start_a2a_scatter_batch_range(
+            bt_sem_id=bt_sem_id,
+            bt_start=bt_start,
+            a2a_bank_id=a2a_bank_id,
+            token_start=jnp.int32(0),
+            token_end=jnp.int32(bt),
+        )
 
     # ===== A2A scatter wait =====
 
@@ -2023,6 +1951,69 @@ def _fused_ep_moe_kernel(
             pltpu.make_async_copy(
                 src_ref=ref, dst_ref=ref, sem=local_sems.at[bt_sem_id, 7],
             ).wait()
+
+    # ===== standalone prequant (act_quant) =====
+
+    if enable_act_quant:
+        def _prequant_tokens(
+            pq_bf16_buf, pq_fp8_buf, pq_load_sem, pq_store_sem,
+        ):
+            pltpu.make_async_copy(
+                src_ref=tokens_hbm.at[pl.ds(0, pq_chunk)],
+                dst_ref=pq_bf16_buf,
+                sem=pq_load_sem,
+            ).start()
+
+            for chunk_id in range(num_pq_chunks):
+                hbm_off = chunk_id * pq_chunk
+
+                pltpu.make_async_copy(
+                    src_ref=pq_bf16_buf, dst_ref=pq_bf16_buf,
+                    sem=pq_load_sem,
+                ).wait()
+
+                chunk_f32 = pq_bf16_buf[...].reshape(
+                    pq_chunk, hidden_size,
+                ).astype(jnp.float32)
+                x_amax = jnp.max(
+                    jnp.abs(chunk_f32), axis=-1, keepdims=True,
+                )
+                x_scale = jnp.maximum(
+                    x_amax / jnp.float32(448.0),
+                    jnp.float32(1e-12),
+                )
+                q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
+                pq_fp8_buf[...] = q.reshape(pq_chunk, t_packing, h_per_t)
+                pq_fp8_buf.bitcast(jnp.float32).at[
+                    pl.ds(0, pq_chunk), 0, h_per_t - 1,
+                ][...] = x_scale.reshape(pq_chunk)
+
+                pltpu.make_async_copy(
+                    src_ref=pq_fp8_buf,
+                    dst_ref=tokens_fp8_hbm.at[pl.ds(hbm_off, pq_chunk)],
+                    sem=pq_store_sem,
+                ).start()
+
+                if chunk_id + 1 < num_pq_chunks:
+                    next_off = (chunk_id + 1) * pq_chunk
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(next_off, pq_chunk)],
+                        dst_ref=pq_bf16_buf,
+                        sem=pq_load_sem,
+                    ).start()
+
+                pltpu.make_async_copy(
+                    src_ref=pq_fp8_buf, dst_ref=pq_fp8_buf,
+                    sem=pq_store_sem,
+                ).wait()
+
+        pl.run_scoped(
+            _prequant_tokens,
+            pltpu.VMEM((pq_chunk, out_packing, h_per_out), jnp.bfloat16),
+            pltpu.VMEM((pq_chunk, t_packing, h_per_t), jnp.float8_e4m3fn),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+        )
 
     # ===== run_bt =====
 
