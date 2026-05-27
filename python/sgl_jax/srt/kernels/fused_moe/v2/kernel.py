@@ -683,6 +683,10 @@ def _fused_ep_moe_kernel(
 
             if num_devices > 0 and (num_devices & (num_devices - 1)) == 0:
                 rounds = int(math.log2(num_devices))
+
+                if enable_act_quant:
+                    pq_per_round = (num_pq_chunks + rounds - 1) // rounds
+
                 for round_id in range(rounds):
                     sync_barrier()
 
@@ -709,6 +713,71 @@ def _fused_ep_moe_kernel(
                         device_id=get_mesh_device_id(peer_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
+
+                    if enable_act_quant:
+                        pq_round_start = round_id * pq_per_round
+
+                        @pl.when(bt_id == 0)
+                        def _(pq_round_start=pq_round_start):
+                            for c in range(pq_per_round):
+                                chunk_id = pq_round_start + c
+                                if chunk_id < num_pq_chunks:
+                                    pq_start = chunk_id * pq_chunk
+
+                                    pltpu.make_async_copy(
+                                        src_ref=pq_bf16_buf,
+                                        dst_ref=pq_bf16_buf,
+                                        sem=pq_load_sem,
+                                    ).wait()
+
+                                    chunk_f32 = pq_bf16_buf[...].reshape(
+                                        pq_chunk, hidden_size,
+                                    ).astype(jnp.float32)
+                                    x_amax = jnp.max(
+                                        jnp.abs(chunk_f32),
+                                        axis=-1, keepdims=True,
+                                    )
+                                    x_scale = jnp.maximum(
+                                        x_amax / jnp.float32(448.0),
+                                        jnp.float32(1e-12),
+                                    )
+                                    q = (chunk_f32 / x_scale).astype(
+                                        jnp.float8_e4m3fn,
+                                    )
+                                    pq_fp8_buf[...] = q.reshape(
+                                        pq_chunk, t_packing, h_per_t,
+                                    )
+                                    pq_fp8_buf.bitcast(jnp.float32).at[
+                                        pl.ds(0, pq_chunk), 0, h_per_t - 1,
+                                    ][...] = x_scale.reshape(pq_chunk)
+
+                                    pltpu.make_async_copy(
+                                        src_ref=pq_fp8_buf,
+                                        dst_ref=tokens_fp8_hbm.at[
+                                            pl.ds(pq_start, pq_chunk)
+                                        ],
+                                        sem=pq_store_sem,
+                                    ).start()
+
+                                    if chunk_id + 1 < num_pq_chunks:
+                                        next_pq_start = (
+                                            (chunk_id + 1) * pq_chunk
+                                        )
+                                        pltpu.make_async_copy(
+                                            src_ref=tokens_hbm.at[
+                                                pl.ds(
+                                                    next_pq_start, pq_chunk,
+                                                )
+                                            ],
+                                            dst_ref=pq_bf16_buf,
+                                            sem=pq_load_sem,
+                                        ).start()
+
+                                    pltpu.make_async_copy(
+                                        src_ref=pq_fp8_buf,
+                                        dst_ref=pq_fp8_buf,
+                                        sem=pq_store_sem,
+                                    ).wait()
 
                     recv_ref = d2e_count_vmem.at[
                         pl.ds(recv_start, chunk),
@@ -771,53 +840,6 @@ def _fused_ep_moe_kernel(
                     ).wait()
 
             sync_barrier()
-
-            if enable_act_quant:
-                @pl.when(bt_id == 0)
-                def _():
-                    for chunk_id in range(num_pq_chunks):
-                        start = chunk_id * pq_chunk
-
-                        pltpu.make_async_copy(
-                            src_ref=pq_bf16_buf, dst_ref=pq_bf16_buf,
-                            sem=pq_load_sem,
-                        ).wait()
-
-                        chunk_f32 = pq_bf16_buf[...].reshape(
-                            pq_chunk, hidden_size,
-                        ).astype(jnp.float32)
-                        x_amax = jnp.max(
-                            jnp.abs(chunk_f32), axis=-1, keepdims=True,
-                        )
-                        x_scale = jnp.maximum(
-                            x_amax / jnp.float32(448.0), jnp.float32(1e-12),
-                        )
-                        q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
-                        pq_fp8_buf[...] = q.reshape(pq_chunk, t_packing, h_per_t)
-                        pq_fp8_buf.bitcast(jnp.float32).at[
-                            pl.ds(0, pq_chunk), 0, h_per_t - 1,
-                        ][...] = x_scale.reshape(pq_chunk)
-
-                        pltpu.make_async_copy(
-                            src_ref=pq_fp8_buf,
-                            dst_ref=tokens_fp8_hbm.at[pl.ds(start, pq_chunk)],
-                            sem=pq_store_sem,
-                        ).start()
-
-                        if chunk_id + 1 < num_pq_chunks:
-                            next_start = (chunk_id + 1) * pq_chunk
-                            pltpu.make_async_copy(
-                                src_ref=tokens_hbm.at[
-                                    pl.ds(next_start, pq_chunk)
-                                ],
-                                dst_ref=pq_bf16_buf,
-                                sem=pq_load_sem,
-                            ).start()
-
-                        pltpu.make_async_copy(
-                            src_ref=pq_fp8_buf, dst_ref=pq_fp8_buf,
-                            sem=pq_store_sem,
-                        ).wait()
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
