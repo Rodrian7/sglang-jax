@@ -221,8 +221,14 @@ from kernel import fused_ep_moe_v2, ref_moe, FusedMoEBlockConfig
 
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
-devices = np.array(jax.devices()).reshape(1, num_devices)
+# BENCH_MESH_DP: dp_size for mesh reshape (default 1 = legacy bench_v2 behavior).
+# Set to match server: --tp-size 32 --dp-size 8 → BENCH_MESH_DP=8.
+_mesh_dp = int(os.environ.get("BENCH_MESH_DP", "1"))
+assert num_devices % _mesh_dp == 0, f"num_devices ({num_devices}) must be divisible by BENCH_MESH_DP ({_mesh_dp})"
+_mesh_tp = num_devices // _mesh_dp
+devices = np.array(jax.devices()).reshape(_mesh_dp, _mesh_tp)
 mesh = jax.sharding.Mesh(devices, ("data", "tensor"))
+log(f"mesh shape: ({_mesh_dp}, {_mesh_tp}) = (data, tensor)")
 ep_size = num_devices
 
 d = int(os.environ.get("BENCH_D", "6144"))
