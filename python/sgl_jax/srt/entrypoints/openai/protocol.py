@@ -64,6 +64,7 @@ class UsageInfo(BaseModel):
     completion_tokens: int | None = 0
     # only used to return cached tokens when --enable-cache-report is set
     prompt_tokens_details: dict[str, int] | None = None
+    completion_tokens_details: dict[str, float] | None = None
 
 
 class StreamOptions(BaseModel):

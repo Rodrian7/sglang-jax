@@ -1024,6 +1024,16 @@ class TokenizerManager:
                     )
                 meta_info["cache_miss_count"] = recv_obj.cache_miss_count
 
+            if getattr(recv_obj, "spec_verify_ct", None) is not None:
+                sv = recv_obj.spec_verify_ct[i]
+                sa = recv_obj.spec_accepted_tokens[i]
+                meta_info["spec_verify_ct"] = sv
+                meta_info["spec_accepted_tokens"] = sa
+                if sv > 0:
+                    draft_tokens = self.server_args.speculative_num_draft_tokens
+                    meta_info["spec_accept_length"] = sa / sv
+                    meta_info["spec_accept_ratio"] = (sa - sv) / (sv * draft_tokens)
+
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
                 state.output_ids += recv_obj.output_ids[i]

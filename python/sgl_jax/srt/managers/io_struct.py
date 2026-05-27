@@ -85,6 +85,10 @@ class BatchStrOut:
     # The routed experts for each output token
     output_routed_experts: list[str | None] = None
 
+    # Speculative decoding per-request stats
+    spec_verify_ct: list[int] = None
+    spec_accepted_tokens: list[int] = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -130,6 +134,10 @@ class BatchTokenIDOut:
 
     # The routed experts for each output token
     output_routed_experts: list[np.ndarray] = None
+
+    # Speculative decoding per-request stats
+    spec_verify_ct: list[int] = None
+    spec_accepted_tokens: list[int] = None
 
 
 @dataclass

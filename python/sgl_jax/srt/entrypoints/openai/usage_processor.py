@@ -16,6 +16,34 @@ class UsageProcessor:
         return {"cached_tokens": count} if count > 0 else None
 
     @staticmethod
+    def _aggregate_spec_details(
+        responses: list[dict[str, Any]],
+    ) -> dict[str, float] | None:
+        total_verify = 0
+        total_accepted = 0
+        for r in responses:
+            mi = r["meta_info"]
+            total_verify += mi.get("spec_verify_ct", 0)
+            total_accepted += mi.get("spec_accepted_tokens", 0)
+        if total_verify == 0:
+            return None
+        details = {
+            "spec_verify_ct": total_verify,
+            "spec_accepted_tokens": total_accepted,
+            "spec_accept_length": total_accepted / total_verify,
+        }
+        first_ratio = next(
+            (r["meta_info"].get("spec_accept_ratio") for r in responses
+             if "spec_accept_ratio" in r["meta_info"]),
+            None,
+        )
+        if first_ratio is not None:
+            draft_tokens = round((total_accepted - total_verify) / (total_verify * first_ratio)) if first_ratio > 0 else 0
+            if draft_tokens > 0:
+                details["spec_accept_ratio"] = (total_accepted - total_verify) / (total_verify * draft_tokens)
+        return details
+
+    @staticmethod
     def calculate_response_usage(
         responses: list[dict[str, Any]],
         n_choices: int = 1,
@@ -32,10 +60,13 @@ class UsageProcessor:
             cached_total = sum(r["meta_info"].get("cached_tokens", 0) for r in responses)
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
+        spec_details = UsageProcessor._aggregate_spec_details(responses)
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            spec_details=spec_details,
         )
 
     @staticmethod
@@ -45,6 +76,7 @@ class UsageProcessor:
         cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
+        spec_details: dict[str, float] | None = None,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0)
@@ -60,6 +92,7 @@ class UsageProcessor:
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
+            spec_details=spec_details,
         )
 
     @staticmethod
@@ -67,6 +100,7 @@ class UsageProcessor:
         prompt_tokens: int,
         completion_tokens: int,
         cached_tokens: dict[str, int] | None = None,
+        spec_details: dict[str, float] | None = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
@@ -74,4 +108,5 @@ class UsageProcessor:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
+            completion_tokens_details=spec_details,
         )
