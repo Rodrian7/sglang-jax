@@ -2332,6 +2332,7 @@ def fused_ep_moe_v2(
     w2_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
     block_config: FusedMoEBlockConfig | None = None,
+    prefetched_a2a_s: jax.Array | None = None,  # Task 4: SC-prefilled a2a_s (ring shape)
     direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool | None = None,
     direct_scaled_dot_ffn2: bool | None = None,
@@ -2824,7 +2825,13 @@ def fused_ep_moe_v2(
     a2a_s_shape = (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t)
     if use_bt_banking:
         a2a_s_shape = (num_bt_banks,) + a2a_s_shape
-    a2a_s_hbm_scratch = pl.empty(a2a_s_shape, t_dtype)
+    if prefetched_a2a_s is not None:
+        # Task 4: caller has pre-filled a2a_s (bt0 bank) via SC kernel.
+        # Use it as the scratch — XLA buffer dependency ensures SC kernel
+        # completes before fused_moe reads it.
+        a2a_s_hbm_scratch = prefetched_a2a_s
+    else:
+        a2a_s_hbm_scratch = pl.empty(a2a_s_shape, t_dtype)
     a2a_s_acc_hbm_scratch = pl.empty(a2a_s_shape, t_dtype)
     a2a_g_shape = (num_experts, bt, t_packing, h_per_t)
     if use_gather_bank:
