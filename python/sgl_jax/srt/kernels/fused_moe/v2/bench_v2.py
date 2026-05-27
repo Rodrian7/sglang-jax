@@ -1185,6 +1185,7 @@ if check_correctness:
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
             enable_act_quant=enable_act_quant,
+            skip_prequant_compute=skip_prequant_compute,
         )
         ref_kwargs = {}
         if use_fp8:
