@@ -2112,7 +2112,7 @@ def _fused_ep_moe_kernel(
                 pq_fp8_buf[...] = packed
                 scale_bytes = jax.lax.bitcast_convert_type(
                     scale.reshape(pq_chunk, 1), jnp.float8_e4m3fn,
-                )
+                ).reshape(pq_chunk, 4)
                 pq_fp8_buf.at[:, 0, pl.ds(h_per_t - 4, 4)][...] = scale_bytes
 
                 pltpu.make_async_copy(
