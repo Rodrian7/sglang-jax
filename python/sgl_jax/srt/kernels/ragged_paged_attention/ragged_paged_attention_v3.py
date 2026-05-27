@@ -31,6 +31,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
+    get_tuned_block_sizes_v3,
+)
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
@@ -1592,9 +1595,11 @@ def get_default_block_sizes(
 
 def get_vmem_limit():
     try:
-        # Use half of VMEM capacity as default to approximate the scoped VMEM limit.
-        # The compiler's scoped VMEM allocation is typically ~50% of total capacity.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes // 2
+        # Use full VMEM capacity. Pallas kernels don't run concurrently with
+        # other XLA HLO ops, so the Pallas vmem budget and XLA scoped_vmem
+        # budget don't sum — leaving headroom here just caps the tuner.
+        # v2 hardcodes 100MB (hardware clamps to capacity) with no issue.
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     except Exception:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     return vmem_limit_bytes
@@ -1812,7 +1817,17 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        # bo_double_buf was previously aliased to bq_double_buf as a vmem-saving
+        # optimization. The kernel body reads bq and writes bo separately, so
+        # the alias was perf-only, not correctness. Disabling it because XLA
+        # MSA on certain (stage=decode, page_size=128) layouts emits
+        # "Conflicting pending required assignment" CHECK failures when two
+        # scratch entries point at the same VMEM object. Cost: an extra buffer
+        # of shape (2, kv_heads, bq, *q.shape[2:]), only KB on typical configs.
+        bo_double_buf = pltpu.VMEM(
+            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+            q.dtype,
+        )
 
         if use_causal_mask:
             bkvmask_double_buf = None
@@ -1826,7 +1841,11 @@ def ragged_paged_attention(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
-        m_scratch = l_scratch
+        # See bo_double_buf note above — unalias to avoid XLA MSA conflict.
+        m_scratch = pltpu.VMEM(
+            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+            out_dtype,
+        )
 
         acc_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
@@ -1950,7 +1969,8 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            tuned = get_tuned_block_sizes_v3(
+                case.symbol,
                 q.dtype,
                 kv_cache_fused_processed.dtype,
                 actual_num_q_heads,
@@ -1958,13 +1978,26 @@ def ragged_paged_attention(
                 head_dim,
                 page_size,
                 max_num_tokens,
-                max_num_seqs,
-                pages_per_seq,
-                case=case,
-                vmem_limit_bytes=vmem_limit_bytes,
-                use_custom_mask=not use_causal_mask,
                 sliding_window=sliding_window,
             )
+            if tuned is not None:
+                block_sizes = tuned
+            else:
+                return get_default_block_sizes(
+                    q.dtype,
+                    kv_cache_fused_processed.dtype,
+                    actual_num_q_heads,
+                    actual_num_kv_heads,
+                    head_dim,
+                    page_size,
+                    max_num_tokens,
+                    max_num_seqs,
+                    pages_per_seq,
+                    case=case,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    use_custom_mask=not use_causal_mask,
+                    sliding_window=sliding_window,
+                )
 
         return {
             "bq_sz": block_sizes[0],
