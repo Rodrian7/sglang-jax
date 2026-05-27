@@ -1925,7 +1925,7 @@ def _fused_ep_moe_kernel(
         se_n_chunks = se_inter_size // se_n_chunk
         se_sem_slot = jnp.int32(0)
 
-        for c_id in range(se_n_chunks):
+        def _se_outer_body(c_id, _):
             n_start = c_id * se_n_chunk
 
             def _with_all_weights(
@@ -1933,7 +1933,6 @@ def _fused_ep_moe_kernel(
                 w2_p0, w2_p1,
                 w1s_buf, w3s_buf,
                 w2s_p0_buf, w2s_p1_buf,
-                c_id=c_id, n_start=n_start,
             ):
                 w_pairs = (
                     (w1_shared_hbm, w1_p0, 0),
@@ -2022,7 +2021,8 @@ def _fused_ep_moe_kernel(
                             sem=local_sems.at[se_sem_slot, 0],
                         ).start()
 
-                        if c_id > 0:
+                        @pl.when(c_id > 0)
+                        def _():
                             pltpu.make_async_copy(
                                 src_ref=output_hbm.at[pl.ds(bt_start_v, bt)],
                                 dst_ref=b_output_x2_vmem.at[0],
@@ -2077,12 +2077,15 @@ def _fused_ep_moe_kernel(
                             gate_chunk[...], up_chunk[...], act_fn
                         )
 
-                        if c_id > 0:
+                        @pl.when(c_id > 0)
+                        def _():
                             pltpu.make_async_copy(
                                 src_ref=b_output_x2_vmem.at[0],
                                 dst_ref=b_output_x2_vmem.at[0],
                                 sem=local_sems.at[se_sem_slot, 3],
                             ).wait()
+
+                        c_id_mask = (c_id > 0).astype(jnp.float32)
 
                         for p_id in range(t_packing):
                             w2_ref = w2_p0 if p_id == 0 else w2_p1
@@ -2101,11 +2104,10 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, bt),
                                 pl.ds(p_id * h_per_t, h_per_t),
                             ]
-                            if c_id == 0:
-                                out_ref[...] = partial.astype(t_dtype)
-                            else:
-                                prev = out_ref[...].astype(jnp.float32)
-                                out_ref[...] = (prev + partial).astype(t_dtype)
+                            prev = out_ref[...].astype(jnp.float32)
+                            out_ref[...] = (
+                                prev * c_id_mask + partial
+                            ).astype(t_dtype)
 
                         pltpu.make_async_copy(
                             src_ref=b_output_x2_vmem.at[0],
@@ -2144,6 +2146,11 @@ def _fused_ep_moe_kernel(
                 pltpu.VMEM((h_per_t,), jnp.bfloat16),
                 pltpu.VMEM((h_per_t,), jnp.bfloat16),
             )
+            return None
+
+        lax.fori_loop(
+            0, se_n_chunks, _se_outer_body, None, unroll=False,
+        )
 
     # ===== run_bt =====
 
