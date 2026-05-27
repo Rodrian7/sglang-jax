@@ -310,7 +310,7 @@ if invalid_w2_fetch_orders:
         f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
         "expected one of after_w13 or before_w13."
     )
-valid_routing_modes = {"random", "deterministic"}
+valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
         f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
@@ -829,6 +829,38 @@ def make_deterministic_topk(num_tokens, top_k, num_experts):
     return topk_weights, topk_ids
 
 
+def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=0.7):
+    """Hot expert routing: hot_load fraction of all (token, k) slots go to
+    hot_frac fraction of experts. Rest uniformly distributed.
+
+    Simulates real router imbalance to reproduce e2e cross-device sync wait
+    behavior in micro-bench.
+    """
+    local_tokens = num_tokens // num_devices
+    num_hot = max(1, int(num_experts * hot_frac))
+    per_device_ids = []
+    per_device_weights = []
+    rng = np.random.default_rng(42)
+    for i, dev in enumerate(jax.local_devices()):
+        global_device_id = jax.process_index() * len(jax.local_devices()) + i
+        # For each (token, k) slot, decide if hot or cold
+        is_hot = rng.random((local_tokens, top_k)) < hot_load
+        hot_ids = rng.integers(0, num_hot, size=(local_tokens, top_k), dtype=np.int32)
+        cold_ids = rng.integers(num_hot, num_experts, size=(local_tokens, top_k), dtype=np.int32)
+        ids_np = np.where(is_hot, hot_ids, cold_ids).astype(np.int32)
+        ids = jnp.array(ids_np)
+        weights = jnp.full((local_tokens, top_k), 1.0 / top_k, dtype=jnp.float32)
+        per_device_ids.append(jax.device_put(ids, dev))
+        per_device_weights.append(jax.device_put(weights, dev))
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_ids,
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_weights,
+    )
+    return topk_weights, topk_ids
+
+
 log("creating weight arrays...")
 w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
 w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
@@ -902,6 +934,8 @@ for num_tokens in token_candidates:
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     if routing_mode == "deterministic":
         topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
+    elif routing_mode == "hot_expert":
+        topk_wts, topk_idx = make_hot_expert_topk(num_tokens, top_k, E)
     else:
         gating_local_shape = (num_tokens // num_devices, E)
         gating_per_dev = []
