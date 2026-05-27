@@ -1996,13 +1996,18 @@ def _fused_ep_moe_kernel(
                             sem=local_sems.at[se_sem_slot, 2],
                         ).wait()
 
-                for bt_id in range(num_bt):
+                def _se_bt_body(bt_id, _):
                     bt_start_v = bt_id * bt
 
-                    def _with_tokens(
-                        se_tokens, gate_chunk, up_chunk,
-                        bt_id=bt_id, bt_start_v=bt_start_v, c_id=c_id,
-                    ):
+                    @pl.when(bt_id > 0)
+                    def _():
+                        pltpu.make_async_copy(
+                            src_ref=b_output_x2_vmem.at[0],
+                            dst_ref=b_output_x2_vmem.at[0],
+                            sem=local_sems.at[se_sem_slot, 3],
+                        ).wait()
+
+                    def _with_tokens(se_tokens, gate_chunk, up_chunk):
                         pltpu.make_async_copy(
                             src_ref=tokens_hbm.at[
                                 pl.ds(bt_start_v, bt),
@@ -2114,6 +2119,11 @@ def _fused_ep_moe_kernel(
                         pltpu.VMEM((bt, se_n_chunk), jnp.float32),
                         pltpu.VMEM((bt, se_n_chunk), jnp.float32),
                     )
+                    return None
+
+                lax.fori_loop(
+                    0, num_bt, _se_bt_body, None, unroll=False,
+                )
 
                 pltpu.make_async_copy(
                     src_ref=b_output_x2_vmem.at[0],
