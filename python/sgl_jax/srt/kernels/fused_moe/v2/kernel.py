@@ -2111,12 +2111,13 @@ def _fused_ep_moe_kernel(
                     x_amax / jnp.float32(448.0), jnp.float32(1e-12),
                 )
                 q = (chunk_f32 / x_scale).astype(jnp.float8_e4m3fn)
-                q = q.reshape(pq_chunk, t_packing, h_per_t)
+                pq_fp8_buf[...] = q.reshape(pq_chunk, t_packing, h_per_t)
                 scale_as_fp8 = pltpu.bitcast(
                     x_scale[:, :, jnp.newaxis], jnp.float8_e4m3fn,
                 ).reshape(pq_chunk, 4)
-                q = q.at[:, 0, h_per_t - 4:h_per_t].set(scale_as_fp8)
-                pq_fp8_buf[...] = q
+                pq_fp8_buf.at[
+                    pl.ds(0, pq_chunk), 0, pl.ds(h_per_t - 4, 4),
+                ][...] = scale_as_fp8
 
                 pltpu.make_async_copy(
                     src_ref=pq_fp8_buf,
