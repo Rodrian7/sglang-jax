@@ -1042,6 +1042,7 @@ for num_tokens in token_candidates:
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 use_jax_allreduce_metadata=not inkernel_metadata,
+                metadata_algorithm=os.environ.get("BENCH_METADATA_ALGORITHM", "recursive_doubling"),
             )
 
         try:
@@ -1124,6 +1125,7 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             use_jax_allreduce_metadata=not inkernel_metadata,
+            metadata_algorithm=os.environ.get("BENCH_METADATA_ALGORITHM", "recursive_doubling"),
         )
         ref_kwargs = {}
         if use_fp8:
