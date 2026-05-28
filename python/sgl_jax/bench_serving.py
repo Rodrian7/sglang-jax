@@ -102,7 +102,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: list[float] = field(default_factory=list)  # List of inter-token latencies
-    spec_itl: list[float] = field(default_factory=list)
+    adjusted_itl: list[float] = field(default_factory=list)
     text_chunks: list[str] = field(default_factory=list)
     prompt_len: int = 0
     error: str = ""
@@ -307,9 +307,9 @@ async def async_request_openai_completions(
                                     output.text_chunks.append(text)
                                     output.itl.append(raw_itl)
                                     if num_new_tokens > 0:
-                                        spec_itl = raw_itl / num_new_tokens
-                                        output.spec_itl.extend(
-                                            [spec_itl] * num_new_tokens
+                                        adjusted_itl = raw_itl / num_new_tokens
+                                        output.adjusted_itl.extend(
+                                            [adjusted_itl] * num_new_tokens
                                         )
 
                                 most_recent_timestamp = timestamp
@@ -928,12 +928,12 @@ class BenchmarkMetrics:
     p95_itl_ms: float
     p99_itl_ms: float
     max_itl_ms: float
-    mean_spec_itl_ms: float
-    median_spec_itl_ms: float
-    std_spec_itl_ms: float
-    p95_spec_itl_ms: float
-    p99_spec_itl_ms: float
-    max_spec_itl_ms: float
+    mean_adjusted_itl_ms: float
+    median_adjusted_itl_ms: float
+    std_adjusted_itl_ms: float
+    p95_adjusted_itl_ms: float
+    p99_adjusted_itl_ms: float
+    max_adjusted_itl_ms: float
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
@@ -1972,7 +1972,7 @@ def calculate_metrics(
     total_input_vision = 0
     completed = 0
     itls: list[float] = []
-    spec_itls: list[float] = []
+    adjusted_itls: list[float] = []
     tpots: list[float] = []
     ttfts: list[float] = []
     e2e_latencies: list[float] = []
@@ -2007,7 +2007,7 @@ def calculate_metrics(
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
                 itls += outputs[i].itl
-            spec_itls += outputs[i].spec_itl or outputs[i].itl
+            adjusted_itls += outputs[i].adjusted_itl or outputs[i].itl
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -2113,12 +2113,12 @@ def calculate_metrics(
         p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         max_itl_ms=np.max(itls or 0) * 1000,
-        mean_spec_itl_ms=np.mean(spec_itls or 0) * 1000,
-        median_spec_itl_ms=np.median(spec_itls or 0) * 1000,
-        std_spec_itl_ms=np.std(spec_itls or 0) * 1000,
-        p95_spec_itl_ms=np.percentile(spec_itls or 0, 95) * 1000,
-        p99_spec_itl_ms=np.percentile(spec_itls or 0, 99) * 1000,
-        max_spec_itl_ms=np.max(spec_itls or 0) * 1000,
+        mean_adjusted_itl_ms=np.mean(adjusted_itls or 0) * 1000,
+        median_adjusted_itl_ms=np.median(adjusted_itls or 0) * 1000,
+        std_adjusted_itl_ms=np.std(adjusted_itls or 0) * 1000,
+        p95_adjusted_itl_ms=np.percentile(adjusted_itls or 0, 95) * 1000,
+        p99_adjusted_itl_ms=np.percentile(adjusted_itls or 0, 99) * 1000,
+        max_adjusted_itl_ms=np.max(adjusted_itls or 0) * 1000,
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
@@ -2470,12 +2470,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    print("{s:{c}^{n}}".format(s="Spec Inter-Token Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean Spec ITL (ms):", metrics.mean_spec_itl_ms))
-    print("{:<40} {:<10.2f}".format("Median Spec ITL (ms):", metrics.median_spec_itl_ms))
-    print("{:<40} {:<10.2f}".format("P95 Spec ITL (ms):", metrics.p95_spec_itl_ms))
-    print("{:<40} {:<10.2f}".format("P99 Spec ITL (ms):", metrics.p99_spec_itl_ms))
-    print("{:<40} {:<10.2f}".format("Max Spec ITL (ms):", metrics.max_spec_itl_ms))
+    print("{s:{c}^{n}}".format(s="Adjusted Inter-Token Latency", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean Adjusted ITL (ms):", metrics.mean_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("Median Adjusted ITL (ms):", metrics.median_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("P95 Adjusted ITL (ms):", metrics.p95_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("P99 Adjusted ITL (ms):", metrics.p99_adjusted_itl_ms))
+    print("{:<40} {:<10.2f}".format("Max Adjusted ITL (ms):", metrics.max_adjusted_itl_ms))
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
@@ -2529,11 +2529,11 @@ async def benchmark(
             "std_itl_ms": metrics.std_itl_ms,
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
-            "mean_spec_itl_ms": metrics.mean_spec_itl_ms,
-            "median_spec_itl_ms": metrics.median_spec_itl_ms,
-            "std_spec_itl_ms": metrics.std_spec_itl_ms,
-            "p95_spec_itl_ms": metrics.p95_spec_itl_ms,
-            "p99_spec_itl_ms": metrics.p99_spec_itl_ms,
+            "mean_adjusted_itl_ms": metrics.mean_adjusted_itl_ms,
+            "median_adjusted_itl_ms": metrics.median_adjusted_itl_ms,
+            "std_adjusted_itl_ms": metrics.std_adjusted_itl_ms,
+            "p95_adjusted_itl_ms": metrics.p95_adjusted_itl_ms,
+            "p99_adjusted_itl_ms": metrics.p99_adjusted_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
@@ -2564,7 +2564,7 @@ async def benchmark(
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
-        "spec_itls": [output.spec_itl for output in outputs],
+        "adjusted_itls": [output.adjusted_itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
