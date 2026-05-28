@@ -478,42 +478,31 @@ class EagleDraftWorker(BaseDraftWorker):
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
-        model_worker_batch.input_ids = np.array(
-            jax.device_get(model_worker_batch.input_ids), dtype=model_worker_batch.input_ids.dtype
+        fields = (
+            model_worker_batch.input_ids,
+            model_worker_batch.seq_lens,
+            model_worker_batch.out_cache_loc,
+            model_worker_batch.positions,
+            model_worker_batch.req_pool_indices,
+            model_worker_batch.cache_loc,
         )
-        model_worker_batch.seq_lens = np.array(
-            jax.device_get(model_worker_batch.seq_lens), dtype=model_worker_batch.seq_lens.dtype
-        )
-        model_worker_batch.out_cache_loc = np.array(
-            jax.device_get(model_worker_batch.out_cache_loc),
-            dtype=model_worker_batch.out_cache_loc.dtype,
-        )
-        model_worker_batch.positions = np.array(
-            jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
-        )
-        model_worker_batch.req_pool_indices = np.array(
-            jax.device_get(model_worker_batch.req_pool_indices),
-            dtype=model_worker_batch.req_pool_indices.dtype,
-        )
-        model_worker_batch.cache_loc = np.array(
-            jax.device_get(model_worker_batch.cache_loc), dtype=model_worker_batch.cache_loc.dtype
-        )
-        model_worker_batch.extend_prefix_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_prefix_lens),
-                dtype=model_worker_batch.extend_prefix_lens.dtype,
+        (
+            model_worker_batch.input_ids,
+            model_worker_batch.seq_lens,
+            model_worker_batch.out_cache_loc,
+            model_worker_batch.positions,
+            model_worker_batch.req_pool_indices,
+            model_worker_batch.cache_loc,
+        ) = jax.device_get(fields)
+
+        if model_worker_batch.extend_prefix_lens is not None:
+            model_worker_batch.extend_prefix_lens = np.asarray(
+                jax.device_get(model_worker_batch.extend_prefix_lens)
             )
-            if model_worker_batch.extend_prefix_lens is not None
-            else None
-        )
-        model_worker_batch.extend_seq_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_seq_lens),
-                dtype=model_worker_batch.extend_seq_lens.dtype,
+        if model_worker_batch.extend_seq_lens is not None:
+            model_worker_batch.extend_seq_lens = np.asarray(
+                jax.device_get(model_worker_batch.extend_seq_lens)
             )
-            if model_worker_batch.extend_seq_lens is not None
-            else None
-        )
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()

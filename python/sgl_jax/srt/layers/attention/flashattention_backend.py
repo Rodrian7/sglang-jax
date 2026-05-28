@@ -407,6 +407,7 @@ class FlashAttention(AttentionBackend):
         src_starts = _dp_starts(alloc_pages, per_dp_src_pages)
         seq_lens_list = []
         valid_slot = np.asarray(batch.seq_lens) > 0
+        result_locs_buf = np.zeros(TARGET_PADDING, dtype=original_selected_cache_locs.dtype)
         for speculative_step_id in range(batch.speculative_num_steps):
             seq_lens = np.where(valid_slot, batch.seq_lens + speculative_step_id, 0)
             seq_lens_list.append(seq_lens)
@@ -429,9 +430,9 @@ class FlashAttention(AttentionBackend):
             write_indices = np.repeat(dst_starts, repeats) + local_off
             gathered_locs = original_selected_cache_locs[gather_indices]
 
-            result_locs = np.zeros(TARGET_PADDING, dtype=original_selected_cache_locs.dtype)
-            result_locs[write_indices] = gathered_locs
-            page_indices.append((result_locs // self.page_size).astype(np.int32))
+            result_locs_buf[:] = 0
+            result_locs_buf[write_indices] = gathered_locs
+            page_indices.append((result_locs_buf // self.page_size).astype(np.int32))
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
@@ -443,25 +444,22 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack(
             [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
         ).ravel()
+        sharding = NamedSharding(self.mesh, P("data"))
+        cu_q_lens_dev = device_array(cu_q_lens, sharding=sharding)
+        distribution_dev = device_array(distribution, sharding=sharding)
+        all_varying = device_array(
+            tuple((cu_kv_lens[i], page_indices[i], seq_lens_list[i])
+                  for i in range(batch.speculative_num_steps)),
+            sharding=sharding,
+        )
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()
-            (
-                metadata_tmp.cu_q_lens,
-                metadata_tmp.cu_kv_lens,
-                metadata_tmp.page_indices,
-                metadata_tmp.seq_lens,
-                metadata_tmp.distribution,
-            ) = device_array(
-                (
-                    cu_q_lens,
-                    cu_kv_lens[i],
-                    page_indices[i],
-                    seq_lens_list[i],
-                    distribution,
-                ),
-                sharding=(NamedSharding(self.mesh, P("data"))),
-            )
+            metadata_tmp.cu_q_lens = cu_q_lens_dev
+            metadata_tmp.cu_kv_lens = all_varying[i][0]
+            metadata_tmp.page_indices = all_varying[i][1]
+            metadata_tmp.seq_lens = all_varying[i][2]
+            metadata_tmp.distribution = distribution_dev
             metadata.append(metadata_tmp)
         return metadata
 

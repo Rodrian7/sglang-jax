@@ -4,13 +4,25 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import numpy as np
+from functools import partial
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
+
+
+@partial(jax.jit, donate_argnames=["hidden_states"])
+def _gather_verified(hidden_states, positions, safe_index):
+    return hidden_states[safe_index, :], positions[safe_index]
+
+
+@partial(jax.jit, donate_argnames=["hidden_states", "logits"])
+def _gather_verified_with_logits(logits, hidden_states, positions, safe_index):
+    return logits[safe_index, :], hidden_states[safe_index, :], positions[safe_index]
 
 
 def replicate_to_mesh(
@@ -207,10 +219,24 @@ class BaseSpecWorker:
         req_ids = np.arange(len(accept_index)) // accept_width
         per_req_last = req_ids * draft_n + draft_n - 1
         safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
-        if not is_all_greedy:
-            logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[safe_index]
+        safe_index = jnp.asarray(safe_index, dtype=jnp.int32)
+        if is_all_greedy:
+            logits_output.hidden_states, model_worker_batch.positions = (
+                _gather_verified(
+                    logits_output.hidden_states,
+                    model_worker_batch.positions,
+                    safe_index,
+                )
+            )
+        else:
+            logits_output.next_token_logits, logits_output.hidden_states, model_worker_batch.positions = (
+                _gather_verified_with_logits(
+                    logits_output.next_token_logits,
+                    logits_output.hidden_states,
+                    model_worker_batch.positions,
+                    safe_index,
+                )
+            )
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,

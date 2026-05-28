@@ -449,15 +449,6 @@ class EagleDraftInput:
         return 0
 
     def tree_flatten(self):
-        accept_length_cpu_arr = (
-            jnp.empty((0,), dtype=jnp.int32)
-            if self.accept_length_cpu is None
-            else _as_int32_array(self.accept_length_cpu, fallback=0)
-        )
-
-        num_tokens_per_batch_arr = _as_int32_array(self.num_tokens_per_batch)
-        num_tokens_for_logprob_arr = _as_int32_array(self.num_tokens_for_logprob_per_batch)
-
         children = (
             self.topk_p,
             self.topk_index,
@@ -468,13 +459,13 @@ class EagleDraftInput:
             self.kv_indices,
             self.seq_lens_for_draft_extend,
             self.req_pool_indices_for_draft_extend,
-            accept_length_cpu_arr,
-            num_tokens_per_batch_arr,
-            num_tokens_for_logprob_arr,
         )
 
         aux_data = {
             "capture_hidden_mode": self.capture_hidden_mode,
+            "accept_length_cpu": self.accept_length_cpu,
+            "num_tokens_per_batch": self.num_tokens_per_batch,
+            "num_tokens_for_logprob_per_batch": self.num_tokens_for_logprob_per_batch,
         }
         return (children, aux_data)
 
@@ -482,6 +473,9 @@ class EagleDraftInput:
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.accept_length_cpu = aux_data["accept_length_cpu"]
+        obj.num_tokens_per_batch = aux_data["num_tokens_per_batch"]
+        obj.num_tokens_for_logprob_per_batch = aux_data["num_tokens_for_logprob_per_batch"]
         obj.topk_p = children[0]
         obj.topk_index = children[1]
         obj.hidden_states = children[2]
@@ -491,10 +485,6 @@ class EagleDraftInput:
         obj.kv_indices = children[6]
         obj.seq_lens_for_draft_extend = children[7]
         obj.req_pool_indices_for_draft_extend = children[8]
-
-        obj.accept_length_cpu = children[9]
-        obj.num_tokens_per_batch = children[10]
-        obj.num_tokens_for_logprob_per_batch = children[11]
 
         return obj
 
@@ -996,9 +986,12 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
-        predict = np.asarray(jax.device_get(predict))
-        accept_index = np.asarray(jax.device_get(accept_index))
-        accept_length = np.asarray(jax.device_get(accept_length))
+        predict, accept_index, accept_length = jax.device_get(
+            (predict, accept_index, accept_length)
+        )
+        predict = np.asarray(predict)
+        accept_index = np.asarray(accept_index)
+        accept_length = np.asarray(accept_length)
 
         accept_length = accept_length + 1
         accept_index = accept_index.flatten()
