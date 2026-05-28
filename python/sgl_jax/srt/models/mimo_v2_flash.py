@@ -14,7 +14,7 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import FusedQKVLinear, LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -210,6 +210,7 @@ class MiMoV2Attention(nnx.Module):
         attention_value_scale: float | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        use_fused_qkv: bool = False,
     ):
         self.layer_id = layer_id
         self.mesh = mesh
@@ -219,36 +220,48 @@ class MiMoV2Attention(nnx.Module):
         self.k_head_num = num_kv_heads
         self.v_head_dim = v_head_dim if v_head_dim is not None else self.head_dim
         self.attention_value_scale = attention_value_scale
+        self.use_fused_qkv = use_fused_qkv
 
         self.q_size = num_heads * self.head_dim
         self.k_size = num_kv_heads * self.head_dim
         self.v_size = num_kv_heads * self.v_head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=self.q_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.k_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=self.k_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.v_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=self.v_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
+        if use_fused_qkv:
+            self.qkv_proj = FusedQKVLinear(
+                hidden_size=hidden_size,
+                q_size=self.q_size,
+                k_size=self.k_size,
+                v_size=self.v_size,
+                mesh=mesh,
+                use_bias=False,
+                params_dtype=dtype,
+            )
+        else:
+            self.q_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=self.q_size,
+                kernel_axes=(None, "tensor"),
+                use_bias=False,
+                params_dtype=dtype,
+                mesh=mesh,
+            )
+            self.k_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=self.k_size,
+                kernel_axes=(None, "tensor"),
+                use_bias=False,
+                params_dtype=dtype,
+                mesh=mesh,
+            )
+            self.v_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=self.v_size,
+                kernel_axes=(None, "tensor"),
+                use_bias=False,
+                params_dtype=dtype,
+                mesh=mesh,
+            )
         self.o_proj = LinearBase(
             input_size=num_heads * self.v_head_dim,
             output_size=hidden_size,
@@ -300,9 +313,13 @@ class MiMoV2Attention(nnx.Module):
         *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        if self.use_fused_qkv:
+            qkv = self.qkv_proj(hidden_states)
+            q, k, v = self.qkv_proj.split(qkv)
+        else:
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
 
         q = q.reshape(-1, self.q_head_num, self.head_dim, out_sharding=P("data", "tensor", None))
         k = k.reshape(
@@ -386,6 +403,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
+                use_fused_qkv=getattr(config, "enable_fused_qkv", False),
             )
         else:
             self.self_attn = MiMoV2Attention(
@@ -404,6 +422,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
+                use_fused_qkv=getattr(config, "enable_fused_qkv", False),
             )
 
         if self.is_layer_sparse:
