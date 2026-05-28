@@ -396,3 +396,104 @@ class QuantizedLinear(nnx.Module):
         if self.bias is not None:
             output = output + self.bias.value
         return output, None
+
+
+class FusedQKVLinear(nnx.Module):
+    """Fused Q/K/V column-parallel linear (single dot_general → 3 outputs).
+
+    Logical weight: ``[hidden_size, q_size + k_size + v_size]``.
+
+    Layout is per-TP-rank interleaved:
+    ``[rank0:[Q|K|V] | rank1:[Q|K|V] | ... | rank_{tp-1}:[Q|K|V]]``.
+    Sharding ``P(None, "tensor")`` makes XLA partition axis=1 into ``tp``
+    equal segments; each rank's segment is exactly its
+    ``[Q_local | K_local | V_local]``. Weight loaders are responsible for
+    arranging the loaded data to match this canonical layout.
+
+    Call returns the fused output tensor. Use ``split(qkv)`` to recover
+    ``(q, k, v)`` logical tensors with shapes ``[..., q_size]``,
+    ``[..., k_size]``, ``[..., v_size]``.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        q_size: int,
+        k_size: int,
+        v_size: int,
+        mesh: jax.sharding.Mesh,
+        use_bias: bool = False,
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        scope_name: str = "fused_qkv_proj",
+    ):
+        self.hidden_size = hidden_size
+        self.q_size = q_size
+        self.k_size = k_size
+        self.v_size = v_size
+        self.mesh = mesh
+        self.params_dtype = params_dtype
+        self.name = scope_name
+        self.tp = mesh.shape["tensor"]
+        if q_size % self.tp != 0 or k_size % self.tp != 0 or v_size % self.tp != 0:
+            raise ValueError(
+                f"FusedQKVLinear requires each of q_size={q_size}, k_size={k_size}, "
+                f"v_size={v_size} to be divisible by tp={self.tp}."
+            )
+        self.q_shard_size = q_size // self.tp
+        self.k_shard_size = k_size // self.tp
+        self.v_shard_size = v_size // self.tp
+        self.per_shard_size = self.q_shard_size + self.k_shard_size + self.v_shard_size
+        total_size = q_size + k_size + v_size
+        self.kernel_axes = (None, "tensor")
+
+        self.weight = nnx.Param(
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (hidden_size, total_size),
+                dtype=params_dtype,
+                out_sharding=P(*self.kernel_axes),
+            ),
+        )
+        if use_bias:
+            self.bias = nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (total_size,),
+                    dtype=params_dtype,
+                    out_sharding=P("tensor"),
+                ),
+            )
+        else:
+            self.bias = None
+
+    @named_scope
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out = lax.dot_general(
+            x,
+            self.weight.value,
+            (((x.ndim - 1,), (0,)), ((), ())),
+            preferred_element_type=self.params_dtype,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P("data", *([None] * (x.ndim - 2)), "tensor"),
+            ),
+        )
+        if self.bias is not None:
+            out = out + self.bias.value
+        return out
+
+    def split(self, qkv: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Recover (q, k, v) from fused output.
+
+        Reshape view ``[..., tp, per_shard_size]`` exposes the per-rank
+        segments along axis=-2; slicing axis=-1 picks each rank's
+        [Q|K|V] sub-segments which are then reshaped back to flat shape.
+        No data movement; XLA keeps the sharding on the tp dim.
+        """
+        qkv_rs = qkv.reshape(*qkv.shape[:-1], self.tp, self.per_shard_size)
+        q = qkv_rs[..., : self.q_shard_size].reshape(*qkv.shape[:-1], -1)
+        k = qkv_rs[..., self.q_shard_size : self.q_shard_size + self.k_shard_size].reshape(
+            *qkv.shape[:-1], -1
+        )
+        v = qkv_rs[..., self.q_shard_size + self.k_shard_size :].reshape(*qkv.shape[:-1], -1)
+        return q, k, v

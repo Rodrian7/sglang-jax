@@ -318,6 +318,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
+        self.model_config.hf_config.enable_fused_qkv = self.server_args.enable_fused_qkv
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):

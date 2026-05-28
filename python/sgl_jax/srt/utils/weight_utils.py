@@ -222,6 +222,39 @@ class WeightLoader:
                 new_linear.bias = nnx.Param(bias.astype(jnp.bfloat16))
         return new_linear
 
+    @staticmethod
+    def create_fused_qkv_linear(
+        weight: jax.Array,
+        q_size: int,
+        k_size: int,
+        v_size: int,
+        mesh: jax.sharding.Mesh,
+    ):
+        """Create a bf16 FusedQKVLinear from a weight array [in, q+k+v].
+
+        Caller must ensure weight is arranged per-rank-interleaved
+        ``[rank0:[Q|K|V] | rank1:[Q|K|V] | ...]`` to match the sharding
+        ``P(None, "tensor")``.
+        """
+        from sgl_jax.srt.layers.linear import FusedQKVLinear
+
+        in_features, total = weight.shape
+        assert (
+            total == q_size + k_size + v_size
+        ), f"weight axis=1 ({total}) != q_size+k_size+v_size ({q_size+k_size+v_size})"
+        with jax.set_mesh(mesh):
+            new_module = FusedQKVLinear(
+                hidden_size=in_features,
+                q_size=q_size,
+                k_size=k_size,
+                v_size=v_size,
+                mesh=mesh,
+                use_bias=False,
+                params_dtype=jnp.bfloat16,
+            )
+            new_module.weight = nnx.Param(weight)
+        return new_module
+
     def dequant_fp8_linear(self, ql, head_dim: int | None = None) -> "LinearBase":
         """Dequantize a single QuantizedLinear → bf16 LinearBase.
 
@@ -574,6 +607,16 @@ class WeightLoader:
 
         tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
 
+        # Fused-keep mode: emit a single fused qkv_proj per layer (vs the
+        # default split path that emits q_proj/k_proj/v_proj). Triggered by
+        # --enable-fused-qkv via model_config.enable_fused_qkv.
+        use_fused = getattr(config, "enable_fused_qkv", False)
+        inf_tp = self.mesh.shape["tensor"]
+        quant_per_inf = 0  # set on layer 0 after n_shards is inferred
+        q_size_total = num_heads * head_dim
+        k_size_total = num_kv_heads * head_dim
+        v_size_total = num_kv_heads * v_head_dim
+
         for layer_idx in sorted(fused_qkv_buffers.keys()):
             buf = fused_qkv_buffers[layer_idx]
             fused_weight = buf["weight"]  # numpy, [total_qkv, hidden], FP8
@@ -600,10 +643,28 @@ class WeightLoader:
             padded_rows = per_shard_blocks * block_size
             in_blocks = in_dim // block_size
 
+            if use_fused and layer_idx == 0:
+                # Validate fused-keep constraints once on layer 0
+                if orig_kv_heads != num_kv_heads:
+                    raise ValueError(
+                        f"--enable-fused-qkv requires quant-time orig_kv_heads "
+                        f"({orig_kv_heads}) == config num_kv_heads ({num_kv_heads}); "
+                        f"in-fused-tensor KV head replication is not implemented. "
+                        f"Disable --enable-fused-qkv."
+                    )
+                if n_shards % inf_tp != 0:
+                    raise ValueError(
+                        f"--enable-fused-qkv requires inference TP ({inf_tp}) to "
+                        f"divide quant-time n_shards ({n_shards}). Got remainder "
+                        f"{n_shards % inf_tp}. Either disable --enable-fused-qkv "
+                        f"or re-quantize ckpt at a compatible TP."
+                    )
+                quant_per_inf = n_shards // inf_tp
+
             if layer_idx % 10 == 0:
                 logger.info(
                     "Layer %d: dequant fused QKV FP8 (CPU), n_shards=%d, "
-                    "per_shard=%d (Q=%d K=%d V=%d), blocks=%d",
+                    "per_shard=%d (Q=%d K=%d V=%d), blocks=%d%s",
                     layer_idx,
                     n_shards,
                     per_shard_total,
@@ -611,6 +672,7 @@ class WeightLoader:
                     per_shard_k,
                     per_shard_v,
                     per_shard_blocks,
+                    " [fused-keep]" if use_fused else "",
                 )
 
             q_parts, k_parts, v_parts = [], [], []
@@ -645,47 +707,87 @@ class WeightLoader:
             # Free CPU buffers for this layer
             del buf["weight"], buf["scale"]
 
-            # Concat on CPU, convert to bf16, shard to TPU via callback.
-            # Uses make_array_from_callback to avoid the allgather that
-            # device_put triggers in multi-host (assert_equal OOM).
-            # Process Q/K/V sequentially to limit peak CPU memory.
             attn = layers[layer_idx].self_attn
-            for proj_name, parts in [
-                ("q_proj", q_parts),
-                ("k_proj", k_parts),
-                ("v_proj", v_parts),
-            ]:
-                merged = np.ascontiguousarray(
-                    np.concatenate(parts, axis=1).astype(ml_dtypes.bfloat16)
-                )
-                del parts[:]
-                # Bind merged via default arg to avoid late-binding closure issue.
-                weight = jax.make_array_from_callback(
-                    merged.shape,
-                    tp_sharding,
-                    lambda idx, m=merged: jnp.array(m[idx]),
-                )
-                del merged
-                setattr(
-                    attn,
-                    proj_name,
-                    self.create_bf16_linear(weight, (None, "tensor"), self.mesh),
-                )
 
-            if layer_idx == 0:
-                q_w = attn.q_proj.weight.value
-                k_w = attn.k_proj.weight.value
-                v_w = attn.v_proj.weight.value
-                logger.info(
-                    "Layer 0 dequant result: Q=%s K=%s V=%s",
-                    q_w.shape,
-                    k_w.shape,
-                    v_w.shape,
+            if use_fused:
+                # Per-inference-shard reorder so each inf shard's segment is
+                # [Q_local | K_local | V_local] contiguous (Q/K/V three-way
+                # interleaving across shards, not within a shard).
+                inf_segments = []
+                for inf_idx in range(inf_tp):
+                    s = inf_idx * quant_per_inf
+                    e = s + quant_per_inf
+                    q_inf = np.concatenate(q_parts[s:e], axis=1)
+                    k_inf = np.concatenate(k_parts[s:e], axis=1)
+                    v_inf = np.concatenate(v_parts[s:e], axis=1)
+                    inf_segments.append(np.concatenate([q_inf, k_inf, v_inf], axis=1))
+                fused = np.ascontiguousarray(
+                    np.concatenate(inf_segments, axis=1).astype(ml_dtypes.bfloat16)
                 )
+                del inf_segments
+                q_parts.clear()
+                k_parts.clear()
+                v_parts.clear()
+
+                weight = jax.make_array_from_callback(
+                    fused.shape,
+                    tp_sharding,
+                    lambda idx, m=fused: jnp.array(m[idx]),
+                )
+                del fused
+                attn.qkv_proj = self.create_fused_qkv_linear(
+                    weight, q_size_total, k_size_total, v_size_total, self.mesh
+                )
+                if layer_idx == 0:
+                    logger.info(
+                        "Layer 0 fused-keep dequant result: qkv_proj.weight=%s",
+                        attn.qkv_proj.weight.value.shape,
+                    )
+            else:
+                # Original split path: 3 separate LinearBase modules.
+                # Concat on CPU, convert to bf16, shard to TPU via callback.
+                # Uses make_array_from_callback to avoid the allgather that
+                # device_put triggers in multi-host (assert_equal OOM).
+                # Process Q/K/V sequentially to limit peak CPU memory.
+                for proj_name, parts in [
+                    ("q_proj", q_parts),
+                    ("k_proj", k_parts),
+                    ("v_proj", v_parts),
+                ]:
+                    merged = np.ascontiguousarray(
+                        np.concatenate(parts, axis=1).astype(ml_dtypes.bfloat16)
+                    )
+                    del parts[:]
+                    # Bind merged via default arg to avoid late-binding closure issue.
+                    weight = jax.make_array_from_callback(
+                        merged.shape,
+                        tp_sharding,
+                        lambda idx, m=merged: jnp.array(m[idx]),
+                    )
+                    del merged
+                    setattr(
+                        attn,
+                        proj_name,
+                        self.create_bf16_linear(weight, (None, "tensor"), self.mesh),
+                    )
+
+                if layer_idx == 0:
+                    q_w = attn.q_proj.weight.value
+                    k_w = attn.k_proj.weight.value
+                    v_w = attn.v_proj.weight.value
+                    logger.info(
+                        "Layer 0 dequant result: Q=%s K=%s V=%s",
+                        q_w.shape,
+                        k_w.shape,
+                        v_w.shape,
+                    )
 
         # Clean up buffers
         fused_qkv_buffers.clear()
-        logger.info("Fused QKV FP8 dequantization complete (CPU numpy path).")
+        logger.info(
+            "Fused QKV FP8 dequantization complete (CPU numpy path)%s.",
+            " [fused-keep]" if use_fused else "",
+        )
 
     @staticmethod
     def _infer_qkv_shards(

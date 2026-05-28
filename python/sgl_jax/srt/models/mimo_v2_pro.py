@@ -48,7 +48,9 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
         if self.loader.is_static_quant:
             head_dim = self.config.head_dim
             v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-            # Dequantize fused QKV per-shard, then split into Q/K/V bf16.
+            use_fused = getattr(self.config, "enable_fused_qkv", False)
+            # Dequantize fused QKV per-shard, then split into Q/K/V bf16
+            # (or keep fused as qkv_proj when enable_fused_qkv is set).
             self.loader.dequant_fused_qkv(self._fused_qkv_buffers, self.model.layers, self.config)
             # Dequantize remaining FP8 weights (layer 0 MLP, etc).
             self.loader.dequant_fp8_layers(
@@ -60,11 +62,15 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
                 ],
                 layer_filter=lambda idx, layer: idx == 0 and not layer.is_layer_sparse,
             )
-            self.loader.replicate_kv_heads(
-                self.model.layers,
-                specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
-                target_kv_heads_fn=lambda attn: attn.k_head_num,
-            )
+            # KV head replication: only meaningful when q_proj/k_proj/v_proj
+            # are separate modules. Fused path keeps K/V inside qkv_proj and
+            # validates orig_kv == config num_kv_heads upstream, so no-op here.
+            if not use_fused:
+                self.loader.replicate_kv_heads(
+                    self.model.layers,
+                    specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
+                    target_kv_heads_fn=lambda attn: attn.k_head_num,
+                )
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         """Override to handle fused qkv_proj weights in MiMo-V2-Pro checkpoints."""

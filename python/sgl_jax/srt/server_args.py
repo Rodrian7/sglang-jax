@@ -81,6 +81,7 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: str | None = None
     enable_sequence_parallel: bool = False
+    enable_fused_qkv: bool = False
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -631,6 +632,14 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_sequence_parallel,
             help="Enable sequence parallelism.",
+        )
+        parser.add_argument(
+            "--enable-fused-qkv",
+            action="store_true",
+            default=ServerArgs.enable_fused_qkv,
+            help="Fuse Q/K/V projections into a single dot_general. "
+            "Requires the model's QKV ckpt format to be supported by the model code "
+            "(currently MiMo-V2-Pro per-TP-shard fused FP8).",
         )
         parser.add_argument(
             "--stream-interval",
