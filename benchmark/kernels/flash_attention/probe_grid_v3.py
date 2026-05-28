@@ -18,7 +18,6 @@ $ARTIFACT_LOCAL_DIR/profiles/<tag>/ so we can drill into HLO if needed.
 import functools
 import os
 import statistics
-import time
 
 import jax
 import jax.numpy as jnp
@@ -156,31 +155,30 @@ def run_cell(shape: dict, kv_range, sz: int, csz: int, *, profile_root: str, tri
     # in multiple_iteration_timeit_from_trace returns kernel-only device time.
     task = f"RPAd-p_{shape['page_size']}-bq_1_1-bkv_{sz}_{csz}"
 
+    # multiple_iteration_timeit_from_trace already manages its own
+    # jax.profiler.trace context. Don't wrap it again here.
+    cell_trace_root = os.path.join(
+        profile_root,
+        shape["tag"],
+        f"kv{kv_range[0]}-{kv_range[1]}",
+        f"sz{sz}_csz{csz}",
+    )
+    os.makedirs(cell_trace_root, exist_ok=True)
+
     samples = []
-    trace_dir = None
     for t in range(tries):
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        trace_dir = os.path.join(
-            profile_root,
-            shape["tag"],
-            f"kv{kv_range[0]}-{kv_range[1]}",
-            f"sz{sz}_csz{csz}",
-            f"try{t}_{ts}",
+        times = multiple_iteration_timeit_from_trace(
+            compute_func=lambda: bound(),
+            data_generator=lambda: (),
+            task=task,
+            tries=1,
+            trace_root=cell_trace_root,
         )
-        os.makedirs(trace_dir, exist_ok=True)
-        with jax.profiler.trace(trace_dir):
-            jax.block_until_ready(bound())
-            times = multiple_iteration_timeit_from_trace(
-                compute_func=lambda: bound(),
-                data_generator=lambda: (),
-                task=task,
-                tries=1,
-            )
         if times:
             samples.append(float(np.mean(times)))
         else:
             samples.append(float("nan"))
-    return samples, trace_dir
+    return samples, cell_trace_root
 
 
 def main():
