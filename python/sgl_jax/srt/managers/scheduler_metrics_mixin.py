@@ -130,7 +130,7 @@ class SchedulerMetricsMixin:
 
         if running_batch.spec_algorithm is not None and not running_batch.spec_algorithm.is_none():
             accept_len = self.accept_token / self.spec_num_forward_ct
-            accept_ratio = (self.accept_token - self.spec_num_forward_ct) / self.draft_token
+            accept_ratio = (self.accept_token - self.spec_num_forward_ct) / (self.draft_token - self.spec_num_forward_ct)
             self.spec_num_total_accepted_tokens += self.accept_token
             self.spec_num_total_forward_ct += self.spec_num_forward_ct
             self.accept_token = 0
