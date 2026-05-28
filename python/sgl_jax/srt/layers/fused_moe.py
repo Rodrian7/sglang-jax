@@ -355,16 +355,28 @@ class FusedEPMoE(nnx.Module):
                     w2_scale, self.hidden_size, self.quant_block_n
                 )
             else:
-                # (E, K//wsz, N) → (E, K//wsz, 1, N)
-                w1_scale_4d = w1_scale.reshape(
-                    w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]
-                )
-                w3_scale_4d = w3_scale.reshape(
-                    w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]
-                )
-                w2_scale_4d = w2_scale.reshape(
-                    w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]
-                )
+                if w1_scale.ndim == 2:
+                    # Per-channel (block_size=None): scale is (E, N) → (E, 1, 1, N)
+                    w1_scale_4d = w1_scale.reshape(
+                        w1_scale.shape[0], 1, 1, w1_scale.shape[1]
+                    )
+                    w3_scale_4d = w3_scale.reshape(
+                        w3_scale.shape[0], 1, 1, w3_scale.shape[1]
+                    )
+                    w2_scale_4d = w2_scale.reshape(
+                        w2_scale.shape[0], 1, 1, w2_scale.shape[1]
+                    )
+                else:
+                    # (E, K//wsz, N) → (E, K//wsz, 1, N)
+                    w1_scale_4d = w1_scale.reshape(
+                        w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]
+                    )
+                    w3_scale_4d = w3_scale.reshape(
+                        w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]
+                    )
+                    w2_scale_4d = w2_scale.reshape(
+                        w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]
+                    )
 
             if hasattr(self, "w1_scale"):
                 del self.w1_scale
