@@ -17,7 +17,6 @@ Usage:
 
 import argparse
 import functools
-from math import inf
 
 import jax
 import jax.numpy as jnp
@@ -105,12 +104,13 @@ def make_decode_inputs(
 
 def benchmark_one(
     bkv_sz: int,
+    bkv_csz: int,
     *,
     inputs,
     head_dim: int,
 ):
     q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution = inputs
-    block_sizes = (1, bkv_sz, 1, bkv_sz)  # decode: bq=1, csz=sz
+    block_sizes = (1, bkv_sz, 1, bkv_csz)  # decode: bq=1, bq_csz=1
 
     @functools.partial(jax.jit, static_argnames=["sm_scale", "d_block_sizes", "vmem_limit_bytes"])
     def attn(q, k, v, kvc, kvl, pi, cql, ckl, dist, sm_scale, d_block_sizes, vmem_limit_bytes):
@@ -150,7 +150,7 @@ def benchmark_one(
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: bound(),
         data_generator=lambda: (),
-        task=f"probe-bkv{bkv_sz}",
+        task=f"probe-sz{bkv_sz}-csz{bkv_csz}",
         tries=1,
     )
     return float(np.mean(times)) if times else float("nan")
@@ -163,7 +163,20 @@ def main():
         default="256:512,1024:2048,16384:32768",
         help="comma-list of LO:HI ranges; each is one sweep",
     )
-    p.add_argument("--bkv-candidates", default="256,512,1024,2048,4096,8192,16384,32768")
+    p.add_argument(
+        "--configs",
+        default=(
+            # Heuristic-shaped baselines (csz=sz, current behavior):
+            "32768:32768,1024:1024,512:512,"
+            # Proposal: fixed csz=512, sweep sz. csz | sz required.
+            "32768:512,16384:512,8192:512,4096:512,2048:512,1024:512"
+        ),
+        help=(
+            "comma-list of SZ:CSZ pairs to benchmark. SZ must be a multiple of CSZ. "
+            "Default tests current heuristic baselines (csz=sz) AND the csz=512 "
+            "fixed proposal (sweep sz)."
+        ),
+    )
     p.add_argument("--max-context-len", type=int, default=40960)
     p.add_argument("--max-kv-cache-tokens", type=int, default=600000)
     p.add_argument("--batch-size", type=int, default=128)  # mnt for decode
@@ -177,7 +190,13 @@ def main():
     for tok in args.prefix_ranges.split(","):
         lo, hi = tok.split(":")
         ranges.append((int(lo), int(hi)))
-    bkv_list = [int(x) for x in args.bkv_candidates.split(",")]
+    configs: list[tuple[int, int]] = []
+    for tok in args.configs.split(","):
+        sz_str, csz_str = tok.split(":")
+        sz, csz = int(sz_str), int(csz_str)
+        if sz % csz != 0:
+            raise ValueError(f"sz={sz} not divisible by csz={csz}")
+        configs.append((sz, csz))
 
     # Heuristic baseline (max_context_len-aware) for context.
     pages_per_seq = cdiv(args.max_context_len, args.page_size)
@@ -202,8 +221,9 @@ def main():
     print(f"# Heuristic decode bkv_sz: {heur['bkv_sz']}")
     print()
 
-    # Per range, sweep bkv. Print table.
-    all_winners: list[tuple[tuple[int, int], int | None, float]] = []
+    # Per range, sweep configs. Print full table.
+    # results[range_idx] = list of (sz, csz, time)
+    results: list[list[tuple[int, int, float]]] = []
     for lo, hi in ranges:
         inputs = make_decode_inputs(
             lo,
@@ -218,30 +238,72 @@ def main():
         )
         actual_kv = (lo + hi) // 2
         print(f"=== prefix [{lo},{hi}) — actual_kv ≈ {actual_kv} ===")
-        best_bkv, best_t = None, inf
-        for bkv in bkv_list:
+        rows: list[tuple[int, int, float]] = []
+        for sz, csz in configs:
             try:
-                t = benchmark_one(bkv, inputs=inputs, head_dim=args.head_dim)
+                t = benchmark_one(sz, csz, inputs=inputs, head_dim=args.head_dim)
             except Exception as e:  # noqa: BLE001
-                print(f"  bkv={bkv:>5}  SKIP ({type(e).__name__}: {e})")
+                print(f"  sz={sz:>5} csz={csz:>5}  SKIP ({type(e).__name__}: {e})")
                 continue
-            mark = ""
-            if t < best_t:
-                best_t, best_bkv = t, bkv
-                mark = "  ← winner so far"
-            print(f"  bkv={bkv:>5}  {t*1000:.4f}ms{mark}")
-        print(f"  WINNER: bkv={best_bkv} @ {best_t*1000:.4f}ms")
+            rows.append((sz, csz, t))
+            print(f"  sz={sz:>5} csz={csz:>5}  {t*1000:.4f}ms")
+        if rows:
+            best_sz, best_csz, best_t = min(rows, key=lambda r: r[2])
+            heur_row = next((r for r in rows if r[0] == r[1] == 32768), None)
+            heur_str = (
+                f"heuristic (sz=csz=32768) {heur_row[2] * 1000:.4f}ms"
+                if heur_row is not None
+                else "(no heuristic baseline in configs)"
+            )
+            print(f"  WINNER: sz={best_sz} csz={best_csz} @ {best_t*1000:.4f}ms — {heur_str}")
         print()
-        all_winners.append(((lo, hi), best_bkv, best_t))
+        results.append(rows)
 
-    # Verdict.
-    print("=== verdict ===")
-    winners = {bkv for _, bkv, _ in all_winners}
-    if len(winners) == 1:
-        print(f"All ranges agree on bkv={winners.pop()} → kv_len bucketing NOT needed.")
-    else:
-        print(f"Winners diverge across ranges: {all_winners}")
-        print("→ TUNED_BLOCK_SIZES_V3 likely needs a kv_len_bucket key dimension.")
+    # Verdict: focus on csz=512 fixed proposal.
+    print("=== verdict — csz=512 fixed proposal ===")
+    print("For each kv range, compare best (sz, csz=512) vs best (sz, csz=sz) vs heuristic:")
+    print()
+    print(
+        f"{'range':>20}  {'csz=512 best':>20}  {'csz=sz best':>20}  {'heuristic':>20}  {'csz=512 vs heur':>20}"
+    )
+    csz512_universal: dict[int, list[float]] = {}  # sz → [time per range]
+    for (lo, hi), rows in zip(ranges, results, strict=False):
+        c512 = [r for r in rows if r[1] == 512]
+        cseq = [r for r in rows if r[0] == r[1]]
+        heur = next((r for r in rows if r[0] == r[1] == 32768), None)
+        b512 = min(c512, key=lambda r: r[2]) if c512 else None
+        bseq = min(cseq, key=lambda r: r[2]) if cseq else None
+        b512_str = f"sz={b512[0]}: {b512[2]*1000:.3f}ms" if b512 else "n/a"
+        bseq_str = f"sz={bseq[0]}: {bseq[2]*1000:.3f}ms" if bseq else "n/a"
+        heur_str = f"{heur[2]*1000:.3f}ms" if heur else "n/a"
+        ratio_str = f"{heur[2]/b512[2]:.2f}× faster" if (heur and b512) else "n/a"
+        print(
+            f"  [{lo},{hi}) ".rjust(20)
+            + f"  {b512_str:>20}  {bseq_str:>20}  {heur_str:>20}  {ratio_str:>20}"
+        )
+        for sz, _, t in c512:
+            csz512_universal.setdefault(sz, []).append(t)
+
+    # Universal config check: is there ONE (sz, csz=512) that's near-optimal across ALL ranges?
+    print()
+    print("=== verdict — universal (sz, csz=512) candidate ===")
+    print(
+        "For each candidate sz with csz=512, compare its time across ranges to that range's per-range optimal:"
+    )
+    print()
+    for sz, times in sorted(csz512_universal.items()):
+        if len(times) != len(ranges):
+            continue
+        slowdowns = []
+        for (lo, hi), rows, t in zip(ranges, results, times, strict=False):
+            best_in_range = min(r[2] for r in rows)
+            slowdowns.append((lo, hi, t / best_in_range))
+        worst = max(s[2] for s in slowdowns)
+        detail = " ".join(f"[{lo},{hi}):{ratio:.2f}×" for lo, hi, ratio in slowdowns)
+        flag = "  ← UNIVERSAL CANDIDATE" if worst < 1.10 else ""
+        print(
+            f"  sz={sz:>5} csz=512  worst-case slowdown vs per-range optimal: {worst:.2f}×  ({detail}){flag}"
+        )
 
 
 if __name__ == "__main__":
