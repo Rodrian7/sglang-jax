@@ -76,6 +76,7 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         use_jax_allreduce_metadata: bool = True,
+        metadata_algorithm: str = "recursive_doubling",
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -105,6 +106,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
+        self.metadata_algorithm = metadata_algorithm
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -574,6 +576,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
             use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
+            metadata_algorithm=self.metadata_algorithm,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
