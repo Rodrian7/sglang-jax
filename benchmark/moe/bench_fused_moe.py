@@ -887,7 +887,10 @@ def run_all(
                 ),
             )
         # Determine quant_block_k for FP8 quantization
-        if quant_block_k_override is not None:
+        if quant_block_k_override == 0:
+            # 0 = per-channel (explicit opt-in)
+            quant_block_k = None
+        elif quant_block_k_override is not None:
             quant_block_k = quant_block_k_override
         else:
             quant_block_k = 256 if weight_dtype == jnp.float8_e4m3fn else None
@@ -1385,7 +1388,8 @@ def parse_args() -> argparse.Namespace:
         "--quant-block-k",
         type=int,
         default=None,
-        help="Sub-channel quantization block size (default: 256 for FP8, None for bf16).",
+        help="Sub-channel quantization block size. Default: 256 for FP8, None for bf16. "
+             "Pass 0 to force per-channel (None) under FP8.",
     )
     parser.add_argument(
         "--alpha",
@@ -1447,6 +1451,11 @@ if __name__ == "__main__":
         faulthandler.enable(file=sys.stdout, all_threads=True)
     except Exception:
         pass
+    # Multi-pod init: caller sets BENCH_DISTRIBUTED=1 when launching across hosts.
+    # Single-pod runs skip this (jax.distributed.initialize() would otherwise hang
+    # waiting for peer hosts that don't exist).
+    if os.environ.get("BENCH_DISTRIBUTED", "0") == "1":
+        jax.distributed.initialize()
     args = parse_args()
     if args.token_valid_ratios is None:
         if args.token_mask_mode == "none" and args.token_valid_ratio < 1.0:
