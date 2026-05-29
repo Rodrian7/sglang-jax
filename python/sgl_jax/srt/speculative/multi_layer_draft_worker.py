@@ -32,6 +32,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.speculative.base_worker import replicate_to_mesh
 from sgl_jax.srt.speculative.eagle_draft_worker import (
     EagleDraftWorker,
+    _alloc_draft_buffers,
     select_top_k_tokens,
     topk_probs_from_logits,
     update_eagle_lists,
@@ -136,17 +137,12 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         topk_index = model_worker_batch.spec_info_padded.topk_index
         hidden_states = model_worker_batch.spec_info_padded.hidden_states
         bs = model_worker_batch.seq_lens.shape[0]
-        step_min_1 = self.speculative_num_steps - 1
-        score_list = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list = jnp.empty(
-            (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
+        hidden_dim = hidden_states.shape[1]
+        score_list, token_list, parents_list, hidden_ph = _alloc_draft_buffers(
+            bs, self.speculative_num_steps, self.topk, hidden_dim
         )
-        parents_list = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
         scores = None
-        positions_base = device_array(
-            np.repeat(model_worker_batch.seq_lens, self.topk),
-            sharding=NamedSharding(self.mesh, P()),
-        )
+        positions_base = np.repeat(model_worker_batch.seq_lens, self.topk)
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
 
         # Per-layer attention metadata: each layer has its own KV pool, so
@@ -161,7 +157,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
+        forward_batch.spec_info.hidden_states = hidden_ph
 
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(

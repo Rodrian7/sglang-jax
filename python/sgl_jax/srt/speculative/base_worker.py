@@ -219,7 +219,6 @@ class BaseSpecWorker:
         req_ids = np.arange(len(accept_index)) // accept_width
         per_req_last = req_ids * draft_n + draft_n - 1
         safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
-        safe_index = jnp.asarray(safe_index, dtype=jnp.int32)
         if is_all_greedy:
             logits_output.hidden_states, model_worker_batch.positions = (
                 _gather_verified(

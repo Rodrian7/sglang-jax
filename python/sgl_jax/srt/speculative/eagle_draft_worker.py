@@ -417,17 +417,12 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.spec_info_padded.hidden_states,
         )
         bs = model_worker_batch.seq_lens.shape[0]
-        step_min_1 = self.speculative_num_steps - 1
-        score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list: jax.Array = jnp.empty(
-            (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
+        hidden_dim = hidden_states.shape[1]
+        score_list, token_list, parents_list, hidden_ph = _alloc_draft_buffers(
+            bs, self.speculative_num_steps, self.topk, hidden_dim
         )
-        parents_list: jax.Array = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
         scores = None
-        positions_base = device_array(
-            np.repeat(model_worker_batch.seq_lens, self.topk),
-            sharding=(NamedSharding(self.mesh, P())),
-        )
+        positions_base = np.repeat(model_worker_batch.seq_lens, self.topk)
         logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
             model_worker_batch,
@@ -440,7 +435,7 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
+        forward_batch.spec_info.hidden_states = hidden_ph
         for i in range(self.speculative_num_steps):
 
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
@@ -523,6 +518,16 @@ class EagleDraftWorker(BaseDraftWorker):
 # ---------------------------------------------------------------------------
 
 
+@functools.partial(jax.jit, static_argnames=["bs", "steps", "topk", "hidden_dim"])
+def _alloc_draft_buffers(bs, steps, topk, hidden_dim):
+    step_min_1 = steps - 1
+    score_list = jnp.empty((bs, 1 + step_min_1 * topk, topk))
+    token_list = jnp.empty((bs, topk + step_min_1 * topk * topk), dtype=jnp.int32)
+    parents_list = jnp.empty((bs, topk + 1 + step_min_1 * topk))
+    hidden_ph = jnp.empty((bs * topk, hidden_dim))
+    return score_list, token_list, parents_list, hidden_ph
+
+
 @functools.partial(jax.jit, static_argnames=["topk"])
 def topk_probs_from_logits(
     logits: jax.Array, topk: int, axis: int = -1
@@ -593,7 +598,7 @@ def update_forward_batch_info(
     i: int,
     input_ids: jax.Array,
     hidden_states: jax.Array,
-    positions_base: jax.Array,
+    positions_base: np.ndarray,
 ) -> ForwardBatch:
     forward_batch.input_ids = input_ids
     # FIXME(pc) hiddenstate will become NAN when forward path is very long, we still have no reason for this
@@ -614,7 +619,7 @@ def select_top_k_tokens(
         return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
     else:
         return select_top_k_tokens_step_greater_0(
-            jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
+            i, topk_p, topk_index, hidden_states, scores, topk
         )
 
 
@@ -640,9 +645,9 @@ def select_top_k_tokens_step_0(
     return input_ids, hidden_states, scores, tree_info
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk", "i"])
 def select_top_k_tokens_step_greater_0(
-    i: jax.Array,
+    i: int,
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
