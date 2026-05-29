@@ -4,10 +4,12 @@ import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.tp_worker import ModelWorker
@@ -16,7 +18,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_mesh
+from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_mesh, replicate_to_mesh_jit
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -411,19 +413,11 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
-        topk_p, topk_index, hidden_states = (
-            model_worker_batch.spec_info_padded.topk_p,
-            model_worker_batch.spec_info_padded.topk_index,
-            model_worker_batch.spec_info_padded.hidden_states,
-        )
-        bs = model_worker_batch.seq_lens.shape[0]
-        hidden_dim = hidden_states.shape[1]
-        score_list, token_list, parents_list, hidden_ph = _alloc_draft_buffers(
-            bs, self.speculative_num_steps, self.topk, hidden_dim
-        )
-        scores = None
+        topk_p = model_worker_batch.spec_info_padded.topk_p
+        topk_index = model_worker_batch.spec_info_padded.topk_index
+        hidden_states = model_worker_batch.spec_info_padded.hidden_states
+
         positions_base = np.repeat(model_worker_batch.seq_lens, self.topk)
-        logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
             model_worker_batch,
         )
@@ -435,35 +429,28 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = hidden_ph
-        for i in range(self.speculative_num_steps):
 
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list, token_list, parents_list = update_eagle_lists(
-                i, score_list, token_list, parents_list, tree_info, self.topk
-            )
-            if i == self.speculative_num_steps - 1:
-                break
-
-            forward_batch = update_forward_batch_info(
-                forward_batch, i, input_ids, hidden_states, positions_base
-            )
-            self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
-
-            forward_batch.bid = model_worker_batch.bid
-            logits_output, _, _ = self.draft_model_runner.forward(
-                forward_batch,
-                logits_metadata=logits_metadata,
-            )
-
-            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
-
-            if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
-            hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
-
+        mr = self.draft_model_runner
+        score_list, token_list, parents_list, updated_pools = _jitted_draft_loop(
+            mr.model_def,
+            mr.model_state_def,
+            mr.model_state_leaves,
+            mr.memory_pools,
+            topk_p,
+            topk_index,
+            hidden_states,
+            positions_base,
+            forward_batch,
+            metadata_per_step,
+            logits_metadata,
+            self.hot_token_ids,
+            mr.mesh,
+            self.speculative_num_steps,
+            self.topk,
+        )
+        mr.memory_pools.token_to_kv_pool.replace_buffer(
+            updated_pools.token_to_kv_pool.kv_buffer
+        )
         return score_list, token_list, parents_list
 
     def _pick_context_len(self, max_seq_len: int) -> int:
@@ -526,6 +513,67 @@ def _alloc_draft_buffers(bs, steps, topk, hidden_dim):
     parents_list = jnp.empty((bs, topk + 1 + step_min_1 * topk))
     hidden_ph = jnp.empty((bs * topk, hidden_dim))
     return score_list, token_list, parents_list, hidden_ph
+
+
+@functools.partial(
+    jax.jit,
+    donate_argnames=["memory_pools"],
+    static_argnames=["model_state_def", "num_steps", "topk", "mesh"],
+)
+def _jitted_draft_loop(
+    model_def,
+    model_state_def,
+    model_state_leaves,
+    memory_pools,
+    topk_p,
+    topk_index,
+    hidden_states,
+    positions_base,
+    forward_batch,
+    metadata_list,
+    logits_metadata,
+    hot_token_ids,
+    mesh,
+    num_steps,
+    topk,
+):
+    bs = topk_p.shape[0]
+    hidden_dim = hidden_states.shape[1]
+    score_list, token_list, parents_list, hidden_ph = _alloc_draft_buffers(
+        bs, num_steps, topk, hidden_dim
+    )
+    forward_batch.spec_info.hidden_states = hidden_ph
+    scores = None
+
+    model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+    model = nnx.merge(model_def, model_state)
+
+    for i in range(num_steps):
+        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+            i, topk_p, topk_index, hidden_states, scores, topk
+        )
+        score_list, token_list, parents_list = update_eagle_lists(
+            i, score_list, token_list, parents_list, tree_info, topk
+        )
+        if i == num_steps - 1:
+            break
+
+        forward_batch.input_ids = input_ids
+        forward_batch.spec_info.hidden_states = hidden_states
+        forward_batch.positions = positions_base + i
+        forward_batch.attn_backend.forward_metadata = metadata_list[i]
+
+        with LoraBatchContext.set_batch(forward_batch):
+            output, pool_updates, _, _ = model(forward_batch, memory_pools, logits_metadata)
+        memory_pools.replace_all(pool_updates)
+
+        topk_p, topk_index = topk_probs_from_logits(output.next_token_logits, topk)
+        if hot_token_ids is not None:
+            topk_index = hot_token_ids[topk_index]
+
+        hidden_states = replicate_to_mesh_jit(mesh, output.hidden_states)
+
+    return score_list, token_list, parents_list, memory_pools
 
 
 @functools.partial(jax.jit, static_argnames=["topk"])

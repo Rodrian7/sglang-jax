@@ -37,6 +37,15 @@ def replicate_to_mesh(
     return out[0] if len(out) == 1 else out
 
 
+def replicate_to_mesh_jit(
+    mesh: jax.sharding.Mesh, *arrs: jax.Array
+) -> tuple[jax.Array, ...] | jax.Array:
+    """JIT-safe replicate — uses jax.sharding.reshard instead of device_put."""
+    sharding = NamedSharding(mesh, P())
+    out = tuple(jax.sharding.reshard(a, sharding) for a in arrs)
+    return out[0] if len(out) == 1 else out
+
+
 class BaseDraftWorker(ABC):
     """Draft model worker interface for speculative decoding.
 
