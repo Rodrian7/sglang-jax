@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -580,6 +582,10 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
             metadata_mode=self.metadata_mode,
+            metadata_window_prefetch_first_expert=os.environ.get(
+                "MOE_METADATA_WINDOW_PREFETCH_FIRST_EXPERT", "0"
+            )
+            == "1",
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,

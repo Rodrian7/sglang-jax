@@ -353,6 +353,7 @@ def _fused_ep_moe_kernel(
     ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
+    metadata_window_prefetch_first_expert: bool = False,
     bt: int,
     bf: int,
     btc: int,
@@ -686,6 +687,19 @@ def _fused_ep_moe_kernel(
                             device_id=get_mesh_device_id(peer_id),
                             device_id_type=pltpu.DeviceIdType.MESH,
                         ).start()
+
+                if metadata_window_prefetch_first_expert:
+                    # Speculative prefetch expert 0's bf0 weights into slot 0 during the
+                    # metadata ICI wait window — HBM is idle here. If expert 0 turns out
+                    # inactive (~25% under balanced routing), the loaded bytes are simply
+                    # not consumed (no correctness impact, only ~3 µs of wasted HBM
+                    # bandwidth). If expert 0 is active (~75%), the first-expert
+                    # cold-start latency drops by ~3-5 µs since wait_fetch_w1 finds the
+                    # DMA already complete. init_carry must set bf0_prefetched=True to
+                    # match. Pattern adapted from fused-moe-calibration debug-hold
+                    # SE-during-metadata (decode64 -7.5 µs measured).
+                    start_fetch_w1(jnp.int32(0), 0, 0, priority=2)
+                    start_fetch_w3(jnp.int32(0), 0, 0, priority=2)
 
                 for peer_id in range(num_devices):
 
@@ -2236,7 +2250,16 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
-        init_carry = (jnp.int32(0), jnp.bool_(False))
+        # bf0_prefetched starts True only when speculative metadata-window prefetch
+        # has loaded expert 0's slot=0/bf_id=0 weights — expert_ffn will then skip
+        # the redundant prefetch and consume the speculatively-loaded weights.
+        # Only direct mode emits the speculative prefetch (line 691); recursive/jax
+        # modes do NOT, so under those modes init_carry must remain False to avoid
+        # consuming an empty slot 0.
+        speculative_prefetched = metadata_window_prefetch_first_expert and (
+            metadata_mode == "direct"
+        )
+        init_carry = (jnp.int32(0), jnp.bool_(speculative_prefetched))
 
         def compute_expert_batch(local_e_id, carry):
             curr_se_block, bf0_w13_prefetched = carry
@@ -2485,6 +2508,7 @@ def jax_allreduce_metadata_by_bt(
         "w2_fetch_priority",
         "skip_inter_bt_sync",
         "interleave_bt",
+        "metadata_window_prefetch_first_expert",
     ],
 )
 def fused_ep_moe_v2(
@@ -2549,6 +2573,7 @@ def fused_ep_moe_v2(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
+    metadata_window_prefetch_first_expert: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
@@ -2908,6 +2933,7 @@ def fused_ep_moe_v2(
                 ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                metadata_window_prefetch_first_expert=metadata_window_prefetch_first_expert,
                 bt=bt,
                 bf=bf,
                 btc=btc,
