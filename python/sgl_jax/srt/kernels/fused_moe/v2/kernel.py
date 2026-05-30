@@ -2266,15 +2266,16 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
-        # bf0_prefetched starts True only when the metadata-window eager prefetch
-        # has loaded expert 0's slot=0/bf_id=0 weights — expert_ffn will then skip
-        # the redundant prefetch and consume the eager-loaded weights.
-        # Only direct mode emits the eager prefetch (line 691); recursive_doubling
-        # has too many sync_barriers between rounds for HBM DMA to safely span,
-        # and jax mode has no in-kernel ICI window. Under those modes init_carry
-        # must remain False to avoid consuming an empty slot 0.
-        eager_bf0_prefetched = metadata_window_prefetch_first_expert and (metadata_mode == "direct")
-        init_carry = (jnp.int32(0), jnp.bool_(eager_bf0_prefetched))
+        # bf0_prefetched starts True only when the metadata-window prefetch above
+        # has loaded expert 0's slot=0/bf_id=0 weights — expert_ffn skips the
+        # redundant prefetch and consumes the already-loaded weights. Only direct
+        # mode emits that prefetch; recursive_doubling has log2(N) sync_barriers
+        # between rounds (HBM DMA can't safely span), and jax mode has no in-kernel
+        # ICI window — under those modes the init must stay False.
+        init_carry = (
+            jnp.int32(0),
+            jnp.bool_(metadata_window_prefetch_first_expert and metadata_mode == "direct"),
+        )
 
         def compute_expert_batch(local_e_id, carry):
             curr_se_block, bf0_w13_prefetched = carry
