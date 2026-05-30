@@ -2207,8 +2207,6 @@ def _fused_ep_moe_kernel(
         else:
             prepare_bt_metadata(bt_id, bt_sem_id)
 
-        t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
-
         if not skip_post_gather:
             wait_store_output(bt_id=bt_id - 2)
 
