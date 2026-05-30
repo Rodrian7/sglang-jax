@@ -153,6 +153,7 @@ def ref_moe(
     w3_scale=None,
 ):
     num_tokens = tokens.shape[0]
+    hidden_size = tokens.shape[1]
     num_experts = w1.shape[0]
 
     tokens_f32 = tokens.astype(jnp.float32)
@@ -211,7 +212,7 @@ def validate_fused_moe_block_config(
     block_config: FusedMoEBlockConfig,
 ):
     bc = block_config.effective_for(num_tokens=num_tokens, ep_size=ep_size)
-    bt, bf, btc = bc.bt, bc.bf, bc.btc
+    bt, bf, btc, bse = bc.bt, bc.bf, bc.btc, bc.bse
     bts = bc.bts
 
     local_num_tokens = num_tokens // ep_size
@@ -384,10 +385,19 @@ def _fused_ep_moe_kernel(
     use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
     use_gather_bank = interleave_bt and num_bt > 1
     use_bt_banking = use_bt_scatter_bank or use_gather_bank
-    expert_buffer_count = a2a_s_x2_hbm.shape[1] if use_bt_banking else a2a_s_x2_hbm.shape[0]
+    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
+    if use_bt_banking:
+        expert_buffer_count = a2a_s_x2_hbm.shape[1]
+        a2a_max_tokens = a2a_s_x2_hbm.shape[2]
+    else:
+        expert_buffer_count = a2a_s_x2_hbm.shape[0]
+        a2a_max_tokens = a2a_s_x2_hbm.shape[1]
     assert expert_buffer_count >= 1
     assert expert_buffer_count <= local_num_experts
-    num_experts = a2a_g_hbm.shape[1] if use_gather_bank else a2a_g_hbm.shape[0]
+    if use_gather_bank:
+        num_experts = a2a_g_hbm.shape[1]
+    else:
+        num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
     routing_smem_top_k = t2e_routing_x2_smem.shape[-1]
     assert padded_num_experts == align_to(num_experts, 128)
@@ -1821,16 +1831,19 @@ def _fused_ep_moe_kernel(
 
                         lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
-                    if can_split_w13_w2_prefetch and bf_id == num_bf - 2:
-                        next_has_prefetch = start_prefetch_expert_bf0(
-                            bt_sem_id,
-                            local_e_id + jnp.int32(1),
-                            slot=slot,
-                            priority=1,
-                            enabled=(num_bts_tiles == jnp.int32(1)),
-                            include_w2=False,
-                        )
-                        next_bf0_prefetched = jnp.logical_or(next_bf0_prefetched, next_has_prefetch)
+                    if can_split_w13_w2_prefetch:
+                        if bf_id == num_bf - 2:
+                            next_has_prefetch = start_prefetch_expert_bf0(
+                                bt_sem_id,
+                                local_e_id + jnp.int32(1),
+                                slot=slot,
+                                priority=1,
+                                enabled=(num_bts_tiles == jnp.int32(1)),
+                                include_w2=False,
+                            )
+                            next_bf0_prefetched = jnp.logical_or(
+                                next_bf0_prefetched, next_has_prefetch
+                            )
 
                     # In w13 mode, next-expert W2 is intentionally not
                     # cross-prefetched here: its own prologue can start W2
@@ -2193,6 +2206,8 @@ def _fused_ep_moe_kernel(
 
         else:
             prepare_bt_metadata(bt_id, bt_sem_id)
+
+        t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
         if not skip_post_gather:
             wait_store_output(bt_id=bt_id - 2)
@@ -2574,6 +2589,7 @@ def fused_ep_moe_v2(
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
     local_num_experts = num_experts // ep_size
+    se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
     local_num_tokens = num_tokens // ep_size
 
@@ -2613,8 +2629,9 @@ def fused_ep_moe_v2(
         block_config=block_config,
     )
 
-    if w1_scale is not None and quant_block_k is None:
-        raise ValueError("quant_block_k required when w1_scale is provided.")
+    if w1_scale is not None:
+        if quant_block_k is None:
+            raise ValueError("quant_block_k required when w1_scale is provided.")
     if quant_block_k is not None:
         if quant_block_k % 128 != 0:
             raise ValueError(f"{quant_block_k=} must be aligned to 128.")
