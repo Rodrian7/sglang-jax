@@ -137,7 +137,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
-    disable_jax_allreduce_metadata: bool = False
+    moe_metadata_mode: str = "recursive"
 
     grammar_backend: str | None = None
 
@@ -974,13 +974,16 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--disable-jax-allreduce-metadata",
-            action="store_true",
-            default=ServerArgs.disable_jax_allreduce_metadata,
+            "--moe-metadata-mode",
+            type=str,
+            choices=["recursive", "direct", "jax"],
+            default=ServerArgs.moe_metadata_mode,
             help=(
-                "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
-                "fall back to the Pallas DMA-based allgather. "
-                "Default uses JAX path (recommended)."
+                "MoE expert-routing metadata all-reduce path for fused_v2. Mutually "
+                "exclusive: 'recursive' = in-kernel recursive-doubling DMA (default, "
+                "fastest e2e for mimo-v2-pro), 'direct' = in-kernel direct all-gather "
+                "DMA, 'jax' = external lax.all_gather (slower for power-of-2 EP at "
+                "v7x-32; kept for compat)."
             ),
         )
 

@@ -348,8 +348,7 @@ def _fused_ep_moe_kernel(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
-    use_jax_allreduce_metadata: bool = False,
-    metadata_algorithm: str = "recursive_doubling",
+    metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
@@ -556,7 +555,7 @@ def _fused_ep_moe_kernel(
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
 
-        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+        if metadata_mode == "jax" and metadata_starts_hbm is not None:
 
             def _copy_precomputed(
                 t2e_routing_vmem,
@@ -671,7 +670,7 @@ def _fused_ep_moe_kernel(
 
             sync_barrier()
 
-            if metadata_algorithm == "direct_allgather":
+            if metadata_mode == "direct":
                 # Port from v1 (fused-moe-calibration @ bed5b39984, kernel.py:808-852).
                 # Each device sends its own row to all N-1 peers in one parallel
                 # batch (vs recursive doubling's log2(N) sequential rounds with
@@ -2477,9 +2476,8 @@ def jax_allreduce_metadata_by_bt(
         "disable_acc_compute",
         "disable_acc_store_vmem",
         "disable_output_store",
-        "use_jax_allreduce_metadata",
+        "metadata_mode",
         "enable_bt_scatter_overlap",
-        "metadata_algorithm",
         "block_config",
         "dp_axis_name",
         "tp_axis_name",
@@ -2538,8 +2536,7 @@ def fused_ep_moe_v2(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
-    use_jax_allreduce_metadata: bool = False,
-    metadata_algorithm: str = "recursive_doubling",
+    metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     w1_shared: jax.Array | None = None,
     w2_shared: jax.Array | None = None,
@@ -2665,7 +2662,11 @@ def fused_ep_moe_v2(
         if ffn1_dequant_chunk % quant_block_k != 0:
             raise ValueError(f"{ffn1_dequant_chunk=} must be divisible by {quant_block_k=}.")
 
-    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1
+    if metadata_mode not in ("recursive", "direct", "jax"):
+        raise ValueError(
+            f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
+        )
+    needs_jax_allreduce = (metadata_mode == "jax") and ep_size > 1
 
     padded_num_experts = align_to(num_experts, 128)
     pad_topk_to_128 = _env_bool("FUSED_MOE_V2_PAD_TOPK_TO_128", True)
@@ -2909,8 +2910,7 @@ def fused_ep_moe_v2(
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
-                use_jax_allreduce_metadata=use_jax_allreduce_metadata,
-                metadata_algorithm=metadata_algorithm,
+                metadata_mode=metadata_mode,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
                 next_w2_prologue_priority=next_w2_prologue_priority,

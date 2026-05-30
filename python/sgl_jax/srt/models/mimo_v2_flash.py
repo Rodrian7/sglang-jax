@@ -127,8 +127,7 @@ class MiMoV2Moe(nnx.Module):
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
-                use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", False),
-                metadata_algorithm=getattr(config, "metadata_algorithm", "recursive_doubling"),
+                metadata_mode=getattr(config, "moe_metadata_mode", "recursive"),
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(
@@ -144,7 +143,7 @@ class MiMoV2Moe(nnx.Module):
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
-                use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", True),
+                metadata_mode=getattr(config, "moe_metadata_mode", "recursive"),
             )
         else:
             self.experts = EPMoE(

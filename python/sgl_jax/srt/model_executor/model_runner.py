@@ -306,9 +306,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.server_args.ep_num_redundant_experts
         )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
-        self.model_config.hf_config.use_jax_allreduce_metadata = (
-            not self.server_args.disable_jax_allreduce_metadata
-        )
+        self.model_config.hf_config.moe_metadata_mode = self.server_args.moe_metadata_mode
         # Pick MLA forward path at server start. Only `fa` selects absorbed
         # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
         # KV via kv_b_proj and run standard attention. Read by

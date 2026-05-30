@@ -141,6 +141,11 @@ ignore = [
 "sgl_jax/srt/kernels/fused_moe/v1/kernel.py" = ["B023"]
 "sgl_jax/srt/kernels/fused_moe/v2/kernel.py" = ["B023", "F841", "SIM102", "SIM108"]
 "sgl_jax/srt/kernels/mla/v2/kernel.py" = ["B023"]
+# Bench drivers: layout uses module-level setup-then-import, and reuses the
+# Pallas closure-over-loop-var pattern. F841 b_smem is a deliberate sentinel
+# computation for the SMEM budget assertion. Pre-existing on baseline.
+"sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py" = ["B023", "E402", "F841"]
+"sgl_jax/srt/kernels/fused_moe/v2/bench_compare.py" = ["B023", "E402"]
 
 [tool.ruff.format]
 docstring-code-format = true

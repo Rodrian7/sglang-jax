@@ -75,8 +75,7 @@ class FusedEPMoE(nnx.Module):
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
-        use_jax_allreduce_metadata: bool = True,
-        metadata_algorithm: str = "recursive_doubling",
+        metadata_mode: str = "recursive",
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -105,8 +104,11 @@ class FusedEPMoE(nnx.Module):
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
-        self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
-        self.metadata_algorithm = metadata_algorithm
+        if metadata_mode not in ("recursive", "direct", "jax"):
+            raise ValueError(
+                f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
+            )
+        self.metadata_mode = metadata_mode
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -484,7 +486,9 @@ class FusedEPMoE(nnx.Module):
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
-            use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
+            # V1 kernel only knows the jax/in-kernel split; 'direct' falls back to
+            # in-kernel (V1 has no direct-allgather support).
+            use_jax_allreduce_metadata=(self.metadata_mode == "jax"),
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
             w1_scale=w1_scale,
@@ -575,8 +579,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_weight_load=self.disable_weight_load,
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
-            use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
-            metadata_algorithm=self.metadata_algorithm,
+            metadata_mode=self.metadata_mode,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
