@@ -90,23 +90,36 @@ def _fits_vmem(
 _SMEM_CAP_BYTES = 1 * 1024 * 1024
 
 
-def _smem_estimate_bytes(mnt: int, pages_per_seq: int) -> int:
+def _smem_estimate_bytes(
+    stage: str, mnt: int, pages_per_seq: int, chunk_prefill_size: int = 4096
+) -> int:
     """Rough scalar-prefetch SMEM footprint for our v3 tuner data-gen.
 
-    page_indices dominates: shape [mnt × pages_per_seq] i32 (padded layout).
+    page_indices dominates: shape [num_seqs × pages_per_seq] i32. num_seqs
+    depends on stage:
+      - decode: num_seqs = mnt (1 token per seq)
+      - prefill / mixed: num_seqs = ceil(mnt / chunk_prefill_size)
+        (bench layout: 1 chunk = 1 seq, q_len = chunk_prefill_size)
+
     Other scalar_prefetches (kv_lens / cu_q_lens / cu_kv_lens / distribution
-    / init_*) are each O(mnt) i32 — bundled overhead estimate of ~10× mnt.
+    / init_*) are each O(num_seqs) i32 — bundled overhead estimate of ~10× num_seqs.
     Result is a conservative upper bound.
     """
-    page_indices = mnt * pages_per_seq * 4
-    other = 10 * mnt * 4
+    if stage == "d":
+        num_seqs = mnt
+    else:  # p, m
+        num_seqs = max(1, (mnt + chunk_prefill_size - 1) // chunk_prefill_size)
+    page_indices = num_seqs * pages_per_seq * 4
+    other = 10 * num_seqs * 4
     return page_indices + other
 
 
-def _fits_smem(mnt: int, page_size: int, max_context_len: int) -> tuple[bool, int]:
+def _fits_smem(
+    stage: str, mnt: int, page_size: int, max_context_len: int, chunk_prefill_size: int = 4096
+) -> tuple[bool, int]:
     """Returns (fits, estimated_bytes). 10% margin under SMEM cap."""
     pages_per_seq = max(1, (max_context_len + page_size - 1) // page_size)
-    est = _smem_estimate_bytes(mnt, pages_per_seq)
+    est = _smem_estimate_bytes(stage, mnt, pages_per_seq, chunk_prefill_size)
     return est <= int(_SMEM_CAP_BYTES * 0.9), est
 
 
@@ -119,7 +132,11 @@ def _bq_candidates(max_q: int, stage: str) -> list[int]:
 
 def _bkv_candidates(page_size: int, kv_packing: int, max_kv: int) -> list[int]:
     alignment = max(page_size, kv_packing)
-    raw = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    # Pruned from [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]: based on
+    # 81 v6e + v7x winners observed so far, no entry has bkv >= 4096 ever
+    # winning. Keep 4096 as upper-bound probe; drop 8192/16384/32768 to save
+    # ~25% candidate count per cell.
+    raw = [256, 512, 1024, 2048, 4096]
     out = []
     for v in raw:
         v = max(alignment, (v // alignment) * alignment)
@@ -657,7 +674,7 @@ def main():
     for stage, ps, hd, q_h, kv_h, mnt in my_work:
         # Outer-level SMEM prune: scalar_prefetches (page_indices dominates)
         # must fit v7x's 1MB SMEM. Independent of block-config choice.
-        fits, est = _fits_smem(mnt, ps, args.max_context_len)
+        fits, est = _fits_smem(stage, mnt, ps, args.max_context_len)
         if not fits:
             print(
                 f"# [smem-prune] stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} "
