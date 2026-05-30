@@ -689,14 +689,18 @@ def _fused_ep_moe_kernel(
                         ).start()
 
                 if metadata_window_prefetch_first_expert:
-                    # Speculative prefetch expert 0's bf0 weights into slot 0 during the
-                    # metadata ICI wait window — HBM is idle here. If expert 0 turns out
-                    # inactive (~25% under balanced routing), the loaded bytes are simply
-                    # not consumed (no correctness impact, only ~3 µs of wasted HBM
-                    # bandwidth). If expert 0 is active (~75%), the first-expert
-                    # cold-start latency drops by ~3-5 µs since wait_fetch_w1 finds the
-                    # DMA already complete. init_carry must set bf0_prefetched=True to
-                    # match. Pattern adapted from fused-moe-calibration debug-hold
+                    # Eager-issue expert 0's bf0 weight DMAs (slot 0, w1+w3) into the
+                    # metadata ICI wait window — HBM is idle here, ICI is busy. This is
+                    # a deterministic re-ordering of work the kernel was going to do
+                    # anyway: slot 0 and these bytes are consumed in expert_ffn for
+                    # expert 0 / bf_id 0. Note: not "speculative" in the LLM-decoding
+                    # sense — there is no draft / verify, just early DMA issue.
+                    # If expert 0 turns out inactive (~25% under balanced routing), the
+                    # loaded bytes are not consumed; ~3 µs of HBM bandwidth used during
+                    # an otherwise-idle window — zero wall-time cost. If expert 0 is
+                    # active (~75%), the first-expert cold-start latency drops ~3-5 µs.
+                    # init_carry must set bf0_prefetched=True to match.
+                    # Pattern adapted from fused-moe-calibration debug-hold
                     # SE-during-metadata (decode64 -7.5 µs measured).
                     start_fetch_w1(jnp.int32(0), 0, 0, priority=2)
                     start_fetch_w3(jnp.int32(0), 0, 0, priority=2)
@@ -1420,13 +1424,14 @@ def _fused_ep_moe_kernel(
 
         def _run_inactive(_):
             # Drain leftover bf0 weight-prefetch sem if the caller passed
-            # bf0_prefetched=True. This can only happen via the speculative
-            # metadata-window prefetch (cross-expert prefetch is itself gated
-            # by the target's has_tokens, so cross-prefetch cannot land us
-            # here with bf0_prefetched=True). Without the drain the speculative
-            # start has no matching wait → sem accounting leaks +1 per layer.
+            # bf0_prefetched=True. This can only happen via the
+            # metadata-window eager prefetch (cross-expert prefetch is
+            # itself gated by the target's has_tokens, so cross-prefetch
+            # cannot land us here with bf0_prefetched=True). Without the
+            # drain the eager start has no matching wait → sem accounting
+            # leaks +1 per layer.
             @pl.when(bf0_prefetched)
-            def _drain_speculative_bf0():
+            def _drain_metadata_window_bf0():
                 wait_fetch_w1(0)
                 wait_fetch_w3(0)
 
@@ -2261,16 +2266,15 @@ def _fused_ep_moe_kernel(
                 a2a_bank_id=a2a_bank_id,
             )
 
-        # bf0_prefetched starts True only when speculative metadata-window prefetch
+        # bf0_prefetched starts True only when the metadata-window eager prefetch
         # has loaded expert 0's slot=0/bf_id=0 weights — expert_ffn will then skip
-        # the redundant prefetch and consume the speculatively-loaded weights.
-        # Only direct mode emits the speculative prefetch (line 691); recursive/jax
-        # modes do NOT, so under those modes init_carry must remain False to avoid
-        # consuming an empty slot 0.
-        speculative_prefetched = metadata_window_prefetch_first_expert and (
-            metadata_mode == "direct"
-        )
-        init_carry = (jnp.int32(0), jnp.bool_(speculative_prefetched))
+        # the redundant prefetch and consume the eager-loaded weights.
+        # Only direct mode emits the eager prefetch (line 691); recursive_doubling
+        # has too many sync_barriers between rounds for HBM DMA to safely span,
+        # and jax mode has no in-kernel ICI window. Under those modes init_carry
+        # must remain False to avoid consuming an empty slot 0.
+        eager_bf0_prefetched = metadata_window_prefetch_first_expert and (metadata_mode == "direct")
+        init_carry = (jnp.int32(0), jnp.bool_(eager_bf0_prefetched))
 
         def compute_expert_batch(local_e_id, carry):
             curr_se_block, bf0_w13_prefetched = carry
