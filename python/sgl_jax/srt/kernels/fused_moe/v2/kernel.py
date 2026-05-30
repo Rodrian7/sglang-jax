@@ -119,16 +119,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
-def _align_local_tokens_for_decode(local_num_tokens: int) -> int:
-    if local_num_tokens <= 0:
-        raise ValueError(f"Expected {local_num_tokens=} > 0.")
-    # TPU Mosaic lowering needs the token x hidden tile shape to preserve the
-    # small-dimension alignment; keep decode shapes at least 8 x 128 aligned.
-    if local_num_tokens <= 8:
-        return 8
-    return ((local_num_tokens + 7) // 8) * 8
-
-
 # ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------
@@ -2590,13 +2580,6 @@ def fused_ep_moe_v2(
 
     local_num_tokens = num_tokens // ep_size
 
-    orig_local_num_tokens = local_num_tokens
-    aligned_local_num_tokens = _align_local_tokens_for_decode(local_num_tokens)
-    pad_local = aligned_local_num_tokens - local_num_tokens
-    if pad_local > 0:
-        local_num_tokens = local_num_tokens + pad_local
-        num_tokens = local_num_tokens * ep_size
-
     if block_config is None:
         block_config = FusedMoEBlockConfig(
             bt=min(16, local_num_tokens),
@@ -3008,16 +2991,6 @@ def fused_ep_moe_v2(
         w3_shared=None,
         w2_shared=None,
     ):
-        if pad_local > 0:
-            tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
-            topk_weights = jnp.pad(topk_weights, ((0, pad_local), (0, 0)), constant_values=0.0)
-            topk_ids = jnp.pad(
-                topk_ids,
-                ((0, pad_local), (0, 0)),
-                mode="constant",
-                constant_values=-1,
-            )
-
         if needs_jax_allreduce:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k],
@@ -3079,8 +3052,6 @@ def fused_ep_moe_v2(
             md_sizes_arg,
             md_d2e_arg,
         )
-        if pad_local > 0:
-            out = out[:orig_local_num_tokens]
         return out
 
     a2a_s_shape = (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t)
