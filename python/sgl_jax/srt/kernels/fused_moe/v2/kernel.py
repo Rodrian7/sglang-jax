@@ -1419,6 +1419,17 @@ def _fused_ep_moe_kernel(
             return jnp.bool_(False)
 
         def _run_inactive(_):
+            # Drain leftover bf0 weight-prefetch sem if the caller passed
+            # bf0_prefetched=True. This can only happen via the speculative
+            # metadata-window prefetch (cross-expert prefetch is itself gated
+            # by the target's has_tokens, so cross-prefetch cannot land us
+            # here with bf0_prefetched=True). Without the drain the speculative
+            # start has no matching wait → sem accounting leaks +1 per layer.
+            @pl.when(bf0_prefetched)
+            def _drain_speculative_bf0():
+                wait_fetch_w1(0)
+                wait_fetch_w3(0)
+
             return start_prefetch_expert_bf0(
                 bt_sem_id,
                 local_e_id + jnp.int32(1),
