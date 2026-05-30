@@ -36,7 +36,108 @@ _WARNED_MISSES: set[tuple] = set()
 
 TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
     "TPU v5": {},
-    "TPU v6e": {},
+    "TPU v6e": {
+        # ===== v6e production-shape sweep (2026-05-29 / 2026-05-30) =====
+        # Tuned on tpuv6e-256-node, kernel commit c86d0ef499c3 (probe/rpa-v3-kv-len-v6e).
+        # Tuner: get_block_spec_config_v3.py with --write-threshold-pct 0.0 (all
+        # winners with positive delta are emitted, no skip).
+        # Test conditions:
+        #   - mid-kv data-gen: random_prefix_lens ∈ [1024, 2048), actual_kv ≈ 1500
+        #   - max_context_len=40960, max_kv_cache_tokens=600000
+        #   - tries=3 (variance bound, observed std/mean < 0.5%)
+        # Source experiments:
+        #   - exp-r4je7j87w7  hd=128 non-SWA (38 entries; final 4 cells lost to
+        #                     8h timeout, prefill q=8 kv=8 ps=256 mnt=1024 missing)
+        #   - exp-zydqhexohw  hd=192 non-SWA (16 entries — MiMo full-attn layers)
+        #   - exp-lrcl0zt04q  hd=256 non-SWA (2 entries — Gemma full-attn layers)
+        # Coverage matrix (per-shard shapes after typical TP split):
+        #   hd=128: q∈{2,4,8,16}, kv∈{1,2,4,8} — Llama / Qwen2/3 / GLM-4 /
+        #            Qwen3-32B / Ling-1T / Qwen-7B at TP={4,8,16}
+        #   hd=192: q∈{4,8,16,32}, kv∈{1,2}   — MiMo-V2-Flash / V2.5-Pro full layers
+        #   hd=256: q=2, kv=1                  — Gemma-2 full layers
+        #
+        # Open gaps (not in this drop, see follow-up issue):
+        #   1. SWA layers (sliding_window=128 / 4096) — g3/g5 didn't schedule on
+        #      v6e queue, will retry. Until then, MiMo SWA layers + Gemma SWA
+        #      layers fall back to heuristic. Production trace shows heuristic
+        #      bkv=256 with sw=128 already runs OK.
+        #   2. Long actual_kv decode (16k+) — entries here are mid-kv tuned.
+        #      Probe 1 single-shape data shows bkv=2048 is ~20% suboptimal at
+        #      actual_kv≈24k (heuristic bkv=32768 wins long-kv coincidentally).
+        #      Cross-shape long-kv probe pending.
+        #   3. SMEM-pruned prefill cells (ps=128 mnt≥1024, ps=256 mnt≥2048 at
+        #      max_context_len=40960) — physically unreachable in the kernel at
+        #      that max_context_len; runtime uses chunk_prefill_size to keep
+        #      mnt within tunable range.
+        #
+        # Pattern observation: across hd∈{128,192,256} × q×kv combos × ps×mnt,
+        # mid-kv decode winner is uniformly bkv=2048 csz=2048. Deltas vs
+        # heuristic +5%~+84% (depending on heuristic over-allocation severity).
+        # Prefill ps=256 mnt=1024 winner is mostly (32, 1024, 32, 1024).
+        # ----- hd=128 decode (non-SWA) -----
+        ("d", None, "bfloat16", "bfloat16", 2, 1, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 2, 1, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 2, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 2, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 4, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 4, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 4, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 4, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 8, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 8, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 2, 128, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 2, 128, 128, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 2, 1, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 2, 1, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 2, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 2, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 4, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 4, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 4, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 4, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 8, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 8, 128, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 2, 128, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 2, 128, 256, 256): (1, 2048, 1, 2048),
+        # ----- hd=128 prefill (chunked, ps=256 mnt=1024) -----
+        ("p", None, "bfloat16", "bfloat16", 2, 1, 128, 256, 1024): (32, 1024, 32, 1024),
+        ("p", None, "bfloat16", "bfloat16", 4, 1, 128, 256, 1024): (32, 1024, 32, 1024),
+        ("p", None, "bfloat16", "bfloat16", 4, 2, 128, 256, 1024): (32, 1024, 32, 1024),
+        ("p", None, "bfloat16", "bfloat16", 4, 4, 128, 256, 1024): (32, 1024, 32, 1024),
+        ("p", None, "bfloat16", "bfloat16", 8, 1, 128, 256, 1024): (32, 1024, 32, 1024),
+        ("p", None, "bfloat16", "bfloat16", 8, 4, 128, 256, 1024): (32, 1024, 32, 1024),
+        # ----- hd=192→256 (key normalized) decode (MiMo full-attention layers) -----
+        # Note: actual head_dim=192 normalizes to 256 in key per
+        # `(head_dim + 127) // 128 * 128`.
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 256, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 256, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 4, 1, 256, 256, 1024): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 256, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 256, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 8, 1, 256, 256, 1024): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 1024): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (1, 2048, 1, 2048),
+        # ----- hd=192→256 prefill (MiMo full, chunked) -----
+        ("p", None, "bfloat16", "bfloat16", 4, 1, 256, 256, 1024): (32, 1024, 32, 1024),
+        ("p", None, "bfloat16", "bfloat16", 8, 1, 256, 256, 1024): (32, 1024, 32, 512),
+        ("p", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 1024): (32, 1024, 32, 512),
+        ("p", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (32, 512, 32, 512),
+        # ----- hd=256 decode (Gemma-2 full-attention layers) -----
+        ("d", None, "bfloat16", "bfloat16", 2, 1, 256, 128, 128): (1, 2048, 1, 2048),
+        ("d", None, "bfloat16", "bfloat16", 2, 1, 256, 128, 256): (1, 2048, 1, 2048),
+    },
     "TPU v7": {
         # ===== MiMo-V2-Pro non-SWA (full-attention) layers =====
         # Per-shard shape: q_heads=32 kv_heads=2 head_dim=192→256 page_size=256
