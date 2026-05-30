@@ -262,6 +262,9 @@ if metadata_mode not in ("recursive", "direct", "jax"):
         f"BENCH_METADATA_MODE must be one of recursive/direct/jax; got {metadata_mode!r}"
     )
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
+metadata_window_prefetch_first_expert = (
+    os.environ.get("BENCH_METADATA_WINDOW_PREFETCH_FIRST_EXPERT", "0") == "1"
+)
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
 next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
 w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
@@ -1098,6 +1101,7 @@ for num_tokens in token_candidates:
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 metadata_mode=metadata_mode,
+                metadata_window_prefetch_first_expert=metadata_window_prefetch_first_expert,
             )
 
         try:
@@ -1210,6 +1214,7 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             metadata_mode=metadata_mode,
+            metadata_window_prefetch_first_expert=metadata_window_prefetch_first_expert,
         )
         ref_kwargs = {}
         if use_fp8:
