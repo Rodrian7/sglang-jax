@@ -317,7 +317,10 @@ class EagleDraftWorker(BaseDraftWorker):
         seq_lens_cpu = model_worker_batch.seq_lens
         page_size = self.page_size
         req_to_token_pool, _ = self.target_worker_ref.get_memory_pool()
-        token_indices_with_all_reqs = req_to_token_pool.req_to_token[
+        req_to_token = req_to_token_pool.req_to_token
+        if hasattr(req_to_token, 'value'):
+            req_to_token = req_to_token.value
+        token_indices_with_all_reqs = np.asarray(req_to_token)[
             model_worker_batch.req_pool_indices
         ]
         spec_info = model_worker_batch.spec_info_padded
@@ -429,6 +432,7 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
+        forward_batch.attn_backend.forward_metadata = metadata_per_step[0]
 
         mr = self.draft_model_runner
         score_list, token_list, parents_list, updated_pools = _jitted_draft_loop(

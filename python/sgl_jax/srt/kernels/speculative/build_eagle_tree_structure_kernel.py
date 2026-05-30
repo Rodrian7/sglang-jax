@@ -419,6 +419,7 @@ def build_eagle_tree_structure_pallas_call(
         "topk",
         "max_context_len",
         "tree_mask_mode",
+        "mesh",
     ),
 )
 def build_eagle_tree_structure(
@@ -430,6 +431,7 @@ def build_eagle_tree_structure(
     topk: int,
     max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
+    mesh: jax.sharding.Mesh | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """
     Build eagle tree using a Pallas kernel.
@@ -475,6 +477,7 @@ def build_eagle_tree_structure(
         retrive_next_sibling,
     ) = jax.shard_map(
         _kernel,
+        mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
         check_vma=False,
