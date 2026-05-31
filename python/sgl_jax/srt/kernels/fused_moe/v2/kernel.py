@@ -2203,14 +2203,13 @@ def _fused_ep_moe_kernel(
         )
 
         def prepare_bt_metadata(_bt_id, _bt_sem_id):
-            with jax.named_scope("probe_prepare_bt_metadata"):
-                wait_fetch_topk(bt_id=_bt_id)
-                _t2e_routing = b_topk_ids_x2_vmem[_bt_sem_id]
-                all_reduce_metadata(
-                    bt_id=_bt_id,
-                    bt_sem_id=_bt_sem_id,
-                    t2e_routing=_t2e_routing,
-                )
+            wait_fetch_topk(bt_id=_bt_id)
+            _t2e_routing = b_topk_ids_x2_vmem[_bt_sem_id]
+            all_reduce_metadata(
+                bt_id=_bt_id,
+                bt_sem_id=_bt_sem_id,
+                t2e_routing=_t2e_routing,
+            )
 
         if can_bt_scatter_overlap:
 
