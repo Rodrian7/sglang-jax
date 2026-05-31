@@ -442,6 +442,13 @@ disable_expert_x_load = all_disable or os.environ.get("DISABLE_EXPERT_X_LOAD", "
 disable_expert_ffn = all_disable or os.environ.get("DISABLE_EXPERT_FFN", "0") == "1"
 disable_dynamic_ffn1 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN1", "0") == "1"
 disable_dynamic_ffn2 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN2", "0") == "1"
+# Group H probes (probe-zero-ffn-attribution branch). Off by default; True
+# produces incorrect outputs but stable runtime. Only the direct_scaled_dot
+# BSZ=64 path is wired (FFN1 first branch + FFN2 direct branch).
+probe_zero_ffn1_compute = os.environ.get("BENCH_PROBE_ZERO_FFN1_COMPUTE", "0") == "1"
+probe_zero_ffn2_compute = os.environ.get("BENCH_PROBE_ZERO_FFN2_COMPUTE", "0") == "1"
+probe_skip_dequant_only = os.environ.get("BENCH_PROBE_SKIP_DEQUANT_ONLY", "0") == "1"
+probe_keep_dot_skip_scale = os.environ.get("BENCH_PROBE_KEEP_DOT_SKIP_SCALE", "0") == "1"
 disable_expert_store = all_disable or os.environ.get("DISABLE_EXPERT_STORE", "0") == "1"
 disable_expert_stage_writeback = (
     all_disable or os.environ.get("DISABLE_EXPERT_STAGE_WRITEBACK", "0") == "1"
@@ -472,6 +479,10 @@ ablation_flags = {
     "disable_expert_ffn": disable_expert_ffn,
     "disable_dynamic_ffn1": disable_dynamic_ffn1,
     "disable_dynamic_ffn2": disable_dynamic_ffn2,
+    "probe_zero_ffn1_compute": probe_zero_ffn1_compute,
+    "probe_zero_ffn2_compute": probe_zero_ffn2_compute,
+    "probe_skip_dequant_only": probe_skip_dequant_only,
+    "probe_keep_dot_skip_scale": probe_keep_dot_skip_scale,
     "disable_expert_store": disable_expert_store,
     "disable_expert_stage_writeback": disable_expert_stage_writeback,
     "disable_expert_store_dma": disable_expert_store_dma,
@@ -485,6 +496,11 @@ ablation_flags = {
 active_ablation = [k for k, v in ablation_flags.items() if v]
 if active_ablation:
     log(f"ablation flags: {active_ablation}")
+if probe_skip_dequant_only and direct_scaled_dot:
+    log(
+        "WARN: probe_skip_dequant_only=1 with direct_scaled_dot=1 is a no-op "
+        "(direct path has no separate dequant step); use BENCH_DIRECT_SCALED_DOT=0 to exercise it"
+    )
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
 if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
@@ -1175,6 +1191,10 @@ for num_tokens in token_candidates:
                 disable_expert_ffn=disable_expert_ffn,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
+                probe_zero_ffn1_compute=probe_zero_ffn1_compute,
+                probe_zero_ffn2_compute=probe_zero_ffn2_compute,
+                probe_skip_dequant_only=probe_skip_dequant_only,
+                probe_keep_dot_skip_scale=probe_keep_dot_skip_scale,
                 disable_expert_store=disable_expert_store,
                 disable_expert_stage_writeback=disable_expert_stage_writeback,
                 disable_expert_store_dma=disable_expert_store_dma,

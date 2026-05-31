@@ -329,6 +329,15 @@ def _fused_ep_moe_kernel(
     disable_expert_ffn: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
+    # Group H probes (probe-zero-ffn-attribution branch): replace selected
+    # compute/scale work with deterministic zero-write while preserving DMA,
+    # A2A, semaphore, and store structure. Only the direct_scaled_dot BSZ=64
+    # path (FFN1 first branch + FFN2 direct branch) honours these. Off by
+    # default; True produces incorrect outputs but stable runtime.
+    probe_zero_ffn1_compute: bool = False,
+    probe_zero_ffn2_compute: bool = False,
+    probe_skip_dequant_only: bool = False,
+    probe_keep_dot_skip_scale: bool = False,
     disable_expert_store: bool = False,
     disable_expert_stage_writeback: bool = False,
     disable_expert_store_dma: bool = False,
@@ -1505,7 +1514,10 @@ def _fused_ep_moe_kernel(
 
                         def _gate_only_btc(btc_id, ___):
                             gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            if not disable_dynamic_ffn1:
+                            # Group H zero-FFN1: skip the dot/scale fori_loop;
+                            # gate stays zero and still gets stored to b_gate_acc_vmem.
+                            # wait_fetch_w1 above already ran (DMA preserved).
+                            if not (disable_dynamic_ffn1 or probe_zero_ffn1_compute):
                                 for p_id in range(t_packing):
 
                                     def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
@@ -1525,9 +1537,15 @@ def _fused_ep_moe_kernel(
                                         s1 = b_w1_scale_x2_vmem[
                                             slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)
                                         ].reshape(bf)
-                                        return gate_acc + jnp.stack(
-                                            [d1[i] * s1 for i in range(btc)], axis=0
-                                        )
+                                        # probe_keep_dot_skip_scale: keep dot,
+                                        # drop the broadcast/multiply by s1.
+                                        if probe_keep_dot_skip_scale:
+                                            scaled = jnp.stack([d1[i] for i in range(btc)], axis=0)
+                                        else:
+                                            scaled = jnp.stack(
+                                                [d1[i] * s1 for i in range(btc)], axis=0
+                                            )
+                                        return gate_acc + scaled
 
                                     gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
@@ -1539,7 +1557,7 @@ def _fused_ep_moe_kernel(
 
                         def _up_only_btc(btc_id, ___):
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            if not disable_dynamic_ffn1:
+                            if not (disable_dynamic_ffn1 or probe_zero_ffn1_compute):
                                 for p_id in range(t_packing):
 
                                     def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
@@ -1559,9 +1577,13 @@ def _fused_ep_moe_kernel(
                                         s3 = b_w3_scale_x2_vmem[
                                             slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)
                                         ].reshape(bf)
-                                        return up_acc + jnp.stack(
-                                            [d3[i] * s3 for i in range(btc)], axis=0
-                                        )
+                                        if probe_keep_dot_skip_scale:
+                                            scaled = jnp.stack([d3[i] for i in range(btc)], axis=0)
+                                        else:
+                                            scaled = jnp.stack(
+                                                [d3[i] * s3 for i in range(btc)], axis=0
+                                            )
+                                        return up_acc + scaled
 
                                     up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
@@ -1872,7 +1894,10 @@ def _fused_ep_moe_kernel(
                             gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                             up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                             act = maybe_cast_ffn2_input(activation_fn(gate, up_val, act_fn))
-                        if not disable_dynamic_ffn2:
+                        # Group H zero-FFN2: skip the dot/scale fori_loop;
+                        # partial stays zero and still gets written to b_y_acc_vmem.
+                        # wait_fetch_w2 / dequant_w2 above already ran.
+                        if not (disable_dynamic_ffn2 or probe_zero_ffn2_compute):
                             for p_id in range(t_packing):
                                 if use_direct_w2:
 
@@ -1906,9 +1931,15 @@ def _fused_ep_moe_kernel(
                                             0,
                                             pl.ds(0, h_per_t),
                                         ].reshape(h_per_t)
-                                        return partial_acc + jnp.stack(
-                                            [d[i] * s for i in range(btc)], axis=0
-                                        )
+                                        # probe_keep_dot_skip_scale: keep dot,
+                                        # drop the broadcast/multiply by s.
+                                        if probe_keep_dot_skip_scale:
+                                            scaled = jnp.stack([d[i] for i in range(btc)], axis=0)
+                                        else:
+                                            scaled = jnp.stack(
+                                                [d[i] * s for i in range(btc)], axis=0
+                                            )
+                                        return partial_acc + scaled
 
                                     partial = lax.fori_loop(
                                         0,
@@ -2490,6 +2521,10 @@ def jax_allreduce_metadata_by_bt(
         "disable_expert_ffn",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
+        "probe_zero_ffn1_compute",
+        "probe_zero_ffn2_compute",
+        "probe_skip_dequant_only",
+        "probe_keep_dot_skip_scale",
         "disable_expert_store",
         "disable_expert_stage_writeback",
         "disable_expert_store_dma",
@@ -2551,6 +2586,15 @@ def fused_ep_moe_v2(
     disable_expert_ffn: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
+    # Group H probes (probe-zero-ffn-attribution branch): replace selected
+    # compute/scale work with deterministic zero-write while preserving DMA,
+    # A2A, semaphore, and store structure. Only the direct_scaled_dot BSZ=64
+    # path (FFN1 first branch + FFN2 direct branch) honours these. Off by
+    # default; True produces incorrect outputs but stable runtime.
+    probe_zero_ffn1_compute: bool = False,
+    probe_zero_ffn2_compute: bool = False,
+    probe_skip_dequant_only: bool = False,
+    probe_keep_dot_skip_scale: bool = False,
     disable_expert_store: bool = False,
     disable_expert_stage_writeback: bool = False,
     disable_expert_store_dma: bool = False,
@@ -2919,6 +2963,10 @@ def fused_ep_moe_v2(
                 disable_expert_ffn=disable_expert_ffn,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
+                probe_zero_ffn1_compute=probe_zero_ffn1_compute,
+                probe_zero_ffn2_compute=probe_zero_ffn2_compute,
+                probe_skip_dequant_only=probe_skip_dequant_only,
+                probe_keep_dot_skip_scale=probe_keep_dot_skip_scale,
                 disable_expert_store=disable_expert_store,
                 disable_expert_stage_writeback=disable_expert_stage_writeback,
                 disable_expert_store_dma=disable_expert_store_dma,
