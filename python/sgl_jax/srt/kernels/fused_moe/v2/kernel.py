@@ -214,17 +214,10 @@ def validate_fused_moe_block_config(
         raise ValueError(f"{hidden_size=} must be aligned to 128.")
     if bf % 128 != 0:
         raise ValueError(f"{bf=} must be aligned to 128.")
-    # btc / bts only need to be powers of 2 ≥ 2 — VREG sublane is 8 wide but
-    # smaller m-tiles are still legal (sublane underutilization, not error).
-    # v1 has no such constraint; v2's earlier `btc % 8 == 0` was conservative
-    # and forced padding-up to 8 even when dyn_sz < 8 (BSZ=64 / EP=32 regime
-    # has avg ~1-2 routings per active local expert, so bts=2/4 may avoid the
-    # padding waste at the cost of underutilized VREG sublanes — let the
-    # tuner pick which trade-off wins per shape).
-    if btc < 2 or (btc & (btc - 1)) != 0:
-        raise ValueError(f"{btc=} must be a power of 2 and >= 2.")
+    if btc <= 0 or btc > bts:
+        raise ValueError(f"Expected {btc=} to satisfy 0 < btc <= bts (got {bts=}).")
     if bts % btc != 0:
-        raise ValueError(f"{bts=} must be divisible by {btc=}.")
+        raise ValueError(f"Expected {bts=} to be divisible by {btc=}.")
 
 
 def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
