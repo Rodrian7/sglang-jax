@@ -228,7 +228,10 @@ def _compute_routing_stats(
     """
     from jax.experimental import multihost_utils
 
-    topk_global_np = np.asarray(multihost_utils.process_allgather(topk_idx, tiled=False)).reshape(
+    # tiled=True gathers along the partitioned axis to recover the full global
+    # shape. tiled=False requires the array to be fully-addressable on the
+    # caller's process, which is not true in multi-host bench runs.
+    topk_global_np = np.asarray(multihost_utils.process_allgather(topk_idx, tiled=True)).reshape(
         num_tokens, top_k_
     )
 
