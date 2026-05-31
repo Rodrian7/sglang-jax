@@ -702,8 +702,8 @@ def _fused_ep_moe_kernel(
                     # init_carry must set bf0_prefetched=True to match.
                     # Pattern adapted from fused-moe-calibration debug-hold
                     # SE-during-metadata (decode64 -7.5 µs measured).
-                    start_fetch_w1(jnp.int32(0), 0, 0, priority=2)
-                    start_fetch_w3(jnp.int32(0), 0, 0, priority=2)
+                    start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
+                    start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
 
                 for peer_id in range(num_devices):
 
