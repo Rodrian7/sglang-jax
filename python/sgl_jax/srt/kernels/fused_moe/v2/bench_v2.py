@@ -213,6 +213,87 @@ def align_local_tokens_for_v2(local_num_tokens: int) -> int:
     return ((local_num_tokens + 7) // 8) * 8
 
 
+def _compute_routing_stats(
+    topk_idx,
+    num_tokens: int,
+    top_k_: int,
+    num_devices_: int,
+    num_experts_: int,
+    routing_mode_: str,
+) -> dict[str, Any]:
+    """Compute routing distribution stats from a global topk_idx of shape (num_tokens, top_k).
+
+    All ranks must call this (process_allgather is collective). Caller decides who prints.
+    Stats are over the GLOBAL topk_idx — see field names for receiver/sender semantics.
+    """
+    from jax.experimental import multihost_utils
+
+    topk_global_np = np.asarray(multihost_utils.process_allgather(topk_idx, tiled=False)).reshape(
+        num_tokens, top_k_
+    )
+
+    local_num_experts_ = num_experts_ // num_devices_
+    tokens_per_dev = num_tokens // num_devices_
+
+    # source device (where the token lives before scatter)
+    src_dev = np.arange(num_tokens, dtype=np.int64) // tokens_per_dev
+    src_dev_bc = np.broadcast_to(src_dev[:, None], (num_tokens, top_k_))
+
+    dest_e = topk_global_np  # (num_tokens, top_k)
+    dest_dev = dest_e // local_num_experts_
+    dest_local_e = dest_e % local_num_experts_
+    is_remote = src_dev_bc != dest_dev
+
+    flat_dest_dev = dest_dev.reshape(-1)
+    flat_dest_local_e = dest_local_e.reshape(-1)
+    flat_src_dev = src_dev_bc.reshape(-1)
+    flat_is_remote = is_remote.reshape(-1).astype(np.int64)
+
+    dyn_sz = np.zeros((num_devices_, local_num_experts_), dtype=np.int64)
+    remote_routes = np.zeros((num_devices_, local_num_experts_), dtype=np.int64)
+    np.add.at(dyn_sz, (flat_dest_dev, flat_dest_local_e), 1)
+    np.add.at(remote_routes, (flat_dest_dev, flat_dest_local_e), flat_is_remote)
+
+    sender_fanin = np.zeros((num_devices_, local_num_experts_), dtype=np.int64)
+    sender_seen = [[set() for _ in range(local_num_experts_)] for _ in range(num_devices_)]
+    for r, loc_e, s in zip(
+        flat_dest_dev.tolist(), flat_dest_local_e.tolist(), flat_src_dev.tolist()
+    ):
+        sender_seen[r][loc_e].add(s)
+    for r in range(num_devices_):
+        for loc_e in range(local_num_experts_):
+            sender_fanin[r, loc_e] = len(sender_seen[r][loc_e])
+
+    active = dyn_sz > 0
+    active_per_dev = active.sum(axis=1)
+    if active.any():
+        dyn_active = dyn_sz[active]
+        remote_active = remote_routes[active]
+    else:
+        dyn_active = np.zeros(1, dtype=np.int64)
+        remote_active = np.zeros(1, dtype=np.int64)
+
+    expert0_active_pct = float((topk_global_np == 0).any())
+
+    return {
+        "tokens": int(num_tokens),
+        "top_k": int(top_k_),
+        "num_devices": int(num_devices_),
+        "num_experts": int(num_experts_),
+        "local_num_experts": int(local_num_experts_),
+        "routing_mode": routing_mode_,
+        "active_experts_mean": float(active_per_dev.mean()),
+        "active_experts_p90": float(np.percentile(active_per_dev, 90)),
+        "dyn_sz_mean": float(dyn_active.mean()),
+        "dyn_sz_p90": float(np.percentile(dyn_active, 90)),
+        "dyn_sz_max": int(dyn_active.max()),
+        "remote_routes_mean": float(remote_active.mean()),
+        "remote_routes_p90": float(np.percentile(remote_active, 90)),
+        "max_sender_fan_in": int(sender_fanin.max()),
+        "expert0_active_pct": expert0_active_pct,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -233,6 +314,7 @@ f = int(os.environ.get("BENCH_F", "2048"))
 E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
+print_routing_stats = os.environ.get("BENCH_PRINT_ROUTING_STATS", "0") == "1"
 bse = int(os.environ.get("BENCH_BSE", "256"))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
@@ -945,6 +1027,19 @@ for num_tokens in token_candidates:
         _, topk_idx = lax.top_k(gating, top_k)
         topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
         topk_wts = jax.nn.softmax(topk_logits, axis=-1)
+
+    if print_routing_stats:
+        # Collective: every rank must call. Only rank 0 prints the JSON line.
+        _stats = _compute_routing_stats(
+            topk_idx,
+            num_tokens=num_tokens,
+            top_k_=top_k,
+            num_devices_=num_devices,
+            num_experts_=E,
+            routing_mode_=routing_mode,
+        )
+        if jax.process_index() == 0:
+            print(f"ROUTING_STATS_JSON={json.dumps(_stats)}", flush=True)
 
     configs_to_try = [
         (bc_raw, *flags)
