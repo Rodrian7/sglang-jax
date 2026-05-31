@@ -689,16 +689,18 @@ def _fused_ep_moe_kernel(
                         ).start()
 
                 if metadata_window_prefetch_first_expert:
-                    # Eager-issue expert 0's bf0 weight DMAs (slot 0, w1+w3) into the
-                    # metadata ICI wait window — HBM is idle here, ICI is busy. This is
-                    # a deterministic re-ordering of work the kernel was going to do
-                    # anyway: slot 0 and these bytes are consumed in expert_ffn for
-                    # expert 0 / bf_id 0. Note: not "speculative" in the LLM-decoding
-                    # sense — there is no draft / verify, just early DMA issue.
-                    # If expert 0 turns out inactive (~25% under balanced routing), the
-                    # loaded bytes are not consumed; ~3 µs of HBM bandwidth used during
-                    # an otherwise-idle window — zero wall-time cost. If expert 0 is
-                    # active (~75%), the first-expert cold-start latency drops ~3-5 µs.
+                    # Issue expert 0's bf0 weight DMAs (slot 0, w1+w3) inside the
+                    # metadata ICI wait window — HBM is idle here, ICI is busy. This
+                    # is a deterministic re-ordering of work the kernel was going to
+                    # do anyway: slot 0 and these bytes are consumed in expert_ffn
+                    # for expert 0 / bf_id 0. (Not "speculative" or "eager" in the
+                    # inference-framework sense — there is no draft/verify and no
+                    # extra unconsumed work; just a temporal relocation of the same
+                    # DMA issue.) If expert 0 turns out inactive (~25% under
+                    # balanced routing), the loaded bytes are not consumed; ~3 µs
+                    # of HBM bandwidth used during an otherwise-idle window — zero
+                    # wall-time cost. If expert 0 is active (~75%), the
+                    # first-expert cold-start latency drops ~3-5 µs.
                     # init_carry must set bf0_prefetched=True to match.
                     # Pattern adapted from fused-moe-calibration debug-hold
                     # SE-during-metadata (decode64 -7.5 µs measured).
@@ -1425,11 +1427,11 @@ def _fused_ep_moe_kernel(
         def _run_inactive(_):
             # Drain leftover bf0 weight-prefetch sem if the caller passed
             # bf0_prefetched=True. This can only happen via the
-            # metadata-window eager prefetch (cross-expert prefetch is
-            # itself gated by the target's has_tokens, so cross-prefetch
-            # cannot land us here with bf0_prefetched=True). Without the
-            # drain the eager start has no matching wait → sem accounting
-            # leaks +1 per layer.
+            # metadata-window prefetch (cross-expert prefetch is itself
+            # gated by the target's has_tokens, so cross-prefetch cannot
+            # land us here with bf0_prefetched=True). Without the drain
+            # the metadata-window start has no matching wait → sem
+            # accounting leaks +1 per layer.
             @pl.when(bf0_prefetched)
             def _drain_metadata_window_bf0():
                 wait_fetch_w1(0)
