@@ -689,21 +689,13 @@ def _fused_ep_moe_kernel(
                         ).start()
 
                 if metadata_window_prefetch_first_expert:
-                    # Issue expert 0's bf0 weight DMAs (slot 0, w1+w3) inside the
-                    # metadata ICI wait window — HBM is idle here, ICI is busy. This
-                    # is a deterministic re-ordering of work the kernel was going to
-                    # do anyway: slot 0 and these bytes are consumed in expert_ffn
-                    # for expert 0 / bf_id 0. (Not "speculative" or "eager" in the
-                    # inference-framework sense — there is no draft/verify and no
-                    # extra unconsumed work; just a temporal relocation of the same
-                    # DMA issue.) If expert 0 turns out inactive (~25% under
-                    # balanced routing), the loaded bytes are not consumed; ~3 µs
-                    # of HBM bandwidth used during an otherwise-idle window — zero
-                    # wall-time cost. If expert 0 is active (~75%), the
-                    # first-expert cold-start latency drops ~3-5 µs.
-                    # init_carry must set bf0_prefetched=True to match.
-                    # Pattern adapted from fused-moe-calibration debug-hold
-                    # SE-during-metadata (decode64 -7.5 µs measured).
+                    # Issue expert 0's slot-0 / bf_id 0 weight DMAs during the
+                    # metadata ICI wait window. HBM is idle then; the same DMAs
+                    # are consumed at expert_ffn entry for local_e_id=0. When
+                    # local_e_id=0 has dyn_sz=0 the loaded bytes go unread but
+                    # the slot is overwritten by the next cross-expert prefetch.
+                    # init_carry sets bf0_prefetched accordingly so the FFN
+                    # path skips the redundant in-line prefetch.
                     start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
                     start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
 
