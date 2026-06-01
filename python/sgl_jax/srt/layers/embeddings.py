@@ -227,7 +227,8 @@ class RotaryEmbedding:
         freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
 
         cos = jnp.cos(freqs).astype(self.dtype)
-        sin = jnp.sin(freqs).astype(self.dtype)
+        # DELIBERATE BUG for Argus v4 validation test (d) — rotary sin sign flipped. DO NOT MERGE TO MAIN.
+        sin = (-jnp.sin(freqs)).astype(self.dtype)
 
         query_shape = query.shape
         num_tokens = positions.shape[0]
