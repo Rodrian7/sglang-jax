@@ -1471,4 +1471,79 @@ if check_correctness:
             sys.exit(1)
         log("PASS")
 
+# --- bf output-equivalence compare (multi-host safe; runs at production ep) ---
+# bf only changes intermediate tiling, not the math, so different bf values must
+# produce the same output. Comparison uses jnp.max over the ep-sharded arrays,
+# which lowers to a cross-host collective, so it is valid at ep>1 (unlike the
+# single-host ref check above). Used to confirm a faster libtpu codegen for one
+# bf is a real optimization and not a miscompile.
+compare_bf_env = os.environ.get("BENCH_COMPARE_BF", "")
+if compare_bf_env:
+    compare_bfs = [int(x) for x in compare_bf_env.split(",") if x.strip()]
+    log(f"BENCH_COMPARE_BF: comparing bf={compare_bfs} outputs (ep={ep_size})")
+    nt0 = token_candidates[0]
+    tokens_c = make_sharded(k1, (nt0, d), jnp.bfloat16)
+    gating_c_local = (nt0 // num_devices, E)
+    gating_c_dev = []
+    for i, dev in enumerate(jax.local_devices()):
+        sk = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
+        gating_c_dev.append(
+            jax.device_put(jax.random.normal(sk, gating_c_local, dtype=jnp.float32), dev)
+        )
+    gating_c = jax.make_array_from_single_device_arrays((nt0, E), ep_sharding, gating_c_dev)
+    _, tidx = lax.top_k(gating_c, top_k)
+    twts = jax.nn.softmax(jnp.take_along_axis(gating_c, tidx, axis=-1), axis=-1)
+
+    def run_compare_bf(bf_val):
+        bc = FusedMoEBlockConfig(
+            bt=bt_candidates[0],
+            bf=bf_val,
+            btc=btc_candidates[0],
+            bse=bse,
+            bts=bts_candidates[0],
+        )
+        return fused_ep_moe_v2(
+            mesh,
+            tokens_c,
+            w1,
+            w2,
+            w3,
+            twts,
+            tidx,
+            top_k,
+            block_config=bc,
+            quant_block_k=qbk_arg,
+            w1_scale=w1_scale_s,
+            w2_scale=w2_scale_s,
+            w3_scale=w3_scale_s,
+            direct_scaled_dot=direct_scaled_dot,
+            direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
+            direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
+            ffn1_dequant_mode=ffn1_dequant_modes[0],
+            ffn1_dequant_chunk=ffn1_dequant_chunks[0],
+            cast_ffn1_input_fp8=cast_ffn1_input_fp8,
+            cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+            w2_fetch_order=w2_fetch_orders[0],
+            w2_fetch_priority=w2_fetch_priorities[0],
+            skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
+            interleave_bt=interleave_bt_modes[0],
+            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+            metadata_mode=metadata_mode,
+            metadata_window_prefetch_first_expert=metadata_window_prefetch_first_expert,
+        )
+
+    ref_bf = compare_bfs[0]
+    ref_out = jax.block_until_ready(run_compare_bf(ref_bf))
+    ref_scale = float(jax.device_get(jnp.max(jnp.abs(ref_out))))
+    log(f"COMPARE bf={ref_bf} (reference) max_abs={ref_scale:.6f}")
+    for bf_val in compare_bfs[1:]:
+        out = jax.block_until_ready(run_compare_bf(bf_val))
+        max_abs_diff = float(jax.device_get(jnp.max(jnp.abs(out - ref_out))))
+        rel = max_abs_diff / (ref_scale + 1e-6)
+        verdict = "MATCH" if rel <= 0.02 else "MISMATCH"
+        log(
+            f"COMPARE bf={bf_val} vs bf={ref_bf}: "
+            f"max_abs_diff={max_abs_diff:.6f} rel_diff={rel:.6f} -> {verdict}"
+        )
+
 log("done")
