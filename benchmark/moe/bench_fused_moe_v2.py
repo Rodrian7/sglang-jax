@@ -8,11 +8,20 @@ SAME canonical marker-based timer the v1 tuner uses
 v2 tuned-table entry that can be pasted into
 ``sgl_jax/srt/kernels/fused_moe/v2/tuned_block_configs.py``.
 
-It deliberately reuses the v1 tuner's infrastructure by IMPORTING it rather
-than copy-pasting:
-  - ``select_block_configs`` from bench_fused_moe (candidate enumeration with
-    VMEM filtering). It returns v1 ``FusedMoEBlockConfig`` objects, which we
-    convert to v2 configs using the shared 5 fields (bt, bf, btc, bse, bts).
+Candidate enumeration is **v2-native**: a self-contained port of the
+``generate_tune_candidates`` / ``_estimate_vmem_bytes_v2`` logic out of
+``python/sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py`` (see
+``generate_v2_tune_candidates`` below). It produces v2
+``FusedMoEBlockConfig(bt, bf, btc, bse, bts)`` objects directly and filters
+them against the real v7x **64 MB** VMEM budget using v2's own VMEM model.
+We do NOT import bench_v2.py (it has heavy module-level side effects — it
+builds a mesh and reads env at import — so importing it would fail/hang
+off-TPU and on a fresh process). The v1 ``select_block_configs`` (whose VMEM
+estimate models the v1 kernel's bd1/bd2/bfc blocking) is intentionally NOT
+used: it mis-modeled v2 VMEM and emitted btc=1 / large-bts configs that OOM
+v2 on v7x.
+
+It still reuses by IMPORTING:
   - ``multiple_iteration_timeit_from_trace`` from benchmark.utils (the
     marker-based timer that produced the real tuned tables; timing does not
     depend on the kernel's own event name).
@@ -45,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import math
 import sys
 import traceback
 from functools import partial
@@ -55,11 +65,6 @@ import numpy as np
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 
-# Reuse the v1 tuner's candidate enumeration (VMEM-filtered) verbatim.
-from benchmark.moe.bench_fused_moe import (
-    DEFAULT_TPU_VMEM_BUDGET_MB,
-    select_block_configs,
-)
 from benchmark.moe.utils import (
     DEFAULT_NUM_TOKENS,
     MoEBenchmarkCase,
@@ -77,11 +82,320 @@ from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
 from sgl_jax.srt.layers.fused_moe import FusedEPMoEV2
 from sgl_jax.srt.layers.moe import TopK
 
+# Real v7x VMEM is 64 MB. The v1 tuner's DEFAULT_TPU_VMEM_BUDGET_MB (96 MB)
+# does NOT apply to the v2 kernel; v2 candidates are filtered against 64 MB.
+DEFAULT_TPU_VMEM_BUDGET_MB = 64
 
-def _to_v2_config(c) -> V2BlockConfig:
-    """Convert a v1 FusedMoEBlockConfig (or any object with bt/bf/btc/bse/bts)
-    to the v2 5-field FusedMoEBlockConfig."""
-    return V2BlockConfig(bt=c.bt, bf=c.bf, btc=c.btc, bse=c.bse, bts=c.bts)
+
+# ---------------------------------------------------------------------------
+# v2-native candidate enumeration (self-contained port of
+# generate_tune_candidates / _estimate_vmem_bytes_v2 from
+# python/sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py — no mesh/jax side effects).
+# ---------------------------------------------------------------------------
+
+
+def _align_to(x: int, a: int) -> int:
+    return ((x + a - 1) // a) * a
+
+
+def _pow2_floor(x: float) -> int:
+    if x <= 1:
+        return 1
+    return 1 << int(math.floor(math.log2(x)))
+
+
+def _pow2_ceil(x: float) -> int:
+    if x <= 1:
+        return 1
+    return 1 << int(math.ceil(math.log2(x)))
+
+
+def _aligned_divisors(n: int, alignment: int = 8) -> list[int]:
+    """All divisors of n that are multiples of `alignment`, descending."""
+    if n <= 0:
+        return []
+    divs: set[int] = set()
+    for i in range(1, int(math.isqrt(n)) + 1):
+        if n % i == 0:
+            if i % alignment == 0:
+                divs.add(i)
+            j = n // i
+            if j % alignment == 0:
+                divs.add(j)
+    return sorted(divs, reverse=True)
+
+
+def _estimate_vmem_bytes_v2(
+    *,
+    bt: int,
+    bf: int,
+    btc: int,
+    bse: int,
+    bts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    ep_size: int,
+    num_tokens: int,
+    use_fp8: bool = False,
+    quant_block_k: int = 128,
+    direct_scaled_dot: bool = True,
+    interleave_bt: bool = True,
+    enable_bt_scatter_overlap: bool = True,
+) -> int:
+    """v2 kernel VMEM+SMEM estimate (bytes). Ported verbatim from bench_v2.py's
+    ``_estimate_vmem_bytes_v2`` (sans verbose logging)."""
+    t_packing = 1  # bf16 activations
+    w_bytes = 1 if use_fp8 else 2
+    token_bytes = 2  # bf16
+    h_per_t = hidden_size // t_packing
+    padded_num_experts = _align_to(num_experts, 128)
+    padded_top_k = _align_to(top_k, 128)
+    acc_bt = math.gcd(bt, 16)
+    local_num_tokens = num_tokens // ep_size
+    num_bt = local_num_tokens // bt if bt > 0 else 1
+    use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
+    use_gather_bank = interleave_bt and num_bt > 1
+    smem_banks = num_bt if use_gather_bank else 2
+
+    b_a2a_g_acc = 2 * top_k * acc_bt * hidden_size * token_bytes
+    b_topk_w = smem_banks * bt * padded_top_k * 4
+    b_topk_id = smem_banks * bt * padded_top_k * 4
+    b_output = smem_banks * bt * hidden_size * token_bytes
+
+    b_w1 = 2 * hidden_size * bf * w_bytes
+    b_w3 = 2 * hidden_size * bf * w_bytes
+    b_w2 = 2 * bf * hidden_size * w_bytes
+
+    b_w1_scale = 0
+    b_w3_scale = 0
+    b_w2_scale = 0
+    if use_fp8:
+        b_w1_scale = 2 * t_packing * (h_per_t // quant_block_k) * bf * 4
+        b_w3_scale = b_w1_scale
+        b_w2_scale = 2 * t_packing * (bf // quant_block_k) * h_per_t * 4
+
+    b_w1_dq = 0
+    b_w3_dq = 0
+    b_w2_dq = 0
+    if use_fp8 and not direct_scaled_dot:
+        b_w1_dq = t_packing * h_per_t * bf * 2  # bf16
+        b_w3_dq = b_w1_dq
+        b_w2_dq = t_packing * bf * h_per_t * 2  # bf16
+
+    b_gate_acc = bts * bf * 4
+    b_up_acc = bts * bf * 4
+    b_x = bts * hidden_size * token_bytes
+    b_y_acc = bts * hidden_size * 4
+    b_y_stage = bts * hidden_size * token_bytes
+
+    local_num_experts = num_experts // ep_size
+    b_scoped = (
+        bt * padded_top_k * 4
+        + ep_size * padded_num_experts * 4
+        + 2 * padded_num_experts * 4
+        + padded_num_experts * 4
+        + padded_num_experts * 4
+    )
+
+    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
+    b_sems = (
+        2 * 4
+        + smem_banks * 10 * 4
+        + 3
+        * (
+            num_bt_banks * local_num_experts * 4
+            if (use_bt_scatter_bank or use_gather_bank)
+            else local_num_experts * 4
+        )
+        + (num_bt_banks * 4 if use_gather_bank else 4)
+        + 3 * 4
+    )
+
+    b_smem = (  # noqa: F841  # SMEM-budget sentinel (parity with v2/bench_v2.py)
+        smem_banks * bt * padded_top_k * 4
+        + smem_banks * ep_size * padded_num_experts * 4
+        + smem_banks * 2 * padded_num_experts * 4
+        + smem_banks * padded_num_experts * 4
+        + smem_banks * padded_num_experts * 4
+    )
+
+    total = (
+        b_a2a_g_acc
+        + b_topk_w
+        + b_topk_id
+        + b_output
+        + b_w1
+        + b_w3
+        + b_w2
+        + b_w1_scale
+        + b_w3_scale
+        + b_w2_scale
+        + b_w1_dq
+        + b_w3_dq
+        + b_w2_dq
+        + b_gate_acc
+        + b_up_acc
+        + b_x
+        + b_y_acc
+        + b_y_stage
+        + b_scoped
+        + b_sems
+    )
+    return total
+
+
+def generate_v2_tune_candidates(
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    num_tokens: int,
+    ep_size: int,
+    num_experts: int,
+    top_k: int,
+    use_fp8: bool = False,
+    quant_block_k: int = 128,
+    direct_scaled_dot: bool = True,
+    interleave_bt: bool = True,
+    enable_bt_scatter_overlap: bool = True,
+    vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024,
+    vmem_headroom: float = 0.95,
+    max_configs: int = 48,
+    bse: int = 256,
+    verbose: bool = False,
+) -> list[V2BlockConfig]:
+    """v2-native candidate enumeration + 64 MB VMEM feasibility filter.
+
+    Ported from ``generate_tune_candidates`` in bench_v2.py. Emits v2 5-field
+    ``FusedMoEBlockConfig(bt, bf, btc, bse, bts)`` objects whose effective form
+    fits ``vmem_budget_bytes * vmem_headroom`` per the v2 VMEM model. btc comes
+    from ``_aligned_divisors(bts, 8)`` so every candidate has btc % 8 == 0
+    (hence btc % t_packing(2) == 0). Returns at most ``max_configs`` configs.
+    """
+    local_num_tokens = num_tokens // ep_size
+    effective_budget = int(vmem_budget_bytes * vmem_headroom)
+
+    bf_list = sorted(
+        {
+            v
+            for v in [128, 256, 512, 1024, 2048]
+            if v <= intermediate_size and intermediate_size % v == 0
+        }
+    )
+
+    bt_list: list[int] = []
+    for p_val in [2, 4]:
+        if local_num_tokens == p_val:
+            bt_list.append(p_val)
+    p = 8
+    while p <= local_num_tokens:
+        if local_num_tokens % p == 0:
+            bt_list.append(p)
+        p *= 2
+    if not bt_list:
+        bt_list = [local_num_tokens]
+    bt_list = sorted(set(bt_list))
+
+    configs: list[V2BlockConfig] = []
+    seen: set[tuple] = set()
+
+    for bt in bt_list:
+        max_bts = bt * ep_size
+        expected = bt * ep_size * top_k / num_experts
+        lo = _pow2_floor(expected)
+        hi = _pow2_ceil(expected)
+        exp_floor8 = (int(expected) // 8) * 8
+        exp_ceil8 = _align_to(int(math.ceil(expected)), 8)
+        exp_hi8 = _align_to(int(math.ceil(expected * 1.25)), 8)
+        bts_cands = sorted(
+            {
+                v
+                for v in [bt, lo, hi, hi * 2, exp_floor8, exp_ceil8, exp_hi8]
+                if 0 < v <= max_bts and v % 8 == 0
+            }
+        )
+        if not bts_cands:
+            bts_cands = [bt]
+
+        for bts_val in bts_cands:
+            btc_cands = _aligned_divisors(bts_val, 8)
+            if not btc_cands:
+                continue
+
+            for bf in bf_list:
+                for btc in btc_cands:
+                    bc = V2BlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts_val)
+                    try:
+                        bc_eff = bc.effective_for(num_tokens=num_tokens, ep_size=ep_size)
+                    except ValueError:
+                        continue
+
+                    key = (bc_eff.bt, bc_eff.bf, bc_eff.btc, bc_eff.bts)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    est = _estimate_vmem_bytes_v2(
+                        bt=bc_eff.bt,
+                        bf=bc_eff.bf,
+                        btc=bc_eff.btc,
+                        bse=bc_eff.bse,
+                        bts=bc_eff.bts,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        ep_size=ep_size,
+                        num_tokens=num_tokens,
+                        use_fp8=use_fp8,
+                        quant_block_k=quant_block_k,
+                        direct_scaled_dot=direct_scaled_dot,
+                        interleave_bt=interleave_bt,
+                        enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                    )
+                    if est > effective_budget:
+                        if verbose:
+                            print(
+                                f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
+                                f"btc={bc_eff.btc},bts={bc_eff.bts}: "
+                                f"{est / (1024 * 1024):.1f}MB > "
+                                f"{effective_budget / (1024 * 1024):.1f}MB"
+                            )
+                        continue
+                    configs.append(bc)
+
+    if len(configs) <= max_configs:
+        return configs
+
+    # Round-robin across (bt, bts) buckets, preferring large bf/btc first.
+    buckets: dict[tuple, list[V2BlockConfig]] = {}
+    for cfg in configs:
+        bk = (cfg.bt, cfg.bts or cfg.bt)
+        buckets.setdefault(bk, []).append(cfg)
+    for bk in buckets:
+        buckets[bk].sort(key=lambda c: (c.bf, c.btc), reverse=True)
+
+    selected: list[V2BlockConfig] = []
+    selected_keys: set[tuple] = set()
+    bucket_keys = sorted(buckets.keys(), reverse=True)
+    while len(selected) < max_configs:
+        made_progress = False
+        for bk in bucket_keys:
+            bucket = buckets[bk]
+            if not bucket:
+                continue
+            cfg = bucket.pop(0)
+            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts)
+            if key not in selected_keys:
+                selected_keys.add(key)
+                selected.append(cfg)
+                made_progress = True
+            if len(selected) >= max_configs:
+                break
+        if not made_progress:
+            break
+    return selected
 
 
 def run_all(
@@ -258,35 +572,63 @@ def run_all(
 
             v2_block_cfgs: list[V2BlockConfig | None]
             if tune_block_config:
-                v1_cfgs = select_block_configs(
-                    case,
-                    dtype,
-                    weight_dtype=weight_dtype,
-                    router_dtype=data["router_logits"].dtype,
-                    bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
-                    bts_candidates=bts_candidates,
-                    bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
-                    bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
-                    bse_candidates=bse_candidates,
-                    tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
-                    tpu_vmem_headroom_ratio=tpu_vmem_headroom_ratio,
-                    tpu_vmem_estimate_scale=tpu_vmem_estimate_scale,
+                use_fp8 = weight_dtype == jnp.float8_e4m3fn
+                # v2 VMEM model needs the fp8 quant block size (defaults to 128
+                # in the kernel/model). quant_block_k above may be 256 for the
+                # weight quantizer, but the v2 VMEM scale buffers use the
+                # kernel default; pass the effective quant_block_k (>=128).
+                vmem_qbk = quant_block_k if (use_fp8 and quant_block_k) else 128
+                effective_budget_mb = (
+                    tpu_vmem_budget_bytes / (1024 * 1024)
+                ) * tpu_vmem_headroom_ratio
+                cand_cfgs = generate_v2_tune_candidates(
+                    intermediate_size=case.intermediate_size,
+                    hidden_size=case.hidden_size,
+                    num_tokens=case.num_tokens,
+                    ep_size=mesh_ep,
+                    num_experts=case.num_experts,
+                    top_k=case.top_k,
+                    use_fp8=use_fp8,
+                    quant_block_k=vmem_qbk,
+                    vmem_budget_bytes=tpu_vmem_budget_bytes,
+                    vmem_headroom=tpu_vmem_headroom_ratio,
                     max_configs=max_configs,
-                    use_shared_expert=use_shared_expert,
-                    quant_block_k=quant_block_k,
-                    excluded_configs=None,
+                    bse=(bse_candidates[0] if bse_candidates else 256),
+                    verbose=True,
                 )
-                # Convert v1 -> v2 configs, dedup on the v2 5-tuple.
+                # Drop any config v2 itself would reject (mirrors kernel validate).
                 v2_block_cfgs = []
                 seen: set[tuple] = set()
-                for c in v1_cfgs:
-                    v2c = _to_v2_config(c)
-                    key = (v2c.bt, v2c.bf, v2c.btc, v2c.bse, v2c.bts)
+                for c in cand_cfgs:
+                    try:
+                        v2_validate(
+                            num_tokens=case.num_tokens,
+                            num_experts=case.num_experts,
+                            top_k=case.top_k,
+                            hidden_size=case.hidden_size,
+                            intermediate_size=case.intermediate_size,
+                            dtype=dtype,
+                            ep_size=mesh_ep,
+                            block_config=c,
+                        )
+                    except ValueError:
+                        continue
+                    key = (c.bt, c.bf, c.btc, c.bse, c.bts)
                     if key in seen:
                         continue
                     seen.add(key)
-                    v2_block_cfgs.append(v2c)
-                print(f"  v2 candidates: {len(v1_cfgs)} v1 -> {len(v2_block_cfgs)} unique v2")
+                    v2_block_cfgs.append(c)
+                print(
+                    f"  v2 candidates: {len(cand_cfgs)} enumerated (<= {effective_budget_mb:.0f}MB "
+                    f"effective VMEM) -> {len(v2_block_cfgs)} valid"
+                )
+                for c in v2_block_cfgs:
+                    print(f"    cand bt={c.bt}, bf={c.bf}, btc={c.btc}, bse={c.bse}, bts={c.bts}")
+                if not v2_block_cfgs:
+                    print(
+                        "  WARNING: no v2 candidates survived enumeration+validation for "
+                        f"case={case.name}; nothing to time."
+                    )
             else:
                 v2_block_cfgs = [None]
 
@@ -324,6 +666,8 @@ def run_all(
 
             best: tuple[float, V2BlockConfig | None] | None = None
             default_ms: float | None = None
+            n_succeeded = 0
+            n_failed = 0
             for i, block_cfg in enumerate(v2_block_cfgs):
                 tag = "default" if block_cfg is None else str(i)
                 if block_cfg is None:
@@ -369,6 +713,21 @@ def run_all(
                     )
                 except ValueError as e:
                     print(f"SKIP fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}], reason: {e}")
+                    n_failed += 1
+                    continue
+                except jax.errors.JaxRuntimeError as e:
+                    # RESOURCE_EXHAUSTED (VMEM OOM) and other runtime/compile
+                    # failures: mark this config FAILED and keep sweeping.
+                    msg = str(e)
+                    short = msg.splitlines()[0] if msg else type(e).__name__
+                    print(
+                        f"FAILED fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}] "
+                        f"(bt={block_cfg.bt}, bf={block_cfg.bf}, btc={block_cfg.btc}, "
+                        f"bse={block_cfg.bse}, bts={block_cfg.bts}): "
+                        f"{type(e).__name__}: {short}",
+                        flush=True,
+                    )
+                    n_failed += 1
                     continue
                 except SystemExit as e:
                     print(
@@ -380,22 +739,40 @@ def run_all(
                     raise
                 except Exception as e:
                     print(
-                        f"ERROR fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}]: "
+                        f"FAILED fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}]: "
                         f"{type(e).__name__}: {e}",
                         flush=True,
                     )
                     print(traceback.format_exc(), flush=True)
+                    n_failed += 1
                     continue
 
                 if len(times) > 1:
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
                 print(f"     fused_moe_v2[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
+                if np.isfinite(mean_ms):
+                    n_succeeded += 1
+                else:
+                    n_failed += 1
                 if block_cfg is None:
                     default_ms = mean_ms
                 if tune_block_config and np.isfinite(mean_ms):
                     if best is None or mean_ms < best[0]:
                         best = (mean_ms, block_cfg)
+
+            if tune_block_config:
+                print(
+                    f"  [case={case.name}] sweep summary: {n_succeeded} succeeded, "
+                    f"{n_failed} failed out of {len(v2_block_cfgs)} candidate(s)."
+                )
+                if n_succeeded == 0:
+                    print(
+                        f"  NO CONFIG SUCCEEDED for case={case.name} "
+                        f"(tokens={case.num_tokens}, ep={case.ep_size}): "
+                        "every candidate failed (VMEM OOM / compile / validate). "
+                        "No tuned_v2 entry emitted for this case."
+                    )
 
             if tune_block_config and best is not None:
                 best_ms, best_cfg = best
@@ -498,7 +875,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bt-candidates", type=int, nargs="+", help="Candidate list for bt.")
     parser.add_argument("--bts-candidates", type=int, nargs="+", help="Candidate list for bts.")
     parser.add_argument("--bf-candidates", type=int, nargs="+", help="Candidate list for bf.")
-    parser.add_argument("--bd-candidates", type=int, nargs="+", help="Candidate list for bd1/bd2.")
+    parser.add_argument(
+        "--bd-candidates",
+        type=int,
+        nargs="+",
+        help="(DEPRECATED, ignored) v1-only bd1/bd2; the v2 kernel has no bd blocking.",
+    )
     parser.add_argument(
         "--bse-candidates",
         type=int,
