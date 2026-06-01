@@ -641,11 +641,14 @@ def calculate_tiling(
     num_rhs_buffers = 3
     # Reserve headroom for the lhs buffers, f32 accumulator, fp8 scales, and
     # register-allocator spill slots, which this heuristic otherwise ignores.
-    # Without it, large-expert fp8 shapes (e.g. grok-2 k=8192, n=16384) let the
-    # 3 triple-buffered rhs tiles consume the entire VMEM budget, overflowing by
-    # the size of those other allocations (~1.8M observed on TPU v7x / libtpu
-    # 0.0.30). Budgeting ~80% of VMEM to the rhs tiles leaves room for the rest.
-    rhs_vmem_budget = vmem_limit_bytes * 4 // 5
+    # Without it, large-expert fp8 shapes let the 3 triple-buffered rhs tiles
+    # consume the whole VMEM budget and overflow. grok-2 has two problem gemms:
+    # wi (k=8192, n=16384) and wo (k=16384, n=8192). For wo the contraction dim
+    # is large, so the lhs tile [tile_m, tile_k] is big; budgeting too much to
+    # rhs lets the heuristic stop at the tile_n floor without splitting tile_k,
+    # overflowing the real scoped vmem limit. Budget ~60% to the rhs tiles so
+    # the heuristic splits tile_k for large-K gemms and leaves room for lhs/acc.
+    rhs_vmem_budget = vmem_limit_bytes * 3 // 5
     rhs_vmem_target = rhs_vmem_budget // num_rhs_buffers
     base_rhs_size_bytes = dims.size_k * dims.size_n * rhs_bits // 8
 
