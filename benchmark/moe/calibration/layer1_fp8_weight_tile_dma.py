@@ -559,7 +559,12 @@ def _measure_dma_ms(
 
     jax.block_until_ready(run_dma(weight_source, scale_source))
 
-    task = f"layer1_fp8_dma_{plan.path}_bf{plan.bf}"
+    # task name MUST match the Pallas custom-call name above so the trace parser's
+    # generic regex (benchmark/utils.py _extract_marker_durations_with_source_ms)
+    # binds device events to this task. The bf16 module relies on a hardcoded
+    # `task.startswith("layer1_dma_")` rewrite branch in the parser; we don't have
+    # one here, so align task name with kernel event name directly.
+    task = f"layer1_fp8_weight_tile_dma_{plan.path}_bf{plan.bf}"
     return multiple_iteration_timeit_from_trace(
         compute_func=run_dma,
         data_generator=lambda: (weight_source, scale_source),
