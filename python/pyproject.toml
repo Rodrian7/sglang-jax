@@ -52,6 +52,7 @@ dev = [
 ]
 tpu = [
     "jax[tpu]==0.8.1",
+    "libtpu>=0.0.38",
 ]
 gpu = [
     "jax[cuda12]==0.8.1",
@@ -61,6 +62,7 @@ cpu = [
 ]
 all = [
     "jax[tpu]==0.8.1",
+    "libtpu>=0.0.38",
 ]
 multimodal = [
     "torch",
