@@ -21,6 +21,7 @@ from benchmark.moe.calibration import (
     layer1_dma_overlap,
     layer1_ffn_compute,
     layer1_ffn_pallas_compute,
+    layer1_fp8_weight_tile_dma,
     layer1_local_dma,
     layer1_shared_expert_compute,
     layer1_wait,
@@ -41,6 +42,7 @@ SCENARIO_LAYER1_A2A_SCATTER = "layer1_a2a_scatter"
 SCENARIO_LAYER1_A2A_GATHER = "layer1_a2a_gather"
 SCENARIO_LAYER1_DMA_OVERLAP = "layer1_dma_overlap"
 SCENARIO_LAYER1_WEIGHT_TILE_DMA = "layer1_weight_tile_dma"
+SCENARIO_LAYER1_FP8_WEIGHT_TILE_DMA = "layer1_fp8_weight_tile_dma"
 SCENARIO_LAYER1_LOCAL_DMA = "layer1_local_dma"
 SCENARIO_LAYER1_FFN_COMPUTE = "layer1_ffn_compute"
 SCENARIO_LAYER1_FFN_PALLAS_COMPUTE = "layer1_ffn_pallas_compute"
@@ -57,6 +59,7 @@ SCENARIOS = (
     SCENARIO_LAYER1_A2A_GATHER,
     SCENARIO_LAYER1_DMA_OVERLAP,
     SCENARIO_LAYER1_WEIGHT_TILE_DMA,
+    SCENARIO_LAYER1_FP8_WEIGHT_TILE_DMA,
     SCENARIO_LAYER1_LOCAL_DMA,
     SCENARIO_LAYER1_FFN_COMPUTE,
     SCENARIO_LAYER1_FFN_PALLAS_COMPUTE,
@@ -67,6 +70,7 @@ SCENARIOS = (
 
 SUITE_V7X32_BF16_WEIGHT_TILES = "v7x32_bf16_weight_tiles"
 SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY = "v7x8_bf16_weight_tile_dma_tuned_family"
+SUITE_V7X32_FP8_WEIGHT_TILE_DMA_MIMO = "v7x32_fp8_weight_tile_dma_mimo"
 SUITE_V7X32_BF16_HBM_COPY_ENVELOPE = "v7x32_bf16_hbm_copy_envelope"
 SUITE_V7X32_BF16_HBM_CURVE_V2 = "v7x32_bf16_hbm_curve_v2"
 SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3 = "v7x32_bf16_hbm_dense_curve_v3"
@@ -94,6 +98,7 @@ SUITE_V7X32_BF16_FUSED_MOE_E2E_DIAG = "v7x32_bf16_fused_moe_e2e_diag"
 SUITES = (
     SUITE_V7X32_BF16_WEIGHT_TILES,
     SUITE_V7X8_BF16_WEIGHT_TILE_DMA_TUNED_FAMILY,
+    SUITE_V7X32_FP8_WEIGHT_TILE_DMA_MIMO,
     SUITE_V7X32_BF16_HBM_COPY_ENVELOPE,
     SUITE_V7X32_BF16_HBM_CURVE_V2,
     SUITE_V7X32_BF16_HBM_DENSE_CURVE_V3,
@@ -1254,6 +1259,34 @@ def _layer1_weight_tile_dma_rows(
     ]
 
 
+def _layer1_fp8_weight_tile_dma_rows(
+    suite: str,
+    execution_mode: str,
+    runtime: dict[str, Any],
+    bf_values: tuple[int, ...] | None = None,
+    path_values: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    if suite != SUITE_V7X32_FP8_WEIGHT_TILE_DMA_MIMO:
+        raise ValueError(
+            f"layer1_fp8_weight_tile_dma supports only "
+            f"{SUITE_V7X32_FP8_WEIGHT_TILE_DMA_MIMO}; got {suite}."
+        )
+    paths = path_values if path_values else layer1_fp8_weight_tile_dma.WEIGHT_PATHS
+    bfs = bf_values if bf_values else (512,)
+    return layer1_fp8_weight_tile_dma.build_rows(
+        suite=suite,
+        paths=paths,
+        bf_values=bfs,
+        execution_mode=execution_mode,
+        runtime=runtime,
+        source=_source(),
+        metadata=_suite_metadata_for_runtime(
+            matrix_kind="fused_moe_fp8_weight_tile_dma",
+            target_runtime=layer1_fp8_weight_tile_dma.TARGET_RUNTIME_V7X32,
+        ),
+    )
+
+
 def _layer1_a2a_metadata_rows(
     suite: str,
     execution_mode: str,
@@ -1571,6 +1604,10 @@ def build_rows(
     if scenario == SCENARIO_LAYER1_WEIGHT_TILE_DMA:
         return _layer1_weight_tile_dma_rows(
             suite, resolved_mode, runtime, bf_values, path_values, bd_values
+        )
+    if scenario == SCENARIO_LAYER1_FP8_WEIGHT_TILE_DMA:
+        return _layer1_fp8_weight_tile_dma_rows(
+            suite, resolved_mode, runtime, bf_values, path_values
         )
     if scenario == SCENARIO_LAYER1_LOCAL_DMA:
         return _layer1_local_dma_rows(suite, resolved_mode, runtime, bf_values, path_values)
