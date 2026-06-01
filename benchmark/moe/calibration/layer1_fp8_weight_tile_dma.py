@@ -85,16 +85,31 @@ class FP8WeightTilePlan:
     path: str
     path_class: str
     bf: int
+    weight_only: bool  # J4: skip scale async copy + scale self-copy wait
+    tile_repeat: int  # J4: issue N independent tiles to N VMEM slots before single drain
+    # Per-tile bytes (single fetch, t_packing=2):
+    bytes_weight_per_tile: int
+    bytes_scale_per_tile: int
+    bytes_total_per_tile: int
+    dma_count_weight_per_tile: int  # = t_packing (2)
+    dma_count_scale_per_tile: int  # = 0 if weight_only else t_packing
+    # Per-kernel-call bytes (= tile_repeat × per-tile):
     bytes_weight: int
     bytes_scale: int
     bytes_total: int
-    dma_count_weight: int
-    dma_count_scale: int
+    dma_count_weight: int  # = tile_repeat × t_packing
+    dma_count_scale: int  # = 0 if weight_only else tile_repeat × t_packing
     weight_tile_shape: tuple[int, ...]
     scale_tile_shape: tuple[int, ...]
 
 
-def plan_for(path: str, bf: int) -> FP8WeightTilePlan:
+def plan_for(
+    path: str,
+    bf: int,
+    *,
+    weight_only: bool = False,
+    tile_repeat: int = 1,
+) -> FP8WeightTilePlan:
     if path not in WEIGHT_PATHS:
         raise ValueError(f"Unsupported path {path!r}; expected one of {WEIGHT_PATHS}")
     if bf <= 0:
@@ -106,24 +121,49 @@ def plan_for(path: str, bf: int) -> FP8WeightTilePlan:
             f"For path=w2, bf={bf} must be >= quant_block_k={QUANT_BLOCK_K} so the scale "
             "tile is non-empty along the bf axis."
         )
+    if tile_repeat < 1:
+        raise ValueError(f"tile_repeat={tile_repeat} must be >= 1")
+    if tile_repeat > LOCAL_NUM_EXPERTS:
+        raise ValueError(
+            f"tile_repeat={tile_repeat} exceeds LOCAL_NUM_EXPERTS={LOCAL_NUM_EXPERTS}; "
+            "the kernel uses N expert slots in HBM to ensure each repeat reads a distinct tile."
+        )
     if path == "w2":
         weight_tile = (T_PACKING, bf, H_PER_T_PACKING)
         scale_tile = (T_PACKING, bf // QUANT_BLOCK_K, 1, H_PER_T_PACKING)
-        bytes_scale = T_PACKING * (bf // QUANT_BLOCK_K) * 1 * H_PER_T_PACKING * SCALE_BYTES
+        bytes_scale_per_tile = T_PACKING * (bf // QUANT_BLOCK_K) * 1 * H_PER_T_PACKING * SCALE_BYTES
     else:
         weight_tile = (T_PACKING, H_PER_T_PACKING, bf)
         scale_tile = (T_PACKING, H_PER_T_PACKING // QUANT_BLOCK_K, 1, bf)
-        bytes_scale = T_PACKING * (H_PER_T_PACKING // QUANT_BLOCK_K) * 1 * bf * SCALE_BYTES
-    bytes_weight = T_PACKING * bf * H_PER_T_PACKING * WEIGHT_BYTES
+        bytes_scale_per_tile = T_PACKING * (H_PER_T_PACKING // QUANT_BLOCK_K) * 1 * bf * SCALE_BYTES
+    bytes_weight_per_tile = T_PACKING * bf * H_PER_T_PACKING * WEIGHT_BYTES
+    if weight_only:
+        bytes_scale_per_tile = 0
+        dma_count_scale_per_tile = 0
+    else:
+        dma_count_scale_per_tile = T_PACKING
+    bytes_total_per_tile = bytes_weight_per_tile + bytes_scale_per_tile
+    bytes_weight = bytes_weight_per_tile * tile_repeat
+    bytes_scale = bytes_scale_per_tile * tile_repeat
+    bytes_total = bytes_total_per_tile * tile_repeat
+    dma_count_weight = T_PACKING * tile_repeat
+    dma_count_scale = dma_count_scale_per_tile * tile_repeat
     return FP8WeightTilePlan(
         path=path,
         path_class=PATH_CLASS_MAP[path],
         bf=bf,
+        weight_only=weight_only,
+        tile_repeat=tile_repeat,
+        bytes_weight_per_tile=bytes_weight_per_tile,
+        bytes_scale_per_tile=bytes_scale_per_tile,
+        bytes_total_per_tile=bytes_total_per_tile,
+        dma_count_weight_per_tile=T_PACKING,
+        dma_count_scale_per_tile=dma_count_scale_per_tile,
         bytes_weight=bytes_weight,
         bytes_scale=bytes_scale,
-        bytes_total=bytes_weight + bytes_scale,
-        dma_count_weight=T_PACKING,
-        dma_count_scale=T_PACKING,
+        bytes_total=bytes_total,
+        dma_count_weight=dma_count_weight,
+        dma_count_scale=dma_count_scale,
         weight_tile_shape=weight_tile,
         scale_tile_shape=scale_tile,
     )
@@ -135,6 +175,8 @@ def build_rows(
     paths: Iterable[str],
     bf_values: Iterable[int],
     execution_mode: str,
+    weight_only: bool = False,
+    tile_repeat: int = 1,
     runtime: dict[str, Any] | None = None,
     source: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -184,11 +226,16 @@ def build_rows(
     for path in paths_list:
         for bf in bf_list:
             try:
-                plan = plan_for(path, bf)
+                plan = plan_for(path, bf, weight_only=weight_only, tile_repeat=tile_repeat)
             except ValueError as exc:
                 rows.append(
                     _make_row(
-                        plan_or_proxy=_proxy_plan(path=path, bf=bf),
+                        plan_or_proxy=_proxy_plan(
+                            path=path,
+                            bf=bf,
+                            weight_only=weight_only,
+                            tile_repeat=tile_repeat,
+                        ),
                         samples=[],
                         status=STATUS_NOT_IMPLEMENTED,
                         suite=suite,
@@ -248,14 +295,18 @@ def _schema_only_rows(
     source: Mapping[str, Any] | None,
     metadata: Mapping[str, Any] | None,
     implementation_note: str,
+    weight_only: bool = False,
+    tile_repeat: int = 1,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in paths:
         for bf in bf_values:
             try:
-                plan = plan_for(path, bf)
+                plan = plan_for(path, bf, weight_only=weight_only, tile_repeat=tile_repeat)
             except ValueError:
-                plan = _proxy_plan(path=path, bf=bf)
+                plan = _proxy_plan(
+                    path=path, bf=bf, weight_only=weight_only, tile_repeat=tile_repeat
+                )
             rows.append(
                 _make_row(
                     plan_or_proxy=plan,
@@ -272,11 +323,20 @@ def _schema_only_rows(
     return rows
 
 
-def _proxy_plan(path: str, bf: int) -> FP8WeightTilePlan:
+def _proxy_plan(
+    path: str, bf: int, *, weight_only: bool = False, tile_repeat: int = 1
+) -> FP8WeightTilePlan:
     return FP8WeightTilePlan(
         path=path,
         path_class=PATH_CLASS_MAP.get(path, "unknown"),
         bf=bf,
+        weight_only=weight_only,
+        tile_repeat=tile_repeat,
+        bytes_weight_per_tile=0,
+        bytes_scale_per_tile=0,
+        bytes_total_per_tile=0,
+        dma_count_weight_per_tile=0,
+        dma_count_scale_per_tile=0,
         bytes_weight=0,
         bytes_scale=0,
         bytes_total=0,
@@ -322,8 +382,16 @@ def _make_row(
             ),
             "p_loop": "for p in range(t_packing), with t_packing=2 for bf16 tokens",
             "primary_copy_only": True,
-            "issues_per_p": ["weight_async_copy", "scale_async_copy"],
-            "wait_pattern": "two self-copy waits on shared DMA sem (weight then scale)",
+            "issues_per_p": (
+                ["weight_async_copy"]
+                if plan.weight_only
+                else ["weight_async_copy", "scale_async_copy"]
+            ),
+            "wait_pattern": (
+                "single self-copy wait on weight scratch"
+                if plan.weight_only
+                else "two self-copy waits on shared DMA sem (weight then scale)"
+            ),
             "excluded_from_phase1_row": (
                 "dot/MXU compute",
                 "A2A",
@@ -332,7 +400,24 @@ def _make_row(
                 "fused-MoE control flow",
             ),
         },
+        "j4_probe": {
+            "weight_only": plan.weight_only,
+            "tile_repeat": plan.tile_repeat,
+            "hbm_expert_slots": plan.tile_repeat,
+            "drains": (
+                ["weight_self_copy"]
+                if plan.weight_only
+                else ["weight_self_copy", "scale_self_copy"]
+            ),
+        },
         "fp8_traffic": {
+            # Per-tile (single fetch, t_packing=2):
+            "bytes_weight_per_tile": plan.bytes_weight_per_tile,
+            "bytes_scale_per_tile": plan.bytes_scale_per_tile,
+            "bytes_total_per_tile": plan.bytes_total_per_tile,
+            "dma_count_weight_per_tile": plan.dma_count_weight_per_tile,
+            "dma_count_scale_per_tile": plan.dma_count_scale_per_tile,
+            # Per kernel call (= tile_repeat × per-tile):
             "bytes_weight": plan.bytes_weight,
             "bytes_scale": plan.bytes_scale,
             "bytes_total": plan.bytes_total,
@@ -465,16 +550,21 @@ def _measure_dma_ms(
     sem_index = SEM_INDEX_MAP[plan.path]
 
     is_w2 = plan.path == "w2"
+    n = plan.tile_repeat
+    weight_only = plan.weight_only
+
+    # HBM has `n` distinct expert slots so each repeat reads a fresh tile (avoids
+    # compiler dedup of identical reads when N > num_bf available at this bf).
     if is_w2:
-        weight_hbm_shape = (1, INTERMEDIATE_SIZE, HIDDEN_SIZE)
-        scale_hbm_shape = (1, INTERMEDIATE_SIZE // QUANT_BLOCK_K, 1, HIDDEN_SIZE)
-        weight_scratch_shape = (T_PACKING, plan.bf, H_PER_T_PACKING)
-        scale_scratch_shape = (T_PACKING, plan.bf // QUANT_BLOCK_K, 1, H_PER_T_PACKING)
+        weight_hbm_shape = (n, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        scale_hbm_shape = (n, INTERMEDIATE_SIZE // QUANT_BLOCK_K, 1, HIDDEN_SIZE)
+        weight_scratch_shape = (n, T_PACKING, plan.bf, H_PER_T_PACKING)
+        scale_scratch_shape = (n, T_PACKING, plan.bf // QUANT_BLOCK_K, 1, H_PER_T_PACKING)
     else:
-        weight_hbm_shape = (1, HIDDEN_SIZE, INTERMEDIATE_SIZE)
-        scale_hbm_shape = (1, HIDDEN_SIZE // QUANT_BLOCK_K, 1, INTERMEDIATE_SIZE)
-        weight_scratch_shape = (T_PACKING, H_PER_T_PACKING, plan.bf)
-        scale_scratch_shape = (T_PACKING, H_PER_T_PACKING // QUANT_BLOCK_K, 1, plan.bf)
+        weight_hbm_shape = (n, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+        scale_hbm_shape = (n, HIDDEN_SIZE // QUANT_BLOCK_K, 1, INTERMEDIATE_SIZE)
+        weight_scratch_shape = (n, T_PACKING, H_PER_T_PACKING, plan.bf)
+        scale_scratch_shape = (n, T_PACKING, H_PER_T_PACKING // QUANT_BLOCK_K, 1, plan.bf)
 
     weight_source = jnp.ones(weight_hbm_shape, dtype=weight_dtype)
     scale_source = jnp.ones(scale_hbm_shape, dtype=scale_dtype)
@@ -483,53 +573,65 @@ def _measure_dma_ms(
 
     def kernel(weight_ref, scale_ref, out_ref, weight_scratch, scale_scratch, local_sems):
         del out_ref
-        for p in range(T_PACKING):
-            if is_w2:
-                w_src = weight_ref.at[
-                    0,
-                    pl.ds(0, plan.bf),
-                    pl.ds(p * H_PER_T_PACKING, H_PER_T_PACKING),
-                ]
-                s_src = scale_ref.at[
-                    0,
-                    pl.ds(0, plan.bf // QUANT_BLOCK_K),
-                    pl.ds(0, 1),
-                    pl.ds(p * H_PER_T_PACKING, H_PER_T_PACKING),
-                ]
-            else:
-                w_src = weight_ref.at[
-                    0,
-                    pl.ds(p * H_PER_T_PACKING, H_PER_T_PACKING),
-                    pl.ds(0, plan.bf),
-                ]
-                s_src = scale_ref.at[
-                    0,
-                    pl.ds(p * H_PER_T_PACKING // QUANT_BLOCK_K, H_PER_T_PACKING // QUANT_BLOCK_K),
-                    pl.ds(0, 1),
-                    pl.ds(0, plan.bf),
-                ]
-            pltpu.make_async_copy(
-                src_ref=w_src,
-                dst_ref=weight_scratch.at[p],
-                sem=local_sems.at[0, sem_index],
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=s_src,
-                dst_ref=scale_scratch.at[p],
-                sem=local_sems.at[0, sem_index],
-            ).start()
+        # Issue n × t_packing weight starts (and optionally n × t_packing scale starts)
+        # to independent VMEM slots, all sharing one DMA sem. This tests outstanding
+        # depth saturation: if the engine can dispatch them in parallel, wall-time
+        # grows sublinearly with n.
+        for tile_i in range(n):
+            for p in range(T_PACKING):
+                if is_w2:
+                    w_src = weight_ref.at[
+                        tile_i,
+                        pl.ds(0, plan.bf),
+                        pl.ds(p * H_PER_T_PACKING, H_PER_T_PACKING),
+                    ]
+                    s_src = scale_ref.at[
+                        tile_i,
+                        pl.ds(0, plan.bf // QUANT_BLOCK_K),
+                        pl.ds(0, 1),
+                        pl.ds(p * H_PER_T_PACKING, H_PER_T_PACKING),
+                    ]
+                else:
+                    w_src = weight_ref.at[
+                        tile_i,
+                        pl.ds(p * H_PER_T_PACKING, H_PER_T_PACKING),
+                        pl.ds(0, plan.bf),
+                    ]
+                    s_src = scale_ref.at[
+                        tile_i,
+                        pl.ds(
+                            p * H_PER_T_PACKING // QUANT_BLOCK_K,
+                            H_PER_T_PACKING // QUANT_BLOCK_K,
+                        ),
+                        pl.ds(0, 1),
+                        pl.ds(0, plan.bf),
+                    ]
+                pltpu.make_async_copy(
+                    src_ref=w_src,
+                    dst_ref=weight_scratch.at[tile_i, p],
+                    sem=local_sems.at[0, sem_index],
+                ).start()
+                if not weight_only:
+                    pltpu.make_async_copy(
+                        src_ref=s_src,
+                        dst_ref=scale_scratch.at[tile_i, p],
+                        sem=local_sems.at[0, sem_index],
+                    ).start()
 
-        # Mirror v2 wait_fetch_w*: two self-copy waits on the shared sem.
+        # Single drain over the full weight scratch (covers all n × t_packing weight
+        # starts since they share the sem). Mirror v2 wait_fetch_w* by issuing a
+        # separate self-copy on scale scratch when scale was loaded.
         pltpu.make_async_copy(
             src_ref=weight_scratch,
             dst_ref=weight_scratch,
             sem=local_sems.at[0, sem_index],
         ).wait()
-        pltpu.make_async_copy(
-            src_ref=scale_scratch,
-            dst_ref=scale_scratch,
-            sem=local_sems.at[0, sem_index],
-        ).wait()
+        if not weight_only:
+            pltpu.make_async_copy(
+                src_ref=scale_scratch,
+                dst_ref=scale_scratch,
+                sem=local_sems.at[0, sem_index],
+            ).wait()
 
     @jax.jit
     def run_dma(weight_hbm, scale_hbm):
@@ -554,17 +656,23 @@ def _measure_dma_ms(
                 has_side_effects=True,
                 vmem_limit_bytes=VMEM_LIMIT_BYTES,
             ),
-            name=f"layer1_fp8_weight_tile_dma_{plan.path}_bf{plan.bf}",
+            # task name MUST equal this; encode probe knobs so each cell gets a
+            # unique parser-bindable event.
+            name=(
+                f"layer1_fp8_weight_tile_dma_{plan.path}_bf{plan.bf}"
+                f"_w{int(weight_only)}_r{plan.tile_repeat}"
+            ),
         )(weight_hbm, scale_hbm)
 
     jax.block_until_ready(run_dma(weight_source, scale_source))
 
     # task name MUST match the Pallas custom-call name above so the trace parser's
     # generic regex (benchmark/utils.py _extract_marker_durations_with_source_ms)
-    # binds device events to this task. The bf16 module relies on a hardcoded
-    # `task.startswith("layer1_dma_")` rewrite branch in the parser; we don't have
-    # one here, so align task name with kernel event name directly.
-    task = f"layer1_fp8_weight_tile_dma_{plan.path}_bf{plan.bf}"
+    # binds device events to this task. See [[calibration-task-name-must-match-pallas-kernel-name]].
+    task = (
+        f"layer1_fp8_weight_tile_dma_{plan.path}_bf{plan.bf}"
+        f"_w{int(plan.weight_only)}_r{plan.tile_repeat}"
+    )
     return multiple_iteration_timeit_from_trace(
         compute_func=run_dma,
         data_generator=lambda: (weight_source, scale_source),
