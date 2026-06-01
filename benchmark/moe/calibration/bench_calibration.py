@@ -1273,11 +1273,21 @@ def _layer1_fp8_weight_tile_dma_rows(
         )
     paths = path_values if path_values else layer1_fp8_weight_tile_dma.WEIGHT_PATHS
     bfs = bf_values if bf_values else (512,)
+    # J4 probes: env-driven (one cell per Python process per manifest invocation).
+    weight_only = os.environ.get("BENCH_J4_WEIGHT_ONLY", "0") == "1"
+    try:
+        tile_repeat = int(os.environ.get("BENCH_J4_TILE_REPEAT", "1"))
+    except ValueError:
+        tile_repeat = 1
+    if tile_repeat < 1:
+        tile_repeat = 1
     return layer1_fp8_weight_tile_dma.build_rows(
         suite=suite,
         paths=paths,
         bf_values=bfs,
         execution_mode=execution_mode,
+        weight_only=weight_only,
+        tile_repeat=tile_repeat,
         runtime=runtime,
         source=_source(),
         metadata=_suite_metadata_for_runtime(
