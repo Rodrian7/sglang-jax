@@ -113,6 +113,52 @@ def _extract_durations_ms(trace: dict[str, Any]) -> list[float]:
     return max(sorted(durations.items()), key=lambda kv: len(kv[1]))[1]
 
 
+def _kernel_durations_from_xplane(trace_dir: str) -> list[float]:
+    """Per-invocation kernel device durations (ms) via Tensor-Core burst clustering.
+
+    Robust timing source for tuning: the chrome-trace kernel-name regex does not
+    match the v2 pallas_call name on current libtpu, so we parse the xplane.pb
+    directly and cluster Tensor Core bundle offsets into per-call bursts
+    (gap > 20us). Returns [] if xplane_pb2 unavailable or no device bursts found,
+    so callers fall back to the chrome-trace path.
+    """
+    try:
+        from tensorflow.tsl.profiler.protobuf import xplane_pb2
+    except Exception:
+        return []
+    import glob as _glob
+
+    pbs = _glob.glob(os.path.join(trace_dir, "**", "*.xplane.pb"), recursive=True)
+    if not pbs:
+        return []
+    sp = xplane_pb2.XSpace()
+    with open(max(pbs, key=os.path.getmtime), "rb") as _fh:
+        sp.ParseFromString(_fh.read())
+    for plane in sp.planes:
+        if plane.name != "/device:TPU:0":
+            continue
+        offs = sorted(
+            e.offset_ps / 1e6
+            for line in plane.lines
+            if line.name == "Tensor Core"
+            for e in line.events
+        )
+        if not offs:
+            return []
+        bursts, cur = [], [offs[0]]
+        for x in offs[1:]:
+            if x - cur[-1] > 20.0:
+                bursts.append(cur)
+                cur = [x]
+            else:
+                cur.append(x)
+        bursts.append(cur)
+        durs_us = [b[-1] - b[0] for b in bursts if len(b) > 50]
+        body = durs_us[1:] if len(durs_us) > 2 else durs_us
+        return [d / 1e3 for d in body]  # us -> ms
+    return []
+
+
 def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
     """Warmup then profile *iters* calls, return per-iter device durations (ms)."""
     for _ in range(warmup):
@@ -130,6 +176,9 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
 
     if jax.process_index() != 0:
         return []
+    xplane_durs = _kernel_durations_from_xplane(trace_dir)
+    if xplane_durs:
+        return xplane_durs
     try:
         trace = _load_trace(trace_dir)
         return _extract_durations_ms(trace)
