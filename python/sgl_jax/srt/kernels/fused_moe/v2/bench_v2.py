@@ -338,6 +338,16 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 )
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
+# J6.3 fused-w13 prototype:
+#   separate (default) — current behavior, separate sems for W1/W3
+#   schedule           — separate HBM/VMEM, W1+W3 share sem 4 + single drain
+#   packed             — packed w13_hbm via per-bf interleave; one weight DMA
+#                        per p instead of two; scales remain separate
+fused_w13_mode = os.environ.get("BENCH_FUSED_W13_MODE", "separate").lower()
+if fused_w13_mode not in ("separate", "schedule", "packed"):
+    raise ValueError(
+        f"BENCH_FUSED_W13_MODE must be separate/schedule/packed; got {fused_w13_mode!r}"
+    )
 ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
 ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 _default_mode = "recursive" if os.environ.get("BENCH_INKERNEL_MD", "1") == "1" else "jax"
@@ -970,6 +980,39 @@ if use_fp8:
     qbk_arg = quant_block_k
     log("fp8 quantization done")
 
+# J6.3 fused-w13 packed weight: built once from quantized W1/W3 via per-bf
+# interleave (per docs/performance/.../current_state.md J6.3). Layout is
+# bf-dependent so this prototype only supports a single BENCH_BF value.
+w13_packed = None
+if fused_w13_mode == "packed":
+    if len(bf_candidates) != 1:
+        raise ValueError(
+            "BENCH_FUSED_W13_MODE=packed currently supports a single BENCH_BF; "
+            f"got bf_candidates={bf_candidates}."
+        )
+    bf_for_w13 = bf_candidates[0]
+    if f % bf_for_w13 != 0:
+        raise ValueError(f"intermediate={f} must be divisible by bf={bf_for_w13}.")
+    log(f"building packed w13 tensor via per-bf interleave (bf={bf_for_w13})...")
+
+    @jax.jit
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=(P(("data", "tensor")), P(("data", "tensor"))),
+        out_specs=P(("data", "tensor")),
+        check_vma=False,
+    )
+    def _build_w13_packed(w1_local, w3_local):
+        E_loc, d_loc, f_loc = w1_local.shape
+        num_bf = f_loc // bf_for_w13
+        w1c = w1_local.reshape(E_loc, d_loc, num_bf, bf_for_w13)
+        w3c = w3_local.reshape(E_loc, d_loc, num_bf, bf_for_w13)
+        return jnp.stack([w1c, w3c], axis=3).reshape(E_loc, d_loc, 2 * f_loc)
+
+    w13_packed = _build_w13_packed(w1, w3)
+    jax.block_until_ready(w13_packed)
+    log("packed w13 ready")
+
 log("weights ready")
 
 # --- Sweep ---
@@ -1200,6 +1243,8 @@ for num_tokens in token_candidates:
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 metadata_mode=metadata_mode,
                 metadata_window_prefetch_first_expert=metadata_window_prefetch_first_expert,
+                fused_w13_mode=fused_w13_mode,
+                w13=w13_packed,
             )
 
         try:

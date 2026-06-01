@@ -237,6 +237,11 @@ def _fused_ep_moe_kernel(
     w1_hbm,  # (local_num_experts, hidden_size, intermediate_size)
     w2_hbm,  # (local_num_experts, intermediate_size, hidden_size)
     w3_hbm,  # (local_num_experts, hidden_size, intermediate_size)
+    # J6.3 fused-w13 prototype: per-bf interleaved packed weight, populated only
+    # when fused_w13_mode == "packed". Shape (local_num_experts, hidden_size,
+    # 2 * intermediate_size); for fixed bf, slice w13_hbm[e, h, bf_id*2*bf : (bf_id+1)*2*bf]
+    # gives (h_per_t, 2*bf) where positions [0:bf] = W1[bf_id] and [bf:2*bf] = W3[bf_id].
+    w13_hbm,  # None | (local_num_experts, hidden_size, 2 * intermediate_size)
     w1_scale_hbm,  # None | (local_num_experts, H // quant_block_k, 1, I)
     w2_scale_hbm,  # None | (local_num_experts, I // quant_block_k, 1, H)
     w3_scale_hbm,  # None | (local_num_experts, H // quant_block_k, 1, I)
@@ -269,6 +274,10 @@ def _fused_ep_moe_kernel(
     b_w1_x2_vmem,  # (2, t_packing, h_per_t, bf)
     b_w3_x2_vmem,  # (2, t_packing, h_per_t, bf)
     b_w2_x2_vmem,  # (2, t_packing, bf, h_per_t)
+    # J6.3 fused-w13 packed scratch: holds W1+W3 interleaved per bf tile;
+    # b_w13[..., 0:bf] = W1, b_w13[..., bf:2*bf] = W3. Allocated only when
+    # fused_w13_mode == "packed".
+    b_w13_x2_vmem,  # None | (2, t_packing, h_per_t, 2 * bf)
     # Scale double buffers (None when not quantized)
     b_w1_scale_x2_vmem,  # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
     b_w3_scale_x2_vmem,  # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
@@ -349,6 +358,12 @@ def _fused_ep_moe_kernel(
     direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool = False,
     direct_scaled_dot_ffn2: bool = False,
+    # J6.3 fused-w13 prototype mode:
+    #   "separate"  — current behavior, W1/W3 separate sems (4/5)
+    #   "schedule"  — same separate HBM/VMEM layout, W1+W3 share sem 4 + single drain
+    #   "packed"    — w13_hbm + b_w13_x2_vmem; one weight DMA per t_packing iter pulls
+    #                 W1+W3 interleaved tile; only direct_scaled_dot_ffn1=True path supported
+    fused_w13_mode: str = "separate",
     ffn1_dequant_mode: str = "full",
     ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
@@ -392,6 +407,19 @@ def _fused_ep_moe_kernel(
     routing_smem_top_k = t2e_routing_x2_smem.shape[-1]
     assert padded_num_experts == align_to(num_experts, 128)
     assert routing_smem_top_k in (top_k, align_to(top_k, 128))
+
+    # J6.3 fused-w13 prototype guards.
+    if fused_w13_mode not in ("separate", "schedule", "packed"):
+        raise ValueError(f"Unsupported {fused_w13_mode=}; expected separate / schedule / packed.")
+    if fused_w13_mode == "packed" and w13_hbm is None:
+        raise ValueError("fused_w13_mode='packed' requires w13_hbm to be provided.")
+    if fused_w13_mode == "packed" and b_w13_x2_vmem is None:
+        raise ValueError("fused_w13_mode='packed' requires b_w13_x2_vmem scratch to be allocated.")
+    if fused_w13_mode == "packed" and not direct_scaled_dot_ffn1:
+        raise ValueError(
+            "fused_w13_mode='packed' currently only supports direct_scaled_dot_ffn1=True; "
+            "the elif/else FFN1 paths read from b_w1/b_w3 directly and were not retargeted."
+        )
 
     t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
@@ -696,8 +724,11 @@ def _fused_ep_moe_kernel(
                     # the slot is overwritten by the next cross-expert prefetch.
                     # init_carry sets bf0_prefetched accordingly so the FFN
                     # path skips the redundant in-line prefetch.
-                    start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
-                    start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
+                    if fused_w13_mode == "separate":
+                        start_fetch_w1(jnp.int32(0), 0, 0, priority=1)
+                        start_fetch_w3(jnp.int32(0), 0, 0, priority=1)
+                    else:
+                        start_fetch_w13_unified(jnp.int32(0), 0, 0, priority=1)
 
                 for peer_id in range(num_devices):
 
@@ -1176,6 +1207,162 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[slot, 5],
             ).wait()
 
+    # J6.3 fused-w13 schedule mode: W1+W3 weight + scale all on shared sem 4.
+    # Separate HBM layout, separate VMEM scratches, but a single drain across all.
+    def start_fetch_w13_schedule(local_e_id, slot, bf_id, priority=1):
+        if disable_weight_load:
+            return
+        for p in range(t_packing):
+            if not disable_w1_load:
+                pltpu.make_async_copy(
+                    src_ref=w1_hbm.at[
+                        local_e_id,
+                        pl.ds(p * h_per_t, h_per_t),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w1_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 4],
+                ).start(priority=priority)
+                if w1_scale_hbm is not None:
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                            pl.ds(0, 1),
+                            pl.ds(bf_id * bf, bf),
+                        ],
+                        dst_ref=b_w1_scale_x2_vmem.at[slot, p],
+                        sem=local_sems.at[slot, 4],
+                    ).start(priority=priority)
+            if not disable_w3_load:
+                pltpu.make_async_copy(
+                    src_ref=w3_hbm.at[
+                        local_e_id,
+                        pl.ds(p * h_per_t, h_per_t),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w3_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 4],
+                ).start(priority=priority)
+                if w3_scale_hbm is not None:
+                    pltpu.make_async_copy(
+                        src_ref=w3_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                            pl.ds(0, 1),
+                            pl.ds(bf_id * bf, bf),
+                        ],
+                        dst_ref=b_w3_scale_x2_vmem.at[slot, p],
+                        sem=local_sems.at[slot, 4],
+                    ).start(priority=priority)
+
+    def wait_fetch_w13_schedule(slot):
+        if disable_weight_load:
+            return
+        # Drain self-copies on the shared sem; covers all W1 weight + W1 scale +
+        # W3 weight + W3 scale starts.
+        if not disable_w1_load:
+            pltpu.make_async_copy(
+                src_ref=b_w1_x2_vmem.at[slot],
+                dst_ref=b_w1_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 4],
+            ).wait()
+            if w1_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=b_w1_scale_x2_vmem.at[slot],
+                    dst_ref=b_w1_scale_x2_vmem.at[slot],
+                    sem=local_sems.at[slot, 4],
+                ).wait()
+        if not disable_w3_load:
+            pltpu.make_async_copy(
+                src_ref=b_w3_x2_vmem.at[slot],
+                dst_ref=b_w3_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 4],
+            ).wait()
+            if w3_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=b_w3_scale_x2_vmem.at[slot],
+                    dst_ref=b_w3_scale_x2_vmem.at[slot],
+                    sem=local_sems.at[slot, 4],
+                ).wait()
+
+    # J6.3 fused-w13 packed mode: single weight async_copy per t_packing iter
+    # pulls a (h_per_t, 2*bf) slab from w13_hbm covering both W1 and W3 for the
+    # current bf tile. Scales remain separate. All copies share sem 4.
+    def start_fetch_w13_packed(local_e_id, slot, bf_id, priority=1):
+        if disable_weight_load:
+            return
+        for p in range(t_packing):
+            pltpu.make_async_copy(
+                src_ref=w13_hbm.at[
+                    local_e_id,
+                    pl.ds(p * h_per_t, h_per_t),
+                    pl.ds(bf_id * 2 * bf, 2 * bf),
+                ],
+                dst_ref=b_w13_x2_vmem.at[slot, p],
+                sem=local_sems.at[slot, 4],
+            ).start(priority=priority)
+            if w1_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=w1_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w1_scale_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 4],
+                ).start(priority=priority)
+            if w3_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=w3_scale_hbm.at[
+                        local_e_id,
+                        pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
+                    ],
+                    dst_ref=b_w3_scale_x2_vmem.at[slot, p],
+                    sem=local_sems.at[slot, 4],
+                ).start(priority=priority)
+
+    def wait_fetch_w13_packed(slot):
+        if disable_weight_load:
+            return
+        pltpu.make_async_copy(
+            src_ref=b_w13_x2_vmem.at[slot],
+            dst_ref=b_w13_x2_vmem.at[slot],
+            sem=local_sems.at[slot, 4],
+        ).wait()
+        if w1_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w1_scale_x2_vmem.at[slot],
+                dst_ref=b_w1_scale_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 4],
+            ).wait()
+        if w3_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=b_w3_scale_x2_vmem.at[slot],
+                dst_ref=b_w3_scale_x2_vmem.at[slot],
+                sem=local_sems.at[slot, 4],
+            ).wait()
+
+    def start_fetch_w13_unified(local_e_id, slot, bf_id, priority=1):
+        """Mode-aware W1/W3 issue. For fused_w13_mode in {schedule, packed} only."""
+        if fused_w13_mode == "schedule":
+            start_fetch_w13_schedule(local_e_id, slot, bf_id, priority=priority)
+        elif fused_w13_mode == "packed":
+            start_fetch_w13_packed(local_e_id, slot, bf_id, priority=priority)
+        else:
+            raise ValueError(f"start_fetch_w13_unified called with {fused_w13_mode=}")
+
+    def wait_fetch_w13_unified(slot):
+        if fused_w13_mode == "schedule":
+            wait_fetch_w13_schedule(slot)
+        elif fused_w13_mode == "packed":
+            wait_fetch_w13_packed(slot)
+        else:
+            raise ValueError(f"wait_fetch_w13_unified called with {fused_w13_mode=}")
+
     def start_fetch_w2(local_e_id, slot, bf_id, priority=0):
         if disable_weight_load or disable_w2_load:
             return
@@ -1246,8 +1433,11 @@ def _fused_ep_moe_kernel(
 
         @pl.when(has_tokens_to_prefetch)
         def _():
-            start_fetch_w1(safe_local_e_id, slot, 0, priority=priority)
-            start_fetch_w3(safe_local_e_id, slot, 0, priority=priority)
+            if fused_w13_mode == "separate":
+                start_fetch_w1(safe_local_e_id, slot, 0, priority=priority)
+                start_fetch_w3(safe_local_e_id, slot, 0, priority=priority)
+            else:
+                start_fetch_w13_unified(safe_local_e_id, slot, 0, priority=priority)
             if include_w2:
                 start_fetch_w2(safe_local_e_id, slot, 0, priority=priority)
 
@@ -1261,11 +1451,17 @@ def _fused_ep_moe_kernel(
                 bf_id,
                 priority=w2_fetch_priority,
             )
-            start_fetch_w1(local_e_id, slot, bf_id, priority=1)
-            start_fetch_w3(local_e_id, slot, bf_id, priority=1)
+            if fused_w13_mode == "separate":
+                start_fetch_w1(local_e_id, slot, bf_id, priority=1)
+                start_fetch_w3(local_e_id, slot, bf_id, priority=1)
+            else:
+                start_fetch_w13_unified(local_e_id, slot, bf_id, priority=1)
         else:
-            start_fetch_w1(local_e_id, slot, bf_id, priority=1)
-            start_fetch_w3(local_e_id, slot, bf_id, priority=1)
+            if fused_w13_mode == "separate":
+                start_fetch_w1(local_e_id, slot, bf_id, priority=1)
+                start_fetch_w3(local_e_id, slot, bf_id, priority=1)
+            else:
+                start_fetch_w13_unified(local_e_id, slot, bf_id, priority=1)
             if include_w2:
                 start_fetch_w2(
                     local_e_id,
@@ -1426,8 +1622,11 @@ def _fused_ep_moe_kernel(
             # accounting leaks +1 per layer.
             @pl.when(bf0_prefetched)
             def _drain_metadata_window_bf0():
-                wait_fetch_w1(0)
-                wait_fetch_w3(0)
+                if fused_w13_mode == "separate":
+                    wait_fetch_w1(0)
+                    wait_fetch_w3(0)
+                else:
+                    wait_fetch_w13_unified(0)
 
             return start_prefetch_expert_bf0(
                 bt_sem_id,
@@ -1501,7 +1700,21 @@ def _fused_ep_moe_kernel(
                     next_bf_id = bf_id + 2
 
                     if direct_scaled_dot_ffn1 and w1_scale_hbm is not None and bt <= 16:
-                        wait_fetch_w1(slot)
+                        # J6.3 fused-w13: drain pattern depends on mode. For separate
+                        # we keep the original two-stage drain (gate -> wait_w3 -> up).
+                        # For schedule/packed, all of W1+W3 (and packed W13) drained at
+                        # once before either gate or up loop.
+                        if fused_w13_mode == "separate":
+                            wait_fetch_w1(slot)
+                        else:
+                            wait_fetch_w13_unified(slot)
+
+                        # Source-ref helper: in packed mode W1 lives at b_w13[..., 0:bf]
+                        # and W3 at b_w13[..., bf:2*bf]; otherwise read from b_w1/b_w3.
+                        def _w1_w3_view():
+                            if fused_w13_mode == "packed":
+                                return b_w13_x2_vmem, b_w13_x2_vmem, 0, bf
+                            return b_w1_x2_vmem, b_w3_x2_vmem, 0, 0
 
                         def _gate_only_btc(btc_id, ___):
                             gate = jnp.zeros((btc, bf), dtype=jnp.float32)
@@ -1516,8 +1729,12 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_off, quant_block_k),
                                         ]
                                         x_slice = maybe_cast_ffn1_input(x_slice)
-                                        w1_tile = b_w1_x2_vmem[
-                                            slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)
+                                        w1_buf, _, w1_off, _ = _w1_w3_view()
+                                        w1_tile = w1_buf[
+                                            slot,
+                                            _pid,
+                                            pl.ds(sg_off, quant_block_k),
+                                            pl.ds(w1_off, bf),
                                         ]
                                         d1 = jnp.dot(
                                             x_slice, w1_tile, preferred_element_type=jnp.float32
@@ -1535,7 +1752,9 @@ def _fused_ep_moe_kernel(
 
                         lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
 
-                        wait_fetch_w3(slot)
+                        # Separate mode: drain W3 here. Schedule/packed already drained.
+                        if fused_w13_mode == "separate":
+                            wait_fetch_w3(slot)
 
                         def _up_only_btc(btc_id, ___):
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
@@ -1550,8 +1769,12 @@ def _fused_ep_moe_kernel(
                                             pl.ds(sg_off, quant_block_k),
                                         ]
                                         x_slice = maybe_cast_ffn1_input(x_slice)
-                                        w3_tile = b_w3_x2_vmem[
-                                            slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)
+                                        _, w3_buf, _, w3_off = _w1_w3_view()
+                                        w3_tile = w3_buf[
+                                            slot,
+                                            _pid,
+                                            pl.ds(sg_off, quant_block_k),
+                                            pl.ds(w3_off, bf),
                                         ]
                                         d3 = jnp.dot(
                                             x_slice, w3_tile, preferred_element_type=jnp.float32
@@ -1570,8 +1793,13 @@ def _fused_ep_moe_kernel(
                         lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
 
                     elif direct_scaled_dot_ffn1 and w1_scale_hbm is not None:
-                        wait_fetch_w1(slot)
-                        wait_fetch_w3(slot)
+                        # J6.3 fused-w13: only "separate" mode supported on this path.
+                        # The packed compute path is wired into the bt<=16 branch only.
+                        if fused_w13_mode == "separate":
+                            wait_fetch_w1(slot)
+                            wait_fetch_w3(slot)
+                        else:
+                            wait_fetch_w13_unified(slot)
 
                         def gate_up_btc_direct(btc_id, ___):
                             gate = jnp.zeros((btc, bf), dtype=jnp.float32)
@@ -1647,8 +1875,11 @@ def _fused_ep_moe_kernel(
                         lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
 
                     elif ffn1_use_chunked_dequant:
-                        wait_fetch_w1(slot)
-                        wait_fetch_w3(slot)
+                        if fused_w13_mode == "separate":
+                            wait_fetch_w1(slot)
+                            wait_fetch_w3(slot)
+                        else:
+                            wait_fetch_w13_unified(slot)
 
                         for fchunk_id in range(num_ffn1_chunks):
                             bf_off = fchunk_id * ffn1_chunk
@@ -1808,8 +2039,11 @@ def _fused_ep_moe_kernel(
                             )
 
                     else:
-                        wait_fetch_w1(slot)
-                        wait_fetch_w3(slot)
+                        if fused_w13_mode == "separate":
+                            wait_fetch_w1(slot)
+                            wait_fetch_w3(slot)
+                        else:
+                            wait_fetch_w13_unified(slot)
                         dequant_w1(slot)
                         dequant_w3(slot)
 
@@ -2519,6 +2753,7 @@ def jax_allreduce_metadata_by_bt(
         "skip_inter_bt_sync",
         "interleave_bt",
         "metadata_window_prefetch_first_expert",
+        "fused_w13_mode",
     ],
 )
 def fused_ep_moe_v2(
@@ -2584,9 +2819,16 @@ def fused_ep_moe_v2(
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     metadata_window_prefetch_first_expert: bool = False,
+    # J6.3 fused-w13 prototype: see _fused_ep_moe_kernel doc above.
+    fused_w13_mode: str = "separate",
+    w13: jax.Array | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
+    if fused_w13_mode not in ("separate", "schedule", "packed"):
+        raise ValueError(f"Unsupported {fused_w13_mode=}; expected separate / schedule / packed.")
+    if fused_w13_mode == "packed" and w13 is None:
+        raise ValueError("fused_w13_mode='packed' requires w13 (packed weight) to be provided.")
     if cross_expert_prefetch_mode not in ("none", "full", "w13"):
         raise ValueError(
             f"Unsupported {cross_expert_prefetch_mode=}; "
@@ -2803,6 +3045,12 @@ def fused_ep_moe_v2(
         pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w1.dtype),  # W1
         pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w3.dtype),  # W3
         pltpu.VMEM((wb_slots, t_packing, bf, h_per_t), w2.dtype),  # W2
+        # J6.3: b_w13_x2_vmem only when packed; covers (h_per_t, 2*bf) per p.
+        (
+            None
+            if fused_w13_mode != "packed"
+            else pltpu.VMEM((wb_slots, t_packing, h_per_t, 2 * bf), w1.dtype)
+        ),  # W13 packed
         # VMEM: scale double buffers (None when not quantized)
         (
             None
@@ -2944,6 +3192,7 @@ def fused_ep_moe_v2(
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
                 metadata_window_prefetch_first_expert=metadata_window_prefetch_first_expert,
+                fused_w13_mode=fused_w13_mode,
                 bt=bt,
                 bf=bf,
                 btc=btc,
@@ -2959,6 +3208,8 @@ def fused_ep_moe_v2(
                     hbm_spec,  # w1
                     hbm_spec,  # w2
                     hbm_spec,  # w3
+                    # J6.3: w13_hbm appears immediately after w3 (None unless packed)
+                    None if fused_w13_mode != "packed" else hbm_spec,  # w13
                     None if w1_scale is None else hbm_spec,  # w1_scale
                     None if w2_scale is None else hbm_spec,  # w2_scale
                     None if w3_scale is None else hbm_spec,  # w3_scale
@@ -2987,6 +3238,8 @@ def fused_ep_moe_v2(
         )
     )
 
+    _w13_in_spec = P((dp_axis_name, tp_axis_name)) if fused_w13_mode == "packed" else None
+
     @jax.jit
     @jax.shard_map(
         mesh=mesh,
@@ -2995,6 +3248,7 @@ def fused_ep_moe_v2(
             P((dp_axis_name, tp_axis_name)),  # w1
             P((dp_axis_name, tp_axis_name)),  # w2
             P((dp_axis_name, tp_axis_name)),  # w3
+            _w13_in_spec,  # w13 (packed only)
             None if w1_scale is None else P((dp_axis_name, tp_axis_name)),  # w1_scale
             None if w2_scale is None else P((dp_axis_name, tp_axis_name)),  # w2_scale
             None if w3_scale is None else P((dp_axis_name, tp_axis_name)),  # w3_scale
@@ -3015,6 +3269,7 @@ def fused_ep_moe_v2(
         w1,
         w2,
         w3,
+        w13_arg,
         w1_scale_arg,
         w2_scale_arg,
         w3_scale_arg,
@@ -3049,6 +3304,7 @@ def fused_ep_moe_v2(
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),
             pltpu.with_memory_space_constraint(w3, pltpu.HBM),
+            (None if w13_arg is None else pltpu.with_memory_space_constraint(w13_arg, pltpu.HBM)),
             (
                 None
                 if w1_scale_arg is None
@@ -3105,6 +3361,7 @@ def fused_ep_moe_v2(
         w1,
         w2,
         w3,
+        w13,  # J6.3: None unless fused_w13_mode == "packed"
         w1_scale,
         w2_scale,
         w3_scale,
