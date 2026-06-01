@@ -639,7 +639,14 @@ def calculate_tiling(
 
     # Calculate vmem limit for a single rhs buffer when using triple buffers.
     num_rhs_buffers = 3
-    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
+    # Reserve headroom for the lhs buffers, f32 accumulator, fp8 scales, and
+    # register-allocator spill slots, which this heuristic otherwise ignores.
+    # Without it, large-expert fp8 shapes (e.g. grok-2 k=8192, n=16384) let the
+    # 3 triple-buffered rhs tiles consume the entire VMEM budget, overflowing by
+    # the size of those other allocations (~1.8M observed on TPU v7x / libtpu
+    # 0.0.30). Budgeting ~80% of VMEM to the rhs tiles leaves room for the rest.
+    rhs_vmem_budget = vmem_limit_bytes * 4 // 5
+    rhs_vmem_target = rhs_vmem_budget // num_rhs_buffers
     base_rhs_size_bytes = dims.size_k * dims.size_n * rhs_bits // 8
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
