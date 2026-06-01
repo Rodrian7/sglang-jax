@@ -25,6 +25,9 @@ Env vars:
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
   BENCH_D/F/E/TOPK — model dims (default: MiMo V2 Pro)
+  BENCH_PRINT_ROUTING_STATS — 1 to emit ROUTING_STATS_JSON (active experts, dyn_sz, remote)
+  BENCH_PRINT_PIPELINE_STATS — 1 to emit PIPELINE_STATS_JSON (R1 dynamic issue accounting:
+                               bts tiles + W1/W3/W2 weight/scale copy estimates from routing+loop)
 """
 
 from __future__ import annotations
@@ -297,6 +300,105 @@ def _compute_routing_stats(
     }
 
 
+def _compute_pipeline_stats(
+    topk_idx,
+    *,
+    num_tokens: int,
+    top_k_: int,
+    num_devices_: int,
+    num_experts_: int,
+    intermediate_size_: int,
+    bf_: int,
+    bts_: int,
+    t_packing_: int,
+    quant_block_k_: int,
+    xprefetch_: str,
+    w2_order_: str,
+    w2_priority_: int,
+) -> dict[str, Any]:
+    """R1 dynamic issue accounting (resource-bound plan).
+
+    Turns the *same* global topk_idx the kernel uses into logical workload
+    counts: how many active experts, bts tiles, and W1/W3/W2 weight + scale
+    copies the per-expert/per-bf/per-t_packing loop structure issues this run.
+
+    NOT a trace counter and NOT a timing — purely derived from routing + loop
+    shape, so each run's "workload volume" is explainable (e.g. separate W1+W3
+    logical copies vs packed W13, J6.3 argument). Reported per the device that
+    sees the median active-expert load (representative single-device picture).
+    """
+    from jax.experimental import multihost_utils
+
+    topk_global_np = np.asarray(multihost_utils.process_allgather(topk_idx, tiled=True)).reshape(
+        num_tokens, top_k_
+    )
+    local_num_experts_ = num_experts_ // num_devices_
+    dest_dev = (topk_global_np // local_num_experts_).reshape(-1)
+    dest_local_e = (topk_global_np % local_num_experts_).reshape(-1)
+
+    dyn_sz = np.zeros((num_devices_, local_num_experts_), dtype=np.int64)
+    np.add.at(dyn_sz, (dest_dev, dest_local_e), 1)
+
+    num_bf = -(-intermediate_size_ // bf_)  # ceil
+
+    # Per receiving device: bts tiles + weight copies issued by the expert loop.
+    per_dev_active = (dyn_sz > 0).sum(axis=1)
+    # ceil(dyn_sz / bts) over active experts, summed per device
+    bts_tiles = np.where(dyn_sz > 0, -(-dyn_sz // bts_), 0)
+    per_dev_bts_tiles = bts_tiles.sum(axis=1)
+
+    # Representative device = the one whose active-expert count is the median.
+    # Use argsort on active count, take middle, to avoid being skewed by an
+    # idle / overloaded device.
+    order = np.argsort(per_dev_active)
+    rep = int(order[len(order) // 2])
+
+    rep_active = int(per_dev_active[rep])
+    rep_bts_tiles = int(per_dev_bts_tiles[rep])
+    rep_dyn = sorted(int(x) for x in dyn_sz[rep] if x > 0)
+
+    # Weight copy estimate: each (bts tile, bf tile, t_packing) issues one
+    # weight async copy per path. W1 and W3 are separate copies; packed W13
+    # is one copy covering both.
+    w1_copies = rep_bts_tiles * num_bf * t_packing_
+    w3_copies = rep_bts_tiles * num_bf * t_packing_
+    w2_copies = rep_bts_tiles * num_bf * t_packing_
+    w13_packed_copies = rep_bts_tiles * num_bf * t_packing_
+    # Scale copies: one per path per (bts tile, bf tile, t_packing) when FP8.
+    scale_copies = w1_copies + w3_copies + w2_copies
+
+    hist: dict[int, int] = {}
+    for v in rep_dyn:
+        hist[v] = hist.get(v, 0) + 1
+
+    return {
+        "tokens": int(num_tokens),
+        "top_k": int(top_k_),
+        "num_devices": int(num_devices_),
+        "local_num_experts": int(local_num_experts_),
+        "representative_device": rep,
+        "active_experts_per_device": rep_active,
+        "dyn_sz_per_active_expert": rep_dyn,
+        "dyn_sz_histogram": {str(k): v for k, v in sorted(hist.items())},
+        "num_bf": int(num_bf),
+        "bf": int(bf_),
+        "bts": int(bts_),
+        "t_packing": int(t_packing_),
+        "quant_block_k": int(quant_block_k_),
+        "num_bts_tiles_sum": rep_bts_tiles,
+        "estimated_w1_weight_copies": int(w1_copies),
+        "estimated_w3_weight_copies": int(w3_copies),
+        "estimated_w13_separate_weight_copies": int(w1_copies + w3_copies),
+        "estimated_w13_packed_weight_copies": int(w13_packed_copies),
+        "estimated_w13_packed_reduction": int(w1_copies + w3_copies - w13_packed_copies),
+        "estimated_w2_weight_copies": int(w2_copies),
+        "estimated_scale_copies": int(scale_copies),
+        "xprefetch": xprefetch_,
+        "w2_order": w2_order_,
+        "w2_priority": int(w2_priority_),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -318,6 +420,10 @@ E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 print_routing_stats = os.environ.get("BENCH_PRINT_ROUTING_STATS", "0") == "1"
+# R1 dynamic issue accounting (resource-bound plan). Emits PIPELINE_STATS_JSON
+# with per-run logical workload counts (active experts, bts tiles, W1/W3/W2
+# weight+scale copy estimates). Bench-only, no kernel change.
+print_pipeline_stats = os.environ.get("BENCH_PRINT_PIPELINE_STATS", "0") == "1"
 bse = int(os.environ.get("BENCH_BSE", "256"))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
@@ -1043,6 +1149,29 @@ for num_tokens in token_candidates:
         )
         if jax.process_index() == 0:
             print(f"ROUTING_STATS_JSON={json.dumps(_stats)}", flush=True)
+
+    if print_pipeline_stats:
+        # Use the resolved baseline config (first candidate of each knob) for the
+        # logical workload accounting. R2+ sweeps that change bf/btc/bts re-run
+        # the whole bench per env, so each run's PIPELINE_STATS reflects its own
+        # config.
+        _pstats = _compute_pipeline_stats(
+            topk_idx,
+            num_tokens=num_tokens,
+            top_k_=top_k,
+            num_devices_=num_devices,
+            num_experts_=E,
+            intermediate_size_=f,
+            bf_=bf_candidates[0],
+            bts_=(bts_candidates[0] if bts_candidates and bts_candidates[0] else btc_candidates[0]),
+            t_packing_=2,
+            quant_block_k_=quant_block_k,
+            xprefetch_=cross_expert_prefetch_modes[0],
+            w2_order_=w2_fetch_orders[0],
+            w2_priority_=w2_fetch_priorities[0],
+        )
+        if jax.process_index() == 0:
+            print(f"PIPELINE_STATS_JSON={json.dumps(_pstats)}", flush=True)
 
     configs_to_try = [
         (bc_raw, *flags)
