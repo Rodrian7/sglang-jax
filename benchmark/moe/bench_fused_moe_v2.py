@@ -68,6 +68,7 @@ from jax.sharding import PartitionSpec as P
 from benchmark.moe.utils import (
     DEFAULT_NUM_TOKENS,
     MoEBenchmarkCase,
+    MoEImbalanceSimulator,
     build_mesh,
     make_moe_cases,
     prepare_fused_moe_inputs,
@@ -526,9 +527,22 @@ def run_all(
             include_weights=False,
             include_shared_expert=use_shared_expert,
         )
-        # Balanced placeholder logits (lean tuner: no imbalance simulation).
+        # Balanced routing (mirror v1 bench_fused_moe.py): build router_logits
+        # that yield an even per-expert load via MoEImbalanceSimulator. The
+        # all-zero placeholder from prepare_fused_moe_inputs would degenerate to
+        # every token picking experts 0..top_k-1 (one EP shard) → pathological
+        # A2A skew, ~5x slower kernel. "balanced" matches real decode load.
+        target_counts = MoEImbalanceSimulator.generate_counts(
+            case.num_tokens,
+            case.top_k,
+            case.num_experts,
+            mode="balanced",
+        )
+        custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
+            case.num_tokens, case.num_experts, case.top_k, target_counts
+        )
         data["router_logits"] = jax.device_put(
-            data["router_logits"], jax.sharding.NamedSharding(mesh, P("tensor", None))
+            custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
         )
 
         # Determine quant_block_k for FP8 quantization (mirror v1 default 256).
