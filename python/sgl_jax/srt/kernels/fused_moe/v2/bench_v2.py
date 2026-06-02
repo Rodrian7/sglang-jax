@@ -1,6 +1,6 @@
 """Standalone micro-bench for fused_ep_moe_v2.
 
-Trace-based timing (device_duration_ps) matches v1 bench methodology.
+Trace-based timing uses the same marker-based helper as the benchmark tuner.
 Supports config sweeping via comma-separated env vars.
 
 Env vars:
@@ -32,13 +32,10 @@ Env vars:
 
 from __future__ import annotations
 
-import gzip
 import itertools
 import json
 import math
 import os
-import pathlib
-import re
 import sys
 import time
 from typing import Any
@@ -48,142 +45,31 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../../"))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from benchmark.utils import multiple_iteration_timeit_from_trace
+
 t0 = time.time()
-KERNEL_NAME_RE = re.compile(r"fused-moe-v2-k_.*")
-TRACE_ROOT = "/tmp/tpu_logs/v2_trace"
+TRACE_ROOT = os.environ.get("BENCH_TRACE_ROOT", "/tmp/tpu_logs/v2_trace")
+TRACE_TASK = "fused-moe-v2-k_.*"
 
 
 def log(msg):
     print(f"[{time.time()-t0:.1f}s][p{jax.process_index()}] {msg}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Trace timing (mirrors benchmark/utils.py)
-# ---------------------------------------------------------------------------
-
-
-def _load_trace(trace_root: str) -> dict[str, Any]:
-    trace_dir = pathlib.Path(trace_root) / "plugins" / "profile"
-    if not trace_dir.exists():
-        raise FileNotFoundError(f"No trace output under {trace_dir}")
-    latest_dir = max(trace_dir.iterdir(), key=os.path.getmtime)
-    trace_files = list(latest_dir.glob("*.trace.json.gz"))
-    if not trace_files:
-        raise FileNotFoundError(f"No trace json.gz under {latest_dir}")
-    combined: dict[str, Any] = {"traceEvents": []}
-    for tf in sorted(trace_files):
-        with gzip.open(tf, "rb") as fh:
-            shard = json.load(fh)
-        events = shard.get("traceEvents", [])
-        if isinstance(events, list):
-            combined["traceEvents"].extend(events)
-    return combined
-
-
-def _extract_durations_ms(trace: dict[str, Any]) -> list[float]:
-    """Extract per-iteration device durations for the v2 kernel from trace.
-
-    Matches events by kernel name regex (same approach as v1 bench),
-    extracts device_duration_ps for accurate on-device timing.
-    """
-    matched = [
-        e for e in trace.get("traceEvents", []) if "name" in e and KERNEL_NAME_RE.match(e["name"])
-    ]
-    if not matched:
-        return []
-    by_pid: dict[int, list[dict[str, Any]]] = {}
-    for e in matched:
-        pid = e.get("pid")
-        if isinstance(pid, int):
-            by_pid.setdefault(pid, []).append(e)
-    durations: dict[int, list[float]] = {}
-    for pid, evts in by_pid.items():
-        evts.sort(key=lambda x: float(x.get("ts", 0)))
-        d: list[float] = []
-        for e in evts:
-            args = e.get("args", {})
-            if args.get("device_duration_ps"):
-                d.append(float(args["device_duration_ps"]) / 1e9)
-            elif "dur" in e:
-                d.append(float(e["dur"]) / 1e3)
-        if d:
-            durations[pid] = d
-    if not durations:
-        return []
-    return max(sorted(durations.items()), key=lambda kv: len(kv[1]))[1]
-
-
-def _kernel_durations_from_xplane(trace_dir: str) -> list[float]:
-    """Per-invocation kernel device durations (ms) via Tensor-Core burst clustering.
-
-    Robust timing source for tuning: the chrome-trace kernel-name regex does not
-    match the v2 pallas_call name on current libtpu, so we parse the xplane.pb
-    directly and cluster Tensor Core bundle offsets into per-call bursts
-    (gap > 20us). Returns [] if xplane_pb2 unavailable or no device bursts found,
-    so callers fall back to the chrome-trace path.
-    """
-    try:
-        from tensorflow.tsl.profiler.protobuf import xplane_pb2
-    except Exception:
-        return []
-    import glob as _glob
-
-    pbs = _glob.glob(os.path.join(trace_dir, "**", "*.xplane.pb"), recursive=True)
-    if not pbs:
-        return []
-    sp = xplane_pb2.XSpace()
-    with open(max(pbs, key=os.path.getmtime), "rb") as _fh:
-        sp.ParseFromString(_fh.read())
-    for plane in sp.planes:
-        if plane.name != "/device:TPU:0":
-            continue
-        offs = sorted(
-            e.offset_ps / 1e6
-            for line in plane.lines
-            if line.name == "Tensor Core"
-            for e in line.events
-        )
-        if not offs:
-            return []
-        bursts, cur = [], [offs[0]]
-        for x in offs[1:]:
-            if x - cur[-1] > 20.0:
-                bursts.append(cur)
-                cur = [x]
-            else:
-                cur.append(x)
-        bursts.append(cur)
-        durs_us = [b[-1] - b[0] for b in bursts if len(b) > 50]
-        body = durs_us[1:] if len(durs_us) > 2 else durs_us
-        return [d / 1e3 for d in body]  # us -> ms
-    return []
-
-
 def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
-    """Warmup then profile *iters* calls, return per-iter device durations (ms)."""
-    for _ in range(warmup):
-        out = run_fn()
-        jax.block_until_ready(out)
-
-    tag = f"{os.getpid()}_{int(time.time())}"
-    trace_dir = os.path.join(TRACE_ROOT, f"run_{tag}")
-    os.makedirs(trace_dir, exist_ok=True)
-
-    with jax.profiler.trace(trace_dir):
-        for i in range(iters):
-            out = run_fn()
-            jax.block_until_ready(out)
-
-    if jax.process_index() != 0:
-        return []
-    xplane_durs = _kernel_durations_from_xplane(trace_dir)
-    if xplane_durs:
-        return xplane_durs
-    try:
-        trace = _load_trace(trace_dir)
-        return _extract_durations_ms(trace)
-    except FileNotFoundError:
-        return []
+    """Warmup then profile calls with the canonical marker-based trace timer."""
+    return multiple_iteration_timeit_from_trace(
+        compute_func=lambda: run_fn(),
+        data_generator=lambda: (),
+        task=TRACE_TASK,
+        tries=iters,
+        warmup=warmup,
+        trace_root=TRACE_ROOT,
+    )
 
 
 def wall_timeit(run_fn, warmup: int, iters: int) -> list[float]:
