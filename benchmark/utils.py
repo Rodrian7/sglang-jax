@@ -126,7 +126,19 @@ def _kernel_device_durations_from_xplane(trace_dir: str) -> list[float]:
     found, so callers fall back to the marker-step path.
     """
     try:
-        from tensorflow.tsl.profiler.protobuf import xplane_pb2
+        xplane_pb2 = None
+        for _modpath in (
+            "tensorflow.tsl.profiler.protobuf",
+            "tensorflow.core.profiler.protobuf",
+            "tsl.profiler.protobuf",
+        ):
+            try:
+                xplane_pb2 = __import__(_modpath + ".xplane_pb2", fromlist=["xplane_pb2"])
+                break
+            except Exception:
+                continue
+        if xplane_pb2 is None:
+            return []
     except Exception:
         return []
     prof = pathlib.Path(trace_dir) / "plugins" / "profile"
