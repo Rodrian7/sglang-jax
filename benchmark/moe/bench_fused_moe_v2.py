@@ -404,6 +404,7 @@ def run_all(
     weight_dtype: jnp.dtype = jnp.float8_e4m3fn,
     dtype: jnp.dtype = jnp.bfloat16,
     warmup_iters: int = 1,
+    trace_root: str = "/tmp/sglang_jax_moe_trace",
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
@@ -710,6 +711,7 @@ def run_all(
                         task=task,
                         tries=iters,
                         warmup=warmup_iters,
+                        trace_root=trace_root,
                     )
                 except ValueError as e:
                     print(f"SKIP fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}], reason: {e}")
@@ -855,6 +857,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune fused_ep_moe_v2 block configs.")
     parser.add_argument("--iters", type=int, default=20, help="Number of benchmark iterations.")
     parser.add_argument(
+        "--trace-root",
+        type=str,
+        default="/tmp/sglang_jax_moe_trace",
+        help="Where jax.profiler.trace writes (point at the artifact dir to persist traces).",
+    )
+    parser.add_argument(
         "--warmup-iters",
         type=int,
         default=5,
@@ -963,6 +971,7 @@ if __name__ == "__main__":
             args.iters,
             weight_dtype=weight_dtype,
             warmup_iters=args.warmup_iters,
+            trace_root=args.trace_root,
             tune_block_config=args.tune_block_config,
             bt_candidates=args.bt_candidates,
             bts_candidates=args.bts_candidates,
