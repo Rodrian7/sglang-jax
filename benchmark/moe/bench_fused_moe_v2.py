@@ -710,6 +710,7 @@ def run_all(
                         task=task,
                         tries=iters,
                         warmup=warmup_iters,
+                        kernel_device_from_xplane=True,
                     )
                 except ValueError as e:
                     print(f"SKIP fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}], reason: {e}")
