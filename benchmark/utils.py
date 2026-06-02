@@ -114,72 +114,6 @@ def _load_trace(trace_root: str) -> dict[str, Any]:
     return combined
 
 
-def _kernel_device_durations_from_xplane(trace_dir: str) -> list[float]:
-    """Per-invocation kernel DEVICE time (ms) via Tensor-Core burst clustering.
-
-    Isolates the on-device compute window (first..last Tensor Core bundle of one
-    kernel invocation, bursts split on >20us gaps), excluding host dispatch /
-    block_until_ready wall time that otherwise dominates the marker-step span for
-    tiny ops (e.g. small-batch decode). Robust across libtpu versions, unlike
-    matching the kernel custom-call XLA Op which is not always surfaced as a
-    discrete op. Returns [] if xplane_pb2 is unavailable or no device bursts are
-    found, so callers fall back to the marker-step path.
-    """
-    try:
-        xplane_pb2 = None
-        for _modpath in (
-            "tensorflow.tsl.profiler.protobuf",
-            "tensorflow.core.profiler.protobuf",
-            "tsl.profiler.protobuf",
-        ):
-            try:
-                xplane_pb2 = __import__(_modpath + ".xplane_pb2", fromlist=["xplane_pb2"])
-                break
-            except Exception:
-                continue
-        if xplane_pb2 is None:
-            return []
-    except Exception:
-        return []
-    prof = pathlib.Path(trace_dir) / "plugins" / "profile"
-    if not prof.exists():
-        return []
-    candidates = [d for d in prof.iterdir() if d.is_dir()]
-    if not candidates:
-        return []
-    latest = max(candidates, key=os.path.getmtime)
-    pbs = list(latest.glob("*.xplane.pb"))
-    if not pbs:
-        return []
-    space = xplane_pb2.XSpace()
-    with open(max(pbs, key=os.path.getmtime), "rb") as fh:
-        space.ParseFromString(fh.read())
-    for plane in space.planes:
-        if plane.name != "/device:TPU:0":
-            continue
-        offs = sorted(
-            e.offset_ps / 1e6
-            for line in plane.lines
-            if line.name == "Tensor Core"
-            for e in line.events
-        )
-        if not offs:
-            return []
-        bursts: list[list[float]] = []
-        cur = [offs[0]]
-        for x in offs[1:]:
-            if x - cur[-1] > 20.0:
-                bursts.append(cur)
-                cur = [x]
-            else:
-                cur.append(x)
-        bursts.append(cur)
-        durs_us = [b[-1] - b[0] for b in bursts if len(b) > 50]
-        body = durs_us[1:] if len(durs_us) > 2 else durs_us
-        return [d / 1e3 for d in body]  # us -> ms
-    return []
-
-
 def multiple_iteration_timeit_from_trace(
     compute_func,
     data_generator,
@@ -187,15 +121,9 @@ def multiple_iteration_timeit_from_trace(
     tries: int = 5,
     warmup: int = 0,
     trace_root: str = "/tmp/sglang_jax_moe_trace",
-    kernel_device_from_xplane: bool = False,
 ) -> list[float]:
     """
     Profile multiple iterations and pull per-iteration kernel time from trace.
-
-    With ``kernel_device_from_xplane=True``, returns the on-device kernel compute
-    window (Tensor-Core burst span) instead of the host marker-step wall. Use this
-    for tiny ops where host dispatch / sync dominates the marker span. Defaults to
-    False (original marker-step behavior; v1 callers unchanged).
     """
     trace_name = f"{task}_" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     trace_dir = os.path.join(trace_root, trace_name)
@@ -215,11 +143,6 @@ def multiple_iteration_timeit_from_trace(
                 with jax.named_scope(f"{MARKER}_{i}"):
                     out = compute_func(*data_args)
                     jax.block_until_ready(out)
-
-    if kernel_device_from_xplane:
-        kernel_durs = _kernel_device_durations_from_xplane(trace_dir)
-        if kernel_durs:
-            return kernel_durs
 
     trace = _load_trace(trace_dir)
     return _extract_marker_durations_ms(trace, task=task)
