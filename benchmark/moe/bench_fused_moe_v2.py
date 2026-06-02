@@ -54,10 +54,13 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import itertools
+import json
 import math
 import sys
 import traceback
 from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -247,6 +250,146 @@ def _estimate_vmem_bytes_v2(
     return total
 
 
+def _compute_routing_stats(
+    topk_idx: jax.Array,
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_devices: int,
+    num_experts: int,
+    routing_mode: str,
+) -> dict[str, Any]:
+    from jax.experimental import multihost_utils
+
+    topk_global_np = np.asarray(multihost_utils.process_allgather(topk_idx, tiled=True)).reshape(
+        num_tokens, top_k
+    )
+    local_num_experts = num_experts // num_devices
+    tokens_per_dev = num_tokens // num_devices
+
+    src_dev = np.arange(num_tokens, dtype=np.int64) // tokens_per_dev
+    src_dev_bc = np.broadcast_to(src_dev[:, None], (num_tokens, top_k))
+    dest_dev = topk_global_np // local_num_experts
+    dest_local_e = topk_global_np % local_num_experts
+    is_remote = src_dev_bc != dest_dev
+
+    flat_dest_dev = dest_dev.reshape(-1)
+    flat_dest_local_e = dest_local_e.reshape(-1)
+    flat_src_dev = src_dev_bc.reshape(-1)
+    flat_is_remote = is_remote.reshape(-1).astype(np.int64)
+
+    dyn_sz = np.zeros((num_devices, local_num_experts), dtype=np.int64)
+    remote_routes = np.zeros((num_devices, local_num_experts), dtype=np.int64)
+    np.add.at(dyn_sz, (flat_dest_dev, flat_dest_local_e), 1)
+    np.add.at(remote_routes, (flat_dest_dev, flat_dest_local_e), flat_is_remote)
+
+    sender_fanin = np.zeros((num_devices, local_num_experts), dtype=np.int64)
+    sender_seen = [[set() for _ in range(local_num_experts)] for _ in range(num_devices)]
+    for r, loc_e, s in zip(
+        flat_dest_dev.tolist(), flat_dest_local_e.tolist(), flat_src_dev.tolist()
+    ):
+        sender_seen[r][loc_e].add(s)
+    for r in range(num_devices):
+        for loc_e in range(local_num_experts):
+            sender_fanin[r, loc_e] = len(sender_seen[r][loc_e])
+
+    active = dyn_sz > 0
+    active_per_dev = active.sum(axis=1)
+    dyn_active = dyn_sz[active] if active.any() else np.zeros(1, dtype=np.int64)
+    remote_active = remote_routes[active] if active.any() else np.zeros(1, dtype=np.int64)
+
+    return {
+        "tokens": int(num_tokens),
+        "top_k": int(top_k),
+        "num_devices": int(num_devices),
+        "num_experts": int(num_experts),
+        "local_num_experts": int(local_num_experts),
+        "routing_mode": routing_mode,
+        "active_experts_mean": float(active_per_dev.mean()),
+        "active_experts_p90": float(np.percentile(active_per_dev, 90)),
+        "dyn_sz_mean": float(dyn_active.mean()),
+        "dyn_sz_p90": float(np.percentile(dyn_active, 90)),
+        "dyn_sz_max": int(dyn_active.max()),
+        "remote_routes_mean": float(remote_active.mean()),
+        "remote_routes_p90": float(np.percentile(remote_active, 90)),
+        "max_sender_fan_in": int(sender_fanin.max()),
+        "expert0_active_pct": float((topk_global_np == 0).any()),
+    }
+
+
+def _compute_pipeline_stats(
+    topk_idx: jax.Array,
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_devices: int,
+    num_experts: int,
+    intermediate_size: int,
+    bf: int,
+    bts: int,
+    t_packing: int,
+    quant_block_k: int,
+    xprefetch: str,
+    w2_order: str,
+    w2_priority: int,
+) -> dict[str, Any]:
+    from jax.experimental import multihost_utils
+
+    topk_global_np = np.asarray(multihost_utils.process_allgather(topk_idx, tiled=True)).reshape(
+        num_tokens, top_k
+    )
+    local_num_experts = num_experts // num_devices
+    dest_dev = (topk_global_np // local_num_experts).reshape(-1)
+    dest_local_e = (topk_global_np % local_num_experts).reshape(-1)
+
+    dyn_sz = np.zeros((num_devices, local_num_experts), dtype=np.int64)
+    np.add.at(dyn_sz, (dest_dev, dest_local_e), 1)
+
+    num_bf = -(-intermediate_size // bf)
+    per_dev_active = (dyn_sz > 0).sum(axis=1)
+    bts_tiles = np.where(dyn_sz > 0, -(-dyn_sz // bts), 0)
+    per_dev_bts_tiles = bts_tiles.sum(axis=1)
+    rep = int(np.argsort(per_dev_active)[len(per_dev_active) // 2])
+
+    rep_dyn = sorted(int(x) for x in dyn_sz[rep] if x > 0)
+    hist: dict[int, int] = {}
+    for v in rep_dyn:
+        hist[v] = hist.get(v, 0) + 1
+
+    rep_bts_tiles = int(per_dev_bts_tiles[rep])
+    w1_copies = rep_bts_tiles * num_bf * t_packing
+    w3_copies = rep_bts_tiles * num_bf * t_packing
+    w2_copies = rep_bts_tiles * num_bf * t_packing
+    w13_packed_copies = rep_bts_tiles * num_bf * t_packing
+
+    return {
+        "tokens": int(num_tokens),
+        "top_k": int(top_k),
+        "num_devices": int(num_devices),
+        "local_num_experts": int(local_num_experts),
+        "representative_device": rep,
+        "active_experts_per_device": int(per_dev_active[rep]),
+        "dyn_sz_per_active_expert": rep_dyn,
+        "dyn_sz_histogram": {str(k): v for k, v in sorted(hist.items())},
+        "num_bf": int(num_bf),
+        "bf": int(bf),
+        "bts": int(bts),
+        "t_packing": int(t_packing),
+        "quant_block_k": int(quant_block_k),
+        "num_bts_tiles_sum": rep_bts_tiles,
+        "estimated_w1_weight_copies": int(w1_copies),
+        "estimated_w3_weight_copies": int(w3_copies),
+        "estimated_w13_separate_weight_copies": int(w1_copies + w3_copies),
+        "estimated_w13_packed_weight_copies": int(w13_packed_copies),
+        "estimated_w13_packed_reduction": int(w1_copies + w3_copies - w13_packed_copies),
+        "estimated_w2_weight_copies": int(w2_copies),
+        "estimated_scale_copies": int(w1_copies + w3_copies + w2_copies),
+        "xprefetch": xprefetch,
+        "w2_order": w2_order,
+        "w2_priority": int(w2_priority),
+    }
+
+
 def generate_v2_tune_candidates(
     *,
     intermediate_size: int,
@@ -410,6 +553,7 @@ def run_all(
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
+    btc_candidates: list[int] | None = None,
     bd_candidates: list[int] | None = None,
     bse_candidates: list[int] | None = None,
     num_tokens: list[int] | None = None,
@@ -426,6 +570,14 @@ def run_all(
     max_configs: int = 9,
     quant_block_k_override: int | None = None,
     metadata_mode: str = "direct",
+    print_routing_stats: bool = False,
+    print_pipeline_stats: bool = False,
+    routing_mode: str = "balanced",
+    disable_a2a: bool = False,
+    disable_dynamic_ffn1: bool = False,
+    disable_dynamic_ffn2: bool = False,
+    disable_weight_load: bool = False,
+    disable_sync_barrier: bool = False,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     use_shared_expert = False  # lean decode tuner: omitted
@@ -491,6 +643,19 @@ def run_all(
     print(
         f"  metadata_mode={metadata_mode}, shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}"
     )
+    active_ablation = [
+        name
+        for name, enabled in {
+            "disable_a2a": disable_a2a,
+            "disable_dynamic_ffn1": disable_dynamic_ffn1,
+            "disable_dynamic_ffn2": disable_dynamic_ffn2,
+            "disable_weight_load": disable_weight_load,
+            "disable_sync_barrier": disable_sync_barrier,
+        }.items()
+        if enabled
+    ]
+    if active_ablation:
+        print(f"  ablation_flags={active_ablation}")
     print(
         "  shape: "
         f"num_experts={num_experts}, top_k={top_k}, hidden_size={hidden_size}, "
@@ -527,23 +692,25 @@ def run_all(
             include_weights=False,
             include_shared_expert=use_shared_expert,
         )
-        # Balanced routing (mirror v1 bench_fused_moe.py): build router_logits
-        # that yield an even per-expert load via MoEImbalanceSimulator. The
-        # all-zero placeholder from prepare_fused_moe_inputs would degenerate to
-        # every token picking experts 0..top_k-1 (one EP shard) → pathological
-        # A2A skew, ~5x slower kernel. "balanced" matches real decode load.
-        target_counts = MoEImbalanceSimulator.generate_counts(
-            case.num_tokens,
-            case.top_k,
-            case.num_experts,
-            mode="balanced",
-        )
-        custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
-            case.num_tokens, case.num_experts, case.top_k, target_counts
-        )
-        data["router_logits"] = jax.device_put(
-            custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
-        )
+        if routing_mode == "balanced":
+            # Balanced routing mirrors v1 bench_fused_moe.py and avoids the
+            # all-zero placeholder's pathological single-shard skew.
+            target_counts = MoEImbalanceSimulator.generate_counts(
+                case.num_tokens,
+                case.top_k,
+                case.num_experts,
+                mode="balanced",
+            )
+            custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
+                case.num_tokens, case.num_experts, case.top_k, target_counts
+            )
+            data["router_logits"] = jax.device_put(
+                custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
+            )
+        elif routing_mode != "prepared":
+            raise ValueError(
+                f"Unsupported routing_mode={routing_mode!r}; expected balanced/prepared."
+            )
 
         # Determine quant_block_k for FP8 quantization (mirror v1 default 256).
         if quant_block_k_override is not None:
@@ -572,6 +739,11 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
+                disable_a2a=disable_a2a,
+                disable_dynamic_ffn1=disable_dynamic_ffn1,
+                disable_dynamic_ffn2=disable_dynamic_ffn2,
+                disable_weight_load=disable_weight_load,
+                disable_sync_barrier=disable_sync_barrier,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=1,
                 top_k_groups=1,
@@ -644,6 +816,32 @@ def run_all(
                         "  WARNING: no v2 candidates survived enumeration+validation for "
                         f"case={case.name}; nothing to time."
                     )
+            elif any(
+                candidates is not None
+                for candidates in (
+                    bt_candidates,
+                    bf_candidates,
+                    btc_candidates,
+                    bts_candidates,
+                    bse_candidates,
+                )
+            ):
+                bt_list = bt_candidates or [128]
+                bf_list = bf_candidates or [256]
+                btc_list = btc_candidates or [128]
+                bts_list = bts_candidates or [None]
+                bse_list = bse_candidates or [256]
+                v2_block_cfgs = [
+                    V2BlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
+                    for bt, bf, btc, bse, bts in itertools.product(
+                        bt_list,
+                        bf_list,
+                        btc_list,
+                        bse_list,
+                        bts_list,
+                    )
+                ]
+                print(f"  explicit v2 candidates: {len(v2_block_cfgs)}")
             else:
                 v2_block_cfgs = [None]
 
@@ -656,12 +854,60 @@ def run_all(
                 layer_id=0,
             )
 
+            if print_routing_stats or print_pipeline_stats:
+                _, topk_stats_ids = topk_module(data["router_logits"])
+                jax.block_until_ready(topk_stats_ids)
+                if print_routing_stats:
+                    stats = _compute_routing_stats(
+                        topk_stats_ids,
+                        num_tokens=case.num_tokens,
+                        top_k=case.top_k,
+                        num_devices=mesh_ep,
+                        num_experts=case.num_experts,
+                        routing_mode=routing_mode,
+                    )
+                    if jax.process_index() == 0:
+                        print(f"ROUTING_STATS_JSON={json.dumps(stats)}", flush=True)
+                if print_pipeline_stats:
+                    stat_cfg = next((cfg for cfg in v2_block_cfgs if cfg is not None), None)
+                    if stat_cfg is None:
+                        if jax.process_index() == 0:
+                            print(
+                                "PIPELINE_STATS_JSON_SKIPPED=block_config_none",
+                                flush=True,
+                            )
+                    else:
+                        stat_cfg_eff = stat_cfg.effective_for(
+                            num_tokens=case.num_tokens,
+                            ep_size=mesh_ep,
+                        )
+                        stats = _compute_pipeline_stats(
+                            topk_stats_ids,
+                            num_tokens=case.num_tokens,
+                            top_k=case.top_k,
+                            num_devices=mesh_ep,
+                            num_experts=case.num_experts,
+                            intermediate_size=case.intermediate_size,
+                            bf=stat_cfg_eff.bf,
+                            bts=stat_cfg_eff.bts,
+                            t_packing=2,
+                            quant_block_k=quant_block_k or 128,
+                            xprefetch="layer_default",
+                            w2_order="after_w13",
+                            w2_priority=1,
+                        )
+                        if jax.process_index() == 0:
+                            print(f"PIPELINE_STATS_JSON={json.dumps(stats)}", flush=True)
+
             moe_def, moe_state = nnx.split(fused_layer)
             moe_state_leaves, moe_state_def = jax.tree_util.tree_flatten(moe_state)
             topk_def, topk_state = nnx.split(topk_module)
             topk_state_leaves, topk_state_def = jax.tree_util.tree_flatten(topk_state)
 
-            @partial(jax.jit, static_argnames=("moe_state_def", "topk_state_def", "block_config"))
+            @partial(
+                jax.jit,
+                static_argnames=("moe_state_def", "topk_state_def", "block_config"),
+            )
             def run_v2(
                 tokens,
                 router_logits,
@@ -897,6 +1143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bt-candidates", type=int, nargs="+", help="Candidate list for bt.")
     parser.add_argument("--bts-candidates", type=int, nargs="+", help="Candidate list for bts.")
     parser.add_argument("--bf-candidates", type=int, nargs="+", help="Candidate list for bf.")
+    parser.add_argument("--btc-candidates", type=int, nargs="+", help="Candidate list for btc.")
     parser.add_argument(
         "--bd-candidates",
         type=int,
@@ -940,6 +1187,28 @@ def parse_args() -> argparse.Namespace:
         choices=["recursive", "direct", "jax"],
         help="v2 metadata mode (production decode mode for MiMo-V2-Pro is 'direct').",
     )
+    parser.add_argument(
+        "--routing-mode",
+        type=str,
+        default="balanced",
+        choices=["balanced", "prepared"],
+        help="Routing logits source. balanced mirrors the tuner; prepared uses helper defaults.",
+    )
+    parser.add_argument(
+        "--print-routing-stats",
+        action="store_true",
+        help="Emit ROUTING_STATS_JSON for the benchmark routing.",
+    )
+    parser.add_argument(
+        "--print-pipeline-stats",
+        action="store_true",
+        help="Emit PIPELINE_STATS_JSON for the first explicit/tuned v2 block config.",
+    )
+    parser.add_argument("--disable-a2a", action="store_true")
+    parser.add_argument("--disable-dynamic-ffn1", action="store_true")
+    parser.add_argument("--disable-dynamic-ffn2", action="store_true")
+    parser.add_argument("--disable-weight-load", action="store_true")
+    parser.add_argument("--disable-sync-barrier", action="store_true")
     parser.add_argument(
         "--tpu-vmem-budget-mb",
         type=int,
@@ -990,6 +1259,7 @@ if __name__ == "__main__":
             bt_candidates=args.bt_candidates,
             bts_candidates=args.bts_candidates,
             bf_candidates=args.bf_candidates,
+            btc_candidates=args.btc_candidates,
             bd_candidates=args.bd_candidates,
             bse_candidates=args.bse_candidates,
             num_tokens=args.num_tokens,
@@ -1006,6 +1276,14 @@ if __name__ == "__main__":
             max_configs=args.max_configs,
             quant_block_k_override=quant_block_k,
             metadata_mode=args.metadata_mode,
+            print_routing_stats=args.print_routing_stats,
+            print_pipeline_stats=args.print_pipeline_stats,
+            routing_mode=args.routing_mode,
+            disable_a2a=args.disable_a2a,
+            disable_dynamic_ffn1=args.disable_dynamic_ffn1,
+            disable_dynamic_ffn2=args.disable_dynamic_ffn2,
+            disable_weight_load=args.disable_weight_load,
+            disable_sync_barrier=args.disable_sync_barrier,
             return_results=True,
         )
     except BaseException as e:
