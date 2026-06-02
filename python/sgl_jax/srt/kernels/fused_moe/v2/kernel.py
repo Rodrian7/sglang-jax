@@ -56,7 +56,12 @@ class FusedMoEBlockConfig:
         bt = math.gcd(bt, local_num_tokens)
         max_bts = bt * ep_size
         bts = bt if self.bts is None else min(self.bts, max_bts)
-        btc = min(self.btc, bts)
+        if self.bts is None:
+            btc = min(self.btc, bts)
+        else:
+            btc = self.btc
+            if btc > bts:
+                raise ValueError(f"Expected explicit {self.btc=} <= resolved {bts=}.")
         if bts % btc != 0:
             raise ValueError(f"Expected {bts=} divisible by {btc=}.")
         bse = self.bf if self.bse is None else self.bse

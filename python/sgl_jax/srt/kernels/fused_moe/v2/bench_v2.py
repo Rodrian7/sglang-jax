@@ -1287,6 +1287,12 @@ for num_tokens in token_candidates:
         except ValueError as e:
             log(f"  SKIP {tag}: {e}")
             continue
+        if (bc.btc, bc.bts) != (bc_resolved.btc, bc_resolved.bts):
+            log(
+                "  RESOLVE "
+                f"requested btc={bc.btc},bts={bc.bts} -> "
+                f"effective btc={bc_resolved.btc},bts={bc_resolved.bts}"
+            )
 
         tag_resolved = (
             f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
