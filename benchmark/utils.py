@@ -72,6 +72,25 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
                 durations[pid] = pid_durations
         return durations
 
+    # Prefer the kernel op matched by name (the `task` regex, e.g.
+    # fused-moe-v2-k_*) using its on-device device_duration_ps. This is the real
+    # kernel device time; the host marker-step span is dispatch/sync-dominated and
+    # for tiny ops (small-batch decode) vastly overstates it. Fall back to the
+    # marker path when the kernel op is not surfaced as a named device event.
+    if task:
+        name_matcher = re.compile(task)
+        named_device_events = [
+            e
+            for e in trace.get("traceEvents", [])
+            if "name" in e
+            and name_matcher.match(e["name"])
+            and (e.get("args", {}) or {}).get("device_duration_ps")
+        ]
+        if named_device_events:
+            named_by_pid = _durations_by_pid(named_device_events)
+            if named_by_pid:
+                return max(sorted(named_by_pid.items()), key=lambda kv: len(kv[1]))[1]
+
     if not marker_events:
         if not task:
             return []
