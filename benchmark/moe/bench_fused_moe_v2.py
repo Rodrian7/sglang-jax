@@ -590,6 +590,12 @@ def run_all(
     disable_w1_load: bool = False,
     disable_w3_load: bool = False,
     disable_w2_load: bool = False,
+    disable_w1_scale_load: bool = False,
+    disable_w3_scale_load: bool = False,
+    disable_w2_scale_load: bool = False,
+    disable_w1_scale_apply: bool = False,
+    disable_w3_scale_apply: bool = False,
+    disable_w2_scale_apply: bool = False,
     disable_expert_x_load: bool = False,
     disable_expert_ffn: bool = False,
     disable_expert_store: bool = False,
@@ -689,6 +695,12 @@ def run_all(
             "disable_w1_load": disable_w1_load,
             "disable_w3_load": disable_w3_load,
             "disable_w2_load": disable_w2_load,
+            "disable_w1_scale_load": disable_w1_scale_load,
+            "disable_w3_scale_load": disable_w3_scale_load,
+            "disable_w2_scale_load": disable_w2_scale_load,
+            "disable_w1_scale_apply": disable_w1_scale_apply,
+            "disable_w3_scale_apply": disable_w3_scale_apply,
+            "disable_w2_scale_apply": disable_w2_scale_apply,
             "disable_expert_x_load": disable_expert_x_load,
             "disable_expert_ffn": disable_expert_ffn,
             "disable_expert_store": disable_expert_store,
@@ -810,6 +822,12 @@ def run_all(
                 disable_w1_load=disable_w1_load,
                 disable_w3_load=disable_w3_load,
                 disable_w2_load=disable_w2_load,
+                disable_w1_scale_load=disable_w1_scale_load,
+                disable_w3_scale_load=disable_w3_scale_load,
+                disable_w2_scale_load=disable_w2_scale_load,
+                disable_w1_scale_apply=disable_w1_scale_apply,
+                disable_w3_scale_apply=disable_w3_scale_apply,
+                disable_w2_scale_apply=disable_w2_scale_apply,
                 disable_expert_x_load=disable_expert_x_load,
                 disable_expert_ffn=disable_expert_ffn,
                 disable_expert_store=disable_expert_store,
@@ -1300,6 +1318,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-w1-load", action="store_true")
     parser.add_argument("--disable-w3-load", action="store_true")
     parser.add_argument("--disable-w2-load", action="store_true")
+    parser.add_argument("--disable-scale-load", action="store_true")
+    parser.add_argument("--disable-w1-scale-load", action="store_true")
+    parser.add_argument("--disable-w3-scale-load", action="store_true")
+    parser.add_argument("--disable-w2-scale-load", action="store_true")
+    parser.add_argument("--disable-scale-apply", action="store_true")
+    parser.add_argument("--disable-w1-scale-apply", action="store_true")
+    parser.add_argument("--disable-w3-scale-apply", action="store_true")
+    parser.add_argument("--disable-w2-scale-apply", action="store_true")
     parser.add_argument("--disable-expert-x-load", action="store_true")
     parser.add_argument("--disable-expert-ffn", action="store_true")
     parser.add_argument("--disable-expert-store", action="store_true")
@@ -1425,6 +1451,12 @@ if __name__ == "__main__":
             disable_w1_load=args.disable_w1_load,
             disable_w3_load=args.disable_w3_load,
             disable_w2_load=args.disable_w2_load,
+            disable_w1_scale_load=args.disable_scale_load or args.disable_w1_scale_load,
+            disable_w3_scale_load=args.disable_scale_load or args.disable_w3_scale_load,
+            disable_w2_scale_load=args.disable_scale_load or args.disable_w2_scale_load,
+            disable_w1_scale_apply=args.disable_scale_apply or args.disable_w1_scale_apply,
+            disable_w3_scale_apply=args.disable_scale_apply or args.disable_w3_scale_apply,
+            disable_w2_scale_apply=args.disable_scale_apply or args.disable_w2_scale_apply,
             disable_expert_x_load=args.disable_expert_x_load,
             disable_expert_ffn=args.disable_expert_ffn,
             disable_expert_store=args.disable_expert_store,
