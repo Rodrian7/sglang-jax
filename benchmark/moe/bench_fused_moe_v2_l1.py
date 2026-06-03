@@ -329,11 +329,9 @@ def _weight_dma_l1_kernel(
                     if next_bf_id < num_bf_tiles:
                         start_w13_w2(slot, next_bf_id)
     elif path == "empty_loop":
-        acc = jnp.float32(0.0)
-        for expert_i in range(num_expert_iters):
+        for _expert_i in range(num_expert_iters):
             for bf_id in range(num_bf_tiles):
-                acc += jnp.float32(expert_i + bf_id)
-        out_ref[0] = acc
+                _ = bf_id
     elif path == "sem_self_wait":
         for _expert_i in range(num_expert_iters):
             if drain_policy == "end":
@@ -355,7 +353,7 @@ def _weight_dma_l1_kernel(
                     if next_bf_id < num_bf_tiles:
                         start_sem_self_w13_w2(slot)
     else:
-        out_ref[0] = jnp.float32(0.0)
+        pass
 
 
 @functools.partial(
