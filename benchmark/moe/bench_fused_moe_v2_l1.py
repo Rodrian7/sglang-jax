@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import functools
 import os
+import statistics
 
 import jax
 import jax.numpy as jnp
@@ -516,7 +517,14 @@ def run(args: argparse.Namespace) -> None:
             warmup=args.warmup_iters,
             trace_root=trace_root,
         )
-        print(f"L1_WEIGHT_DMA_DONE name={scope_name} samples={len(times)}", flush=True)
+        mean_ms = statistics.mean(times) if times else float("nan")
+        p50_ms = statistics.median(times) if times else float("nan")
+        print(
+            "L1_WEIGHT_DMA_DONE "
+            f"name={scope_name} mean_ms={mean_ms:.6f} p50_ms={p50_ms:.6f} "
+            f"samples={times}",
+            flush=True,
+        )
 
 
 def parse_args() -> argparse.Namespace:
