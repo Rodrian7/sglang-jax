@@ -54,8 +54,6 @@ def _weight_dma_l1_kernel(
     w2_fetch_priority: int,
     drain_policy: str,
 ):
-    del out_ref
-
     local_e_id = jnp.int32(0)
     t_packing = w1_vmem.shape[1]
     h_per_t = w1_vmem.shape[2]
@@ -195,6 +193,91 @@ def _weight_dma_l1_kernel(
         wait_w3(slot)
         wait_w2(slot)
 
+    def start_sem_self_w1(slot, priority=1):
+        for p in range(t_packing):
+            pltpu.make_async_copy(
+                src_ref=w1_vmem.at[slot, p, pl.ds(0, h_per_t), pl.ds(0, payload_bf)],
+                dst_ref=w1_vmem.at[slot, p, pl.ds(0, h_per_t), pl.ds(0, payload_bf)],
+                sem=sems.at[slot, 0],
+            ).start(priority=priority)
+            pltpu.make_async_copy(
+                src_ref=w1_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, h_per_t // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, payload_bf),
+                ],
+                dst_ref=w1_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, h_per_t // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, payload_bf),
+                ],
+                sem=sems.at[slot, 0],
+            ).start(priority=priority)
+
+    def start_sem_self_w3(slot, priority=1):
+        for p in range(t_packing):
+            pltpu.make_async_copy(
+                src_ref=w3_vmem.at[slot, p, pl.ds(0, h_per_t), pl.ds(0, payload_bf)],
+                dst_ref=w3_vmem.at[slot, p, pl.ds(0, h_per_t), pl.ds(0, payload_bf)],
+                sem=sems.at[slot, 1],
+            ).start(priority=priority)
+            pltpu.make_async_copy(
+                src_ref=w3_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, h_per_t // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, payload_bf),
+                ],
+                dst_ref=w3_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, h_per_t // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, payload_bf),
+                ],
+                sem=sems.at[slot, 1],
+            ).start(priority=priority)
+
+    def start_sem_self_w2(slot, priority=1):
+        for p in range(t_packing):
+            pltpu.make_async_copy(
+                src_ref=w2_vmem.at[slot, p, pl.ds(0, payload_bf), pl.ds(0, h_per_t)],
+                dst_ref=w2_vmem.at[slot, p, pl.ds(0, payload_bf), pl.ds(0, h_per_t)],
+                sem=sems.at[slot, 2],
+            ).start(priority=priority)
+            pltpu.make_async_copy(
+                src_ref=w2_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, payload_bf // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, h_per_t),
+                ],
+                dst_ref=w2_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, payload_bf // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, h_per_t),
+                ],
+                sem=sems.at[slot, 2],
+            ).start(priority=priority)
+
+    def start_sem_self_w13_w2(slot):
+        if w2_fetch_order == "before_w13":
+            start_sem_self_w2(slot, priority=w2_fetch_priority)
+            start_sem_self_w1(slot, priority=1)
+            start_sem_self_w3(slot, priority=1)
+        else:
+            start_sem_self_w1(slot, priority=1)
+            start_sem_self_w3(slot, priority=1)
+            start_sem_self_w2(slot, priority=w2_fetch_priority)
+
     for bf_id in range(num_bf_tiles):
         slot = bf_id % 2
         if path == "w1":
@@ -220,7 +303,7 @@ def _weight_dma_l1_kernel(
         elif path == "w13_w2":
             start_w13_w2(slot, bf_id)
             wait_w13_w2(slot)
-        elif path == "pipeline_w13_w2":
+        elif path in ("pipeline_w13_w2", "empty_loop", "sem_self_wait"):
             pass
         else:
             raise ValueError(f"Unsupported L1 weight DMA path: {path}")
@@ -245,6 +328,34 @@ def _weight_dma_l1_kernel(
                     next_bf_id = bf_id + 2
                     if next_bf_id < num_bf_tiles:
                         start_w13_w2(slot, next_bf_id)
+    elif path == "empty_loop":
+        acc = jnp.float32(0.0)
+        for expert_i in range(num_expert_iters):
+            for bf_id in range(num_bf_tiles):
+                acc += jnp.float32(expert_i + bf_id)
+        out_ref[0] = acc
+    elif path == "sem_self_wait":
+        for _expert_i in range(num_expert_iters):
+            if drain_policy == "end":
+                for bf_id in range(num_bf_tiles):
+                    start_sem_self_w13_w2(bf_id % 2)
+                for bf_id in range(num_bf_tiles):
+                    wait_w13_w2(bf_id % 2)
+            else:
+                if num_bf_tiles >= 1:
+                    start_sem_self_w13_w2(0)
+                if num_bf_tiles >= 2:
+                    start_sem_self_w13_w2(1)
+                for bf_id in range(num_bf_tiles):
+                    slot = bf_id % 2
+                    wait_w1(slot)
+                    wait_w3(slot)
+                    wait_w2(slot)
+                    next_bf_id = bf_id + 2
+                    if next_bf_id < num_bf_tiles:
+                        start_sem_self_w13_w2(slot)
+    else:
+        out_ref[0] = jnp.float32(0.0)
 
 
 @functools.partial(
