@@ -183,18 +183,58 @@ class BaseSpecWorker:
         )
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
+        from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+        from sgl_jax.srt.utils.jax_utils import device_array
+        from sgl_jax.srt.model_executor.forward_batch_info import get_global_expert_location_metadata
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
-        forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
-            model_worker_batch
+
+        mr = self.target_worker.model_runner
+        attn_backend = mr.attn_backend
+        data_sharding = NamedSharding(mr.mesh, P("data"))
+
+        # Batch ForwardBatch arrays into single device_array (bypass init_new)
+        (input_ids, seq_lens, out_cache_loc, positions, req_pool_indices,
+         cache_loc, extend_prefix_lens, extend_seq_lens) = device_array(
+            [model_worker_batch.input_ids, model_worker_batch.seq_lens,
+             model_worker_batch.out_cache_loc, model_worker_batch.positions,
+             model_worker_batch.req_pool_indices, model_worker_batch.cache_loc,
+             model_worker_batch.extend_prefix_lens, model_worker_batch.extend_seq_lens],
+            sharding=data_sharding,
         )
 
+        forward_batch = ForwardBatch(
+            bid=model_worker_batch.bid,
+            forward_mode=model_worker_batch.forward_mode,
+            batch_size=len(model_worker_batch.seq_lens),
+            input_ids=input_ids,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            req_pool_indices=req_pool_indices,
+            cache_loc=cache_loc,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            attn_backend=attn_backend,
+            spec_info=model_worker_batch.spec_info_padded,
+            spec_algorithm=model_worker_batch.spec_algorithm,
+            capture_hidden_mode=model_worker_batch.capture_hidden_mode,
+            expert_location_metadata=get_global_expert_location_metadata(),
+        )
+        model_worker_batch.forward_batch = forward_batch
+
+        forward_metadata = attn_backend.get_eagle_forward_metadata(model_worker_batch)
+        logits_metadata = LogitsMetadata.for_target_verify(model_worker_batch)
+        attn_backend.forward_metadata = forward_metadata
+
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
+            model_worker_batch, skip_sample=True,
+            forward_metadata=forward_metadata, logits_metadata=logits_metadata,
         )
         is_all_greedy = model_worker_batch.sampling_info.is_all_greedy
         if is_all_greedy:

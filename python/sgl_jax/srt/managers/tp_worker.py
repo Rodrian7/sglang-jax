@@ -359,6 +359,7 @@ class ModelWorker:
         skip_sample: bool = False,
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
+        logits_metadata=None,
     ) -> tuple[LogitsProcessorOutput, jax.Array | None, int]:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
@@ -375,7 +376,7 @@ class ModelWorker:
                 model_worker_batch
             )
 
-        if sampling_metadata is None:
+        if sampling_metadata is None and not skip_sample:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 0,
@@ -384,7 +385,8 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
-        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+        if logits_metadata is None:
+            logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,

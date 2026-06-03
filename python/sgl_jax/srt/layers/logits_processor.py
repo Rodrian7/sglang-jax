@@ -171,6 +171,29 @@ class LogitsMetadata:
         return obj
 
     @classmethod
+    def for_target_verify(cls, batch: "ModelWorkerBatch"):
+        obj = cls.__new__(cls)
+        obj.forward_mode = batch.forward_mode
+        obj.capture_hidden_mode = batch.capture_hidden_mode
+        obj.extend_return_logprob = False
+        obj.extend_return_top_logprob = False
+        obj.extend_token_ids_logprob = False
+        obj.extend_seq_lens = None
+        obj.accept_lens = None
+        obj.logits_indices = None
+        obj.extend_seq_lens_cpu = None
+        obj.extend_logprob_start_lens_cpu = None
+        obj.extend_logprob_pruned_lens_cpu = None
+        obj.top_logprobs_nums = None
+        obj.extend_input_logprob_token_ids_device = None
+        obj.token_ids_logprobs = None
+        obj.temp_scaled_logprobs = False
+        obj.temperature = None
+        obj.top_p_normalized_logprobs = False
+        obj.top_p = None
+        return obj
+
+    @classmethod
     def from_model_worker_batch(cls, batch: "ModelWorkerBatch", mesh: Mesh = None):
         if batch.forward_mode.is_extend() and batch.return_logprob:
             extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
