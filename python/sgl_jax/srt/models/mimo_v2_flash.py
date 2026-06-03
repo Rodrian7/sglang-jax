@@ -1,6 +1,7 @@
 """MiMo-V2-Flash model implementation for SGLang-JAX."""
 
 import logging
+import os
 from typing import Any
 
 import jax
@@ -615,11 +616,15 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         if self.loader.is_static_quant:
             head_dim = self.config.head_dim
             v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-            # 1. Dequant Q only (K/V go through fused KV path via _kv_buffers)
-            self.loader.dequant_fp8_layers(
-                self.model.layers,
-                specs=[("self_attn.q_proj", head_dim)],
-            )
+            # 1. Q stays FP8 (QuantizedLinear): decode is HBM-bound, fp8 q_proj
+            #    halves the weight read vs the dequant-to-bf16 path. q_proj is not
+            #    in the checkpoint's ignored_layers (only o_proj is), so fp8 is the
+            #    intended precision. Set SGLJAX_DEQUANT_QPROJ=1 to restore bf16.
+            if os.environ.get("SGLJAX_DEQUANT_QPROJ", "0") == "1":
+                self.loader.dequant_fp8_layers(
+                    self.model.layers,
+                    specs=[("self_attn.q_proj", head_dim)],
+                )
             # 2. Fused KV per-head dequant (cross K/V boundary blocks)
             self.loader.dequant_fused_kv(self._kv_buffers, self.model.layers, self.config)
             # 3. Layer-0 dense MLP
