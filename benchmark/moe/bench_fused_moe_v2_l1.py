@@ -43,10 +43,15 @@ def _weight_dma_l1_kernel(
     *,
     path: str,
     bf: int,
+    payload_bf: int,
     num_bf_tiles: int,
+    num_expert_iters: int,
     quant_block_k: int,
     issue_together: bool,
     co_drain: bool,
+    w2_fetch_order: str,
+    w2_fetch_priority: int,
+    drain_policy: str,
 ):
     del out_ref
 
@@ -60,9 +65,9 @@ def _weight_dma_l1_kernel(
                 src_ref=w1_hbm.at[
                     local_e_id,
                     pl.ds(p * h_per_t, h_per_t),
-                    pl.ds(bf_id * bf, bf),
+                    pl.ds(bf_id * bf, payload_bf),
                 ],
-                dst_ref=w1_vmem.at[slot, p],
+                dst_ref=w1_vmem.at[slot, p, pl.ds(0, h_per_t), pl.ds(0, payload_bf)],
                 sem=sems.at[slot, 0],
             ).start(priority=priority)
             pltpu.make_async_copy(
@@ -70,9 +75,15 @@ def _weight_dma_l1_kernel(
                     local_e_id,
                     pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
                     pl.ds(0, 1),
-                    pl.ds(bf_id * bf, bf),
+                    pl.ds(bf_id * bf, payload_bf),
                 ],
-                dst_ref=w1_scale_vmem.at[slot, p],
+                dst_ref=w1_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, h_per_t // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, payload_bf),
+                ],
                 sem=sems.at[slot, 0],
             ).start(priority=priority)
 
@@ -94,9 +105,9 @@ def _weight_dma_l1_kernel(
                 src_ref=w3_hbm.at[
                     local_e_id,
                     pl.ds(p * h_per_t, h_per_t),
-                    pl.ds(bf_id * bf, bf),
+                    pl.ds(bf_id * bf, payload_bf),
                 ],
-                dst_ref=w3_vmem.at[slot, p],
+                dst_ref=w3_vmem.at[slot, p, pl.ds(0, h_per_t), pl.ds(0, payload_bf)],
                 sem=sems.at[slot, 1],
             ).start(priority=priority)
             pltpu.make_async_copy(
@@ -104,9 +115,15 @@ def _weight_dma_l1_kernel(
                     local_e_id,
                     pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
                     pl.ds(0, 1),
-                    pl.ds(bf_id * bf, bf),
+                    pl.ds(bf_id * bf, payload_bf),
                 ],
-                dst_ref=w3_scale_vmem.at[slot, p],
+                dst_ref=w3_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, h_per_t // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, payload_bf),
+                ],
                 sem=sems.at[slot, 1],
             ).start(priority=priority)
 
@@ -127,20 +144,26 @@ def _weight_dma_l1_kernel(
             pltpu.make_async_copy(
                 src_ref=w2_hbm.at[
                     local_e_id,
-                    pl.ds(bf_id * bf, bf),
+                    pl.ds(bf_id * bf, payload_bf),
                     pl.ds(p * h_per_t, h_per_t),
                 ],
-                dst_ref=w2_vmem.at[slot, p],
+                dst_ref=w2_vmem.at[slot, p, pl.ds(0, payload_bf), pl.ds(0, h_per_t)],
                 sem=sems.at[slot, 2],
             ).start(priority=priority)
             pltpu.make_async_copy(
                 src_ref=w2_scale_hbm.at[
                     local_e_id,
-                    pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
+                    pl.ds(bf_id * bf // quant_block_k, payload_bf // quant_block_k),
                     pl.ds(0, 1),
                     pl.ds(p * h_per_t, h_per_t),
                 ],
-                dst_ref=w2_scale_vmem.at[slot, p],
+                dst_ref=w2_scale_vmem.at[
+                    slot,
+                    p,
+                    pl.ds(0, payload_bf // quant_block_k),
+                    pl.ds(0, 1),
+                    pl.ds(0, h_per_t),
+                ],
                 sem=sems.at[slot, 2],
             ).start(priority=priority)
 
@@ -155,6 +178,21 @@ def _weight_dma_l1_kernel(
             dst_ref=w2_scale_vmem.at[slot],
             sem=sems.at[slot, 2],
         ).wait()
+
+    def start_w13_w2(slot, bf_id):
+        if w2_fetch_order == "before_w13":
+            start_w2(slot, bf_id, priority=w2_fetch_priority)
+            start_w1(slot, bf_id, priority=1)
+            start_w3(slot, bf_id, priority=1)
+        else:
+            start_w1(slot, bf_id, priority=1)
+            start_w3(slot, bf_id, priority=1)
+            start_w2(slot, bf_id, priority=w2_fetch_priority)
+
+    def wait_w13_w2(slot):
+        wait_w1(slot)
+        wait_w3(slot)
+        wait_w2(slot)
 
     for bf_id in range(num_bf_tiles):
         slot = bf_id % 2
@@ -179,14 +217,33 @@ def _weight_dma_l1_kernel(
                 start_w3(slot, bf_id)
                 wait_w3(slot)
         elif path == "w13_w2":
-            start_w1(slot, bf_id, priority=1)
-            start_w3(slot, bf_id, priority=1)
-            start_w2(slot, bf_id, priority=0)
-            wait_w1(slot)
-            wait_w3(slot)
-            wait_w2(slot)
+            start_w13_w2(slot, bf_id)
+            wait_w13_w2(slot)
+        elif path == "pipeline_w13_w2":
+            pass
         else:
             raise ValueError(f"Unsupported L1 weight DMA path: {path}")
+
+    if path == "pipeline_w13_w2":
+        for _expert_i in range(num_expert_iters):
+            if drain_policy == "end":
+                for bf_id in range(num_bf_tiles):
+                    start_w13_w2(bf_id % 2, bf_id)
+                for bf_id in range(num_bf_tiles):
+                    wait_w13_w2(bf_id % 2)
+            else:
+                if num_bf_tiles >= 1:
+                    start_w13_w2(0, 0)
+                if num_bf_tiles >= 2:
+                    start_w13_w2(1, 1)
+                for bf_id in range(num_bf_tiles):
+                    slot = bf_id % 2
+                    wait_w1(slot)
+                    wait_w3(slot)
+                    wait_w2(slot)
+                    next_bf_id = bf_id + 2
+                    if next_bf_id < num_bf_tiles:
+                        start_w13_w2(slot, next_bf_id)
 
 
 @functools.partial(
@@ -197,11 +254,16 @@ def _weight_dma_l1_kernel(
         "hidden_size",
         "intermediate_size",
         "bf",
+        "payload_bf",
         "num_bf_tiles",
+        "num_expert_iters",
         "quant_block_k",
         "scope_name",
         "issue_together",
         "co_drain",
+        "w2_fetch_order",
+        "w2_fetch_priority",
+        "drain_policy",
     ],
 )
 def weight_dma_l1(
@@ -217,11 +279,16 @@ def weight_dma_l1(
     hidden_size: int,
     intermediate_size: int,
     bf: int,
+    payload_bf: int,
     num_bf_tiles: int,
+    num_expert_iters: int,
     quant_block_k: int,
     scope_name: str,
     issue_together: bool,
     co_drain: bool,
+    w2_fetch_order: str,
+    w2_fetch_priority: int,
+    drain_policy: str,
 ):
     t_packing = get_dtype_packing(jnp.bfloat16)
     h_per_t = hidden_size // t_packing
@@ -244,10 +311,15 @@ def weight_dma_l1(
                 _weight_dma_l1_kernel,
                 path=path,
                 bf=bf,
+                payload_bf=payload_bf,
                 num_bf_tiles=num_bf_tiles,
+                num_expert_iters=num_expert_iters,
                 quant_block_k=quant_block_k,
                 issue_together=issue_together,
                 co_drain=co_drain,
+                w2_fetch_order=w2_fetch_order,
+                w2_fetch_priority=w2_fetch_priority,
+                drain_policy=drain_policy,
             ),
             out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -334,8 +406,22 @@ def _make_inputs(
     return w1, w2, w3, w1_scale, w2_scale, w3_scale
 
 
-def _scope_name(path: str, bf: int, num_bf_tiles: int, quant_block_k: int) -> str:
-    return f"{TRACE_TASK_PREFIX}-{path}-bf_{bf}-nbf_{num_bf_tiles}-qbk_{quant_block_k}"
+def _scope_name(
+    path: str,
+    bf: int,
+    payload_bf: int,
+    num_bf_tiles: int,
+    num_expert_iters: int,
+    quant_block_k: int,
+    w2_fetch_order: str,
+    w2_fetch_priority: int,
+    drain_policy: str,
+) -> str:
+    return (
+        f"{TRACE_TASK_PREFIX}-{path}-bf_{bf}-payload_{payload_bf}"
+        f"-nbf_{num_bf_tiles}-ne_{num_expert_iters}-qbk_{quant_block_k}"
+        f"-w2_{w2_fetch_order}_p{w2_fetch_priority}-drain_{drain_policy}"
+    )
 
 
 def run(args: argparse.Namespace) -> None:
@@ -350,8 +436,16 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.intermediate_size=} must be divisible by {args.quant_block_k=}.")
     if args.bf % args.quant_block_k != 0:
         raise ValueError(f"{args.bf=} must be divisible by {args.quant_block_k=}.")
+    if args.payload_bf is None:
+        args.payload_bf = args.bf
+    if args.payload_bf <= 0 or args.payload_bf > args.bf:
+        raise ValueError(f"Expected 0 < {args.payload_bf=} <= {args.bf=}.")
+    if args.payload_bf % args.quant_block_k != 0:
+        raise ValueError(f"{args.payload_bf=} must be divisible by {args.quant_block_k=}.")
     if args.bf * args.num_bf_tiles > args.intermediate_size:
         raise ValueError("bf * num_bf_tiles must not exceed intermediate_size.")
+    if args.num_expert_iters <= 0:
+        raise ValueError(f"{args.num_expert_iters=} must be positive.")
 
     weight_dtype = jnp.float8_e4m3fn if args.fp8 else jnp.bfloat16
     w1, w2, w3, w1_scale, w2_scale, w3_scale = _make_inputs(
@@ -364,12 +458,25 @@ def run(args: argparse.Namespace) -> None:
     )
 
     for path in args.paths:
-        scope_name = _scope_name(path, args.bf, args.num_bf_tiles, args.quant_block_k)
+        scope_name = _scope_name(
+            path,
+            args.bf,
+            args.payload_bf,
+            args.num_bf_tiles,
+            args.num_expert_iters,
+            args.quant_block_k,
+            args.w2_fetch_order,
+            args.w2_fetch_priority,
+            args.drain_policy,
+        )
         trace_root = os.path.join(args.trace_root, scope_name)
         print(
             "L1_WEIGHT_DMA "
             f"name={scope_name} path={path} bf={args.bf} "
-            f"num_bf_tiles={args.num_bf_tiles} qbk={args.quant_block_k} "
+            f"payload_bf={args.payload_bf} num_bf_tiles={args.num_bf_tiles} "
+            f"num_expert_iters={args.num_expert_iters} qbk={args.quant_block_k} "
+            f"w2_fetch_order={args.w2_fetch_order} "
+            f"w2_fetch_priority={args.w2_fetch_priority} drain_policy={args.drain_policy} "
             f"experts={args.num_experts} hidden={args.hidden_size} "
             f"intermediate={args.intermediate_size} ep={args.ep_size} "
             f"weight_dtype={jnp.dtype(weight_dtype).name}",
@@ -389,11 +496,16 @@ def run(args: argparse.Namespace) -> None:
                 hidden_size=args.hidden_size,
                 intermediate_size=args.intermediate_size,
                 bf=args.bf,
+                payload_bf=args.payload_bf,
                 num_bf_tiles=args.num_bf_tiles,
+                num_expert_iters=args.num_expert_iters,
                 quant_block_k=args.quant_block_k,
                 scope_name=scope_name,
                 issue_together=args.issue_together,
                 co_drain=args.co_drain,
+                w2_fetch_order=args.w2_fetch_order,
+                w2_fetch_priority=args.w2_fetch_priority,
+                drain_policy=args.drain_policy,
             )
 
         times = multiple_iteration_timeit_from_trace(
@@ -411,7 +523,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paths", default="w1,w3,w13,w2", help="Comma-separated L1 paths.")
     parser.add_argument("--bf", type=int, default=512)
+    parser.add_argument(
+        "--payload-bf",
+        type=int,
+        default=None,
+        help="Actual copied bf width. Defaults to --bf; use a small value for tiny-payload issue/wait probes.",
+    )
     parser.add_argument("--num-bf-tiles", type=int, default=1)
+    parser.add_argument(
+        "--num-expert-iters",
+        type=int,
+        default=1,
+        help="Number of production-shaped expert iterations for pipeline_w13_w2.",
+    )
     parser.add_argument("--quant-block-k", type=int, default=128)
     parser.add_argument("--num-experts", type=int, default=384)
     parser.add_argument("--hidden-size", type=int, default=6144)
@@ -423,6 +547,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--issue-together", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--co-drain", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--w2-fetch-order",
+        choices=["after_w13", "before_w13"],
+        default="after_w13",
+        help="W2 issue order in w13_w2 and pipeline_w13_w2 paths.",
+    )
+    parser.add_argument(
+        "--w2-fetch-priority",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="W2 DMA priority in w13_w2 and pipeline_w13_w2 paths.",
+    )
+    parser.add_argument(
+        "--drain-policy",
+        choices=["production", "end"],
+        default="production",
+        help="production waits W1/W3/W2 per bf tile; end issues all tiles before draining waits.",
+    )
     args = parser.parse_args()
     args.paths = [p.strip() for p in args.paths.split(",") if p.strip()]
     return args
