@@ -100,6 +100,10 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         metadata_mode: str = "recursive",
+        cross_expert_prefetch_mode: str = "full",
+        next_w2_prologue_priority: int = 1,
+        w2_fetch_order: str = "after_w13",
+        w2_fetch_priority: int = 1,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -155,6 +159,10 @@ class FusedEPMoE(nnx.Module):
                 f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
             )
         self.metadata_mode = metadata_mode
+        self.cross_expert_prefetch_mode = cross_expert_prefetch_mode
+        self.next_w2_prologue_priority = next_w2_prologue_priority
+        self.w2_fetch_order = w2_fetch_order
+        self.w2_fetch_priority = w2_fetch_priority
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -660,6 +668,10 @@ class FusedEPMoEV2(FusedEPMoE):
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
             direct_scaled_dot=direct_scaled_dot,
+            cross_expert_prefetch_mode=self.cross_expert_prefetch_mode,
+            next_w2_prologue_priority=self.next_w2_prologue_priority,
+            w2_fetch_order=self.w2_fetch_order,
+            w2_fetch_priority=self.w2_fetch_priority,
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",

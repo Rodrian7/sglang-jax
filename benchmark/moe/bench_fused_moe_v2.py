@@ -601,6 +601,10 @@ def run_all(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    cross_expert_prefetch_mode: str = "full",
+    next_w2_prologue_priority: int = 1,
+    w2_fetch_order: str = "after_w13",
+    w2_fetch_priority: int = 1,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     use_shared_expert = False  # lean decode tuner: omitted
@@ -706,6 +710,12 @@ def run_all(
         f"num_experts={num_experts}, top_k={top_k}, hidden_size={hidden_size}, "
         f"intermediate_size={intermediate_size}, activation={activation}, "
         f"renormalize_topk_logits={renormalize_topk_logits}"
+    )
+    print(
+        "  scheduling: "
+        f"cross_expert_prefetch_mode={cross_expert_prefetch_mode}, "
+        f"next_w2_prologue_priority={next_w2_prologue_priority}, "
+        f"w2_fetch_order={w2_fetch_order}, w2_fetch_priority={w2_fetch_priority}"
     )
     print(
         "  vmem_filter: "
@@ -818,6 +828,10 @@ def run_all(
                 moe_shared_expert_intermediate_size=None,
                 quantization_config=quantization_config,
                 metadata_mode=metadata_mode,
+                cross_expert_prefetch_mode=cross_expert_prefetch_mode,
+                next_w2_prologue_priority=next_w2_prologue_priority,
+                w2_fetch_order=w2_fetch_order,
+                w2_fetch_priority=w2_fetch_priority,
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
@@ -959,9 +973,9 @@ def run_all(
                             bts=stat_cfg_eff.bts,
                             t_packing=2,
                             quant_block_k=quant_block_k or 128,
-                            xprefetch="layer_default",
-                            w2_order="after_w13",
-                            w2_priority=1,
+                            xprefetch=cross_expert_prefetch_mode,
+                            w2_order=w2_fetch_order,
+                            w2_priority=w2_fetch_priority,
                         )
                         if jax.process_index() == 0:
                             print(f"PIPELINE_STATS_JSON={json.dumps(stats)}", flush=True)
@@ -1298,6 +1312,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-acc-store-vmem", action="store_true")
     parser.add_argument("--disable-output-store", action="store_true")
     parser.add_argument(
+        "--cross-expert-prefetch-mode",
+        type=str,
+        default="full",
+        choices=["none", "full", "w13"],
+        help="v2 cross-expert weight prefetch policy.",
+    )
+    parser.add_argument(
+        "--next-w2-prologue-priority",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Priority for next-expert W2 prologue in cross_expert_prefetch_mode=w13.",
+    )
+    parser.add_argument(
+        "--w2-fetch-order",
+        type=str,
+        default="after_w13",
+        choices=["after_w13", "before_w13"],
+        help="Current-expert W2 DMA issue order relative to W1/W3.",
+    )
+    parser.add_argument(
+        "--w2-fetch-priority",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Current-expert W2 DMA issue priority.",
+    )
+    parser.add_argument(
         "--tpu-vmem-budget-mb",
         type=int,
         default=DEFAULT_TPU_VMEM_BUDGET_MB,
@@ -1394,6 +1436,10 @@ if __name__ == "__main__":
             disable_acc_compute=args.disable_acc_compute,
             disable_acc_store_vmem=args.disable_acc_store_vmem,
             disable_output_store=args.disable_output_store,
+            cross_expert_prefetch_mode=args.cross_expert_prefetch_mode,
+            next_w2_prologue_priority=args.next_w2_prologue_priority,
+            w2_fetch_order=args.w2_fetch_order,
+            w2_fetch_priority=args.w2_fetch_priority,
             return_results=True,
         )
     except BaseException as e:
