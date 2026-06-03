@@ -2,10 +2,9 @@
 Tune fused_ep_moe_v2 block configs (lean, decode-focused v2 adaptation).
 
 This is a v2 adaptation of ``benchmark/moe/bench_fused_moe.py``. It tunes the
-``fused_ep_moe_v2`` kernel's block config by timing candidate configs with the
-SAME canonical marker-based timer the v1 tuner uses
-(``multiple_iteration_timeit_from_trace``), then prints the best config as a
-v2 tuned-table entry that can be pasted into
+``fused_ep_moe_v2`` kernel's block config by timing candidate configs with
+synchronous wall-time while optionally emitting JAX profiler traces, then
+prints the best config as a v2 tuned-table entry that can be pasted into
 ``sgl_jax/srt/kernels/fused_moe/v2/tuned_block_configs.py``.
 
 Candidate enumeration is **v2-native**: a self-contained port of the
@@ -22,9 +21,6 @@ used: it mis-modeled v2 VMEM and emitted btc=1 / large-bts configs that OOM
 v2 on v7x.
 
 It still reuses by IMPORTING:
-  - ``multiple_iteration_timeit_from_trace`` from benchmark.utils (the
-    marker-based timer that produced the real tuned tables; timing does not
-    depend on the kernel's own event name).
   - mesh / case / input helpers from benchmark.moe.utils, mirroring how
     bench_fused_moe.py builds the mesh, fp8-quantizes weights, jits the
     forward, and prints the tuned-table line.
@@ -57,7 +53,11 @@ import faulthandler
 import itertools
 import json
 import math
+import os
+import random
+import string
 import sys
+import time
 import traceback
 from functools import partial
 from typing import Any
@@ -77,7 +77,6 @@ from benchmark.moe.utils import (
     prepare_fused_moe_inputs,
     select_cases,
 )
-from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.fused_moe.v2.kernel import FusedMoEBlockConfig as V2BlockConfig
 from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
@@ -89,6 +88,43 @@ from sgl_jax.srt.layers.moe import TopK
 # Real v7x VMEM is 64 MB. The v1 tuner's DEFAULT_TPU_VMEM_BUDGET_MB (96 MB)
 # does NOT apply to the v2 kernel; v2 candidates are filtered against 64 MB.
 DEFAULT_TPU_VMEM_BUDGET_MB = 64
+TRACE_TASK = "fused-moe-v2-k_.*"
+TRACE_MARKER = "SGLANG_JAX_BENCH"
+
+
+def wall_timeit_with_trace(
+    compute_func,
+    *,
+    task: str,
+    tries: int,
+    warmup: int,
+    trace_root: str,
+) -> list[float]:
+    """Return synchronous wall-times while emitting profiler traces.
+
+    The benchmark number intentionally does not parse trace JSON. XPlane/trace
+    output remains available for independent analysis plugins.
+    """
+    start = time.perf_counter()
+    for _ in range(max(0, int(warmup))):
+        out = compute_func()
+        jax.block_until_ready(out)
+    print(f"warmed up in {(time.perf_counter() - start) * 1000:.3f} ms")
+
+    trace_name = f"{task}_" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    trace_dir = os.path.join(trace_root, trace_name)
+    os.makedirs(trace_dir, exist_ok=True)
+
+    times: list[float] = []
+    with jax.profiler.trace(trace_dir):
+        for i in range(tries):
+            with jax.profiler.StepTraceAnnotation(task, step_num=i):
+                with jax.named_scope(f"{TRACE_MARKER}_{i}"):
+                    t0 = time.perf_counter()
+                    out = compute_func()
+                    jax.block_until_ready(out)
+                    times.append((time.perf_counter() - t0) * 1000.0)
+    return times
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +614,28 @@ def run_all(
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
     disable_sync_barrier: bool = False,
+    disable_a2a_scatter: bool = False,
+    disable_a2a_scatter_local_copy: bool = False,
+    disable_a2a_scatter_remote_copy: bool = False,
+    disable_a2a_scatter_recv_wait: bool = False,
+    disable_a2a_scatter_send_wait: bool = False,
+    disable_a2a_gather: bool = False,
+    disable_a2a_gather_local_copy: bool = False,
+    disable_a2a_gather_remote_copy: bool = False,
+    disable_w1_load: bool = False,
+    disable_w3_load: bool = False,
+    disable_w2_load: bool = False,
+    disable_expert_x_load: bool = False,
+    disable_expert_ffn: bool = False,
+    disable_expert_store: bool = False,
+    disable_expert_stage_writeback: bool = False,
+    disable_expert_store_dma: bool = False,
+    disable_expert_store_wait: bool = False,
+    disable_acc_and_store: bool = False,
+    disable_acc_load: bool = False,
+    disable_acc_compute: bool = False,
+    disable_acc_store_vmem: bool = False,
+    disable_output_store: bool = False,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     use_shared_expert = False  # lean decode tuner: omitted
@@ -651,6 +709,28 @@ def run_all(
             "disable_dynamic_ffn2": disable_dynamic_ffn2,
             "disable_weight_load": disable_weight_load,
             "disable_sync_barrier": disable_sync_barrier,
+            "disable_a2a_scatter": disable_a2a_scatter,
+            "disable_a2a_scatter_local_copy": disable_a2a_scatter_local_copy,
+            "disable_a2a_scatter_remote_copy": disable_a2a_scatter_remote_copy,
+            "disable_a2a_scatter_recv_wait": disable_a2a_scatter_recv_wait,
+            "disable_a2a_scatter_send_wait": disable_a2a_scatter_send_wait,
+            "disable_a2a_gather": disable_a2a_gather,
+            "disable_a2a_gather_local_copy": disable_a2a_gather_local_copy,
+            "disable_a2a_gather_remote_copy": disable_a2a_gather_remote_copy,
+            "disable_w1_load": disable_w1_load,
+            "disable_w3_load": disable_w3_load,
+            "disable_w2_load": disable_w2_load,
+            "disable_expert_x_load": disable_expert_x_load,
+            "disable_expert_ffn": disable_expert_ffn,
+            "disable_expert_store": disable_expert_store,
+            "disable_expert_stage_writeback": disable_expert_stage_writeback,
+            "disable_expert_store_dma": disable_expert_store_dma,
+            "disable_expert_store_wait": disable_expert_store_wait,
+            "disable_acc_and_store": disable_acc_and_store,
+            "disable_acc_load": disable_acc_load,
+            "disable_acc_compute": disable_acc_compute,
+            "disable_acc_store_vmem": disable_acc_store_vmem,
+            "disable_output_store": disable_output_store,
         }.items()
         if enabled
     ]
@@ -744,6 +824,28 @@ def run_all(
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_weight_load=disable_weight_load,
                 disable_sync_barrier=disable_sync_barrier,
+                disable_a2a_scatter=disable_a2a_scatter,
+                disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
+                disable_a2a_scatter_remote_copy=disable_a2a_scatter_remote_copy,
+                disable_a2a_scatter_recv_wait=disable_a2a_scatter_recv_wait,
+                disable_a2a_scatter_send_wait=disable_a2a_scatter_send_wait,
+                disable_a2a_gather=disable_a2a_gather,
+                disable_a2a_gather_local_copy=disable_a2a_gather_local_copy,
+                disable_a2a_gather_remote_copy=disable_a2a_gather_remote_copy,
+                disable_w1_load=disable_w1_load,
+                disable_w3_load=disable_w3_load,
+                disable_w2_load=disable_w2_load,
+                disable_expert_x_load=disable_expert_x_load,
+                disable_expert_ffn=disable_expert_ffn,
+                disable_expert_store=disable_expert_store,
+                disable_expert_stage_writeback=disable_expert_stage_writeback,
+                disable_expert_store_dma=disable_expert_store_dma,
+                disable_expert_store_wait=disable_expert_store_wait,
+                disable_acc_and_store=disable_acc_and_store,
+                disable_acc_load=disable_acc_load,
+                disable_acc_compute=disable_acc_compute,
+                disable_acc_store_vmem=disable_acc_store_vmem,
+                disable_output_store=disable_output_store,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=1,
                 top_k_groups=1,
@@ -951,7 +1053,6 @@ def run_all(
                         block_config=block_cfg,
                     )
 
-                task = "fused-moe-v2-k_.*"
                 try:
                     if block_cfg is not None:
                         # Skip configs whose v2-effective form is invalid (raises).
@@ -965,10 +1066,9 @@ def run_all(
                             ep_size=mesh_ep,
                             block_config=block_cfg,
                         )
-                    times = multiple_iteration_timeit_from_trace(
-                        compute_func=_compute,
-                        data_generator=lambda: (),
-                        task=task,
+                    times = wall_timeit_with_trace(
+                        _compute,
+                        task=TRACE_TASK,
                         tries=iters,
                         warmup=warmup_iters,
                         trace_root=trace_root,
@@ -1012,7 +1112,7 @@ def run_all(
                 if len(times) > 1:
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
-                print(f"     fused_moe_v2[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
+                print(f"     fused_moe_v2[{tag}]: {mean_ms:.3f} ms (wall) | samples={times}")
                 if np.isfinite(mean_ms):
                     n_succeeded += 1
                 else:
@@ -1209,6 +1309,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-dynamic-ffn2", action="store_true")
     parser.add_argument("--disable-weight-load", action="store_true")
     parser.add_argument("--disable-sync-barrier", action="store_true")
+    parser.add_argument("--disable-a2a-scatter", action="store_true")
+    parser.add_argument("--disable-a2a-scatter-local-copy", action="store_true")
+    parser.add_argument("--disable-a2a-scatter-remote-copy", action="store_true")
+    parser.add_argument("--disable-a2a-scatter-recv-wait", action="store_true")
+    parser.add_argument("--disable-a2a-scatter-send-wait", action="store_true")
+    parser.add_argument("--disable-a2a-gather", action="store_true")
+    parser.add_argument("--disable-a2a-gather-local-copy", action="store_true")
+    parser.add_argument("--disable-a2a-gather-remote-copy", action="store_true")
+    parser.add_argument("--disable-w1-load", action="store_true")
+    parser.add_argument("--disable-w3-load", action="store_true")
+    parser.add_argument("--disable-w2-load", action="store_true")
+    parser.add_argument("--disable-expert-x-load", action="store_true")
+    parser.add_argument("--disable-expert-ffn", action="store_true")
+    parser.add_argument("--disable-expert-store", action="store_true")
+    parser.add_argument("--disable-expert-stage-writeback", action="store_true")
+    parser.add_argument("--disable-expert-store-dma", action="store_true")
+    parser.add_argument("--disable-expert-store-wait", action="store_true")
+    parser.add_argument("--disable-acc-and-store", action="store_true")
+    parser.add_argument("--disable-acc-load", action="store_true")
+    parser.add_argument("--disable-acc-compute", action="store_true")
+    parser.add_argument("--disable-acc-store-vmem", action="store_true")
+    parser.add_argument("--disable-output-store", action="store_true")
     parser.add_argument(
         "--tpu-vmem-budget-mb",
         type=int,
@@ -1284,6 +1406,28 @@ if __name__ == "__main__":
             disable_dynamic_ffn2=args.disable_dynamic_ffn2,
             disable_weight_load=args.disable_weight_load,
             disable_sync_barrier=args.disable_sync_barrier,
+            disable_a2a_scatter=args.disable_a2a_scatter,
+            disable_a2a_scatter_local_copy=args.disable_a2a_scatter_local_copy,
+            disable_a2a_scatter_remote_copy=args.disable_a2a_scatter_remote_copy,
+            disable_a2a_scatter_recv_wait=args.disable_a2a_scatter_recv_wait,
+            disable_a2a_scatter_send_wait=args.disable_a2a_scatter_send_wait,
+            disable_a2a_gather=args.disable_a2a_gather,
+            disable_a2a_gather_local_copy=args.disable_a2a_gather_local_copy,
+            disable_a2a_gather_remote_copy=args.disable_a2a_gather_remote_copy,
+            disable_w1_load=args.disable_w1_load,
+            disable_w3_load=args.disable_w3_load,
+            disable_w2_load=args.disable_w2_load,
+            disable_expert_x_load=args.disable_expert_x_load,
+            disable_expert_ffn=args.disable_expert_ffn,
+            disable_expert_store=args.disable_expert_store,
+            disable_expert_stage_writeback=args.disable_expert_stage_writeback,
+            disable_expert_store_dma=args.disable_expert_store_dma,
+            disable_expert_store_wait=args.disable_expert_store_wait,
+            disable_acc_and_store=args.disable_acc_and_store,
+            disable_acc_load=args.disable_acc_load,
+            disable_acc_compute=args.disable_acc_compute,
+            disable_acc_store_vmem=args.disable_acc_store_vmem,
+            disable_output_store=args.disable_output_store,
             return_results=True,
         )
     except BaseException as e:
