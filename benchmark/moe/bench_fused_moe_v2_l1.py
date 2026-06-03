@@ -48,6 +48,8 @@ def _weight_dma_l1_kernel(
     issue_together: bool,
     co_drain: bool,
 ):
+    del out_ref
+
     local_e_id = jnp.int32(0)
     t_packing = w1_vmem.shape[1]
     h_per_t = w1_vmem.shape[2]
@@ -185,13 +187,6 @@ def _weight_dma_l1_kernel(
             wait_w2(slot)
         else:
             raise ValueError(f"Unsupported L1 weight DMA path: {path}")
-
-    if path == "w2":
-        out_ref[0] = w2_vmem[0, 0, 0, 0].astype(jnp.float32)
-    elif path == "w3":
-        out_ref[0] = w3_vmem[0, 0, 0, 0].astype(jnp.float32)
-    else:
-        out_ref[0] = w1_vmem[0, 0, 0, 0].astype(jnp.float32)
 
 
 @functools.partial(
