@@ -7,11 +7,13 @@ a per-shard-interleaved layout that requires special dequantization handling.
 """
 
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -52,6 +54,24 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
             # Dequantize fused QKV per-shard, then split into Q/K/V bf16
             # (or keep fused as qkv_proj when enable_fused_qkv is set).
             self.loader.dequant_fused_qkv(self._fused_qkv_buffers, self.model.layers, self.config)
+            # Decode is HBM-bound and reads the bf16 q_proj weight (75MB/layer in
+            # the profile). q_proj is not in ignored_layers (only o_proj is), so
+            # re-quantize the split bf16 q_proj back to FP8 (block [128,128],
+            # matching the checkpoint) -> halves its decode HBM read. Opt-out via
+            # SGLJAX_QPROJ_FP8=0.
+            if os.environ.get("SGLJAX_QPROJ_FP8", "1") == "1" and not use_fused:
+                wbs = getattr(self._quant_config, "weight_block_size", None) or [128, 128]
+                n_req = 0
+                for layer in self.model.layers:
+                    q = getattr(layer.self_attn, "q_proj", None)
+                    if isinstance(q, LinearBase):
+                        layer.self_attn.q_proj = QuantizedLinear.from_linear(
+                            q,
+                            weight_dtype=jnp.float8_e4m3fn,
+                            weight_block_size=list(wbs),
+                        )
+                        n_req += 1
+                logger.info("Re-quantized %d q_proj layers to FP8 (decode HBM)", n_req)
             # Dequantize remaining FP8 weights (layer 0 MLP, etc).
             self.loader.dequant_fp8_layers(
                 self.model.layers,
