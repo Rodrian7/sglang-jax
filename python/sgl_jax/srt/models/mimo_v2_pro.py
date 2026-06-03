@@ -54,12 +54,13 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
             # Dequantize fused QKV per-shard, then split into Q/K/V bf16
             # (or keep fused as qkv_proj when enable_fused_qkv is set).
             self.loader.dequant_fused_qkv(self._fused_qkv_buffers, self.model.layers, self.config)
-            # Decode is HBM-bound and reads the bf16 q_proj weight (75MB/layer in
-            # the profile). q_proj is not in ignored_layers (only o_proj is), so
-            # re-quantize the split bf16 q_proj back to FP8 (block [128,128],
-            # matching the checkpoint) -> halves its decode HBM read. Opt-out via
-            # SGLJAX_QPROJ_FP8=0.
-            if os.environ.get("SGLJAX_QPROJ_FP8", "1") == "1" and not use_fused:
+            # q_proj is not in ignored_layers, so FP8 is in principle the intended
+            # precision; but re-quantizing it via xla_quantized_matmul REGRESSED
+            # decode ITL ~2.6x (23.4->60ms) because that kernel is untuned for the
+            # [6144,6144] W8A16 shape and far slower than the bf16 dot — which is
+            # why the loader keeps attention linears bf16. Left as opt-in
+            # (SGLJAX_QPROJ_FP8=1) pending a tuned quantized-matmul block size.
+            if os.environ.get("SGLJAX_QPROJ_FP8", "0") == "1" and not use_fused:
                 wbs = getattr(self._quant_config, "weight_block_size", None) or [128, 128]
                 n_req = 0
                 for layer in self.model.layers:
