@@ -88,13 +88,35 @@ def _weight_dma_l1_kernel(
 
     def wait_w1(slot):
         pltpu.make_async_copy(
-            src_ref=w1_vmem.at[slot],
-            dst_ref=w1_vmem.at[slot],
+            src_ref=w1_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t),
+                pl.ds(0, payload_bf),
+            ],
+            dst_ref=w1_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t),
+                pl.ds(0, payload_bf),
+            ],
             sem=sems.at[slot, 0],
         ).wait()
         pltpu.make_async_copy(
-            src_ref=w1_scale_vmem.at[slot],
-            dst_ref=w1_scale_vmem.at[slot],
+            src_ref=w1_scale_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t // quant_block_k),
+                pl.ds(0, 1),
+                pl.ds(0, payload_bf),
+            ],
+            dst_ref=w1_scale_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t // quant_block_k),
+                pl.ds(0, 1),
+                pl.ds(0, payload_bf),
+            ],
             sem=sems.at[slot, 0],
         ).wait()
 
@@ -128,13 +150,35 @@ def _weight_dma_l1_kernel(
 
     def wait_w3(slot):
         pltpu.make_async_copy(
-            src_ref=w3_vmem.at[slot],
-            dst_ref=w3_vmem.at[slot],
+            src_ref=w3_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t),
+                pl.ds(0, payload_bf),
+            ],
+            dst_ref=w3_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t),
+                pl.ds(0, payload_bf),
+            ],
             sem=sems.at[slot, 1],
         ).wait()
         pltpu.make_async_copy(
-            src_ref=w3_scale_vmem.at[slot],
-            dst_ref=w3_scale_vmem.at[slot],
+            src_ref=w3_scale_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t // quant_block_k),
+                pl.ds(0, 1),
+                pl.ds(0, payload_bf),
+            ],
+            dst_ref=w3_scale_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, h_per_t // quant_block_k),
+                pl.ds(0, 1),
+                pl.ds(0, payload_bf),
+            ],
             sem=sems.at[slot, 1],
         ).wait()
 
@@ -168,13 +212,35 @@ def _weight_dma_l1_kernel(
 
     def wait_w2(slot):
         pltpu.make_async_copy(
-            src_ref=w2_vmem.at[slot],
-            dst_ref=w2_vmem.at[slot],
+            src_ref=w2_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, payload_bf),
+                pl.ds(0, h_per_t),
+            ],
+            dst_ref=w2_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, payload_bf),
+                pl.ds(0, h_per_t),
+            ],
             sem=sems.at[slot, 2],
         ).wait()
         pltpu.make_async_copy(
-            src_ref=w2_scale_vmem.at[slot],
-            dst_ref=w2_scale_vmem.at[slot],
+            src_ref=w2_scale_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, payload_bf // quant_block_k),
+                pl.ds(0, 1),
+                pl.ds(0, h_per_t),
+            ],
+            dst_ref=w2_scale_vmem.at[
+                slot,
+                pl.ds(0, t_packing),
+                pl.ds(0, payload_bf // quant_block_k),
+                pl.ds(0, 1),
+                pl.ds(0, h_per_t),
+            ],
             sem=sems.at[slot, 2],
         ).wait()
 
