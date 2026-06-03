@@ -19,7 +19,6 @@ import json
 import os
 import pathlib
 import re
-import sys
 import time
 from typing import Any
 
@@ -39,11 +38,8 @@ def log(msg):
 jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_index()}")
 
-sys.path.insert(0, "/tmp/tpu_logs/v2")
-from kernel import FusedMoEBlockConfig, fused_ep_moe_v2
-
-sys.path.insert(0, "/tmp/tpu_logs/v1")
-import v1_kernel
+from sgl_jax.srt.kernels.fused_moe.v1 import kernel as v1_kernel
+from sgl_jax.srt.kernels.fused_moe.v2.kernel import FusedMoEBlockConfig, fused_ep_moe_v2
 
 v1_fused_ep_moe = v1_kernel.fused_ep_moe
 V1BlockConfig = v1_kernel.FusedMoEBlockConfig
@@ -86,7 +82,7 @@ V1_TUNED = {
     256: (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
     512: (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 2048),
     8192: (128, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
-    16384: (128, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
+    16384: (128, 1024, 512, 512, 128, 128, 1024, 512, 512, 1024),
 }
 # V2: from v2 tune sweep at ep=32 fp8.
 # Tuple layout accepts either (bt, bf, btc, bse) or (bt, bf, btc, bse, bts).
@@ -105,7 +101,7 @@ V2_DIRECT_SCALED_DOT_TUNED = {
     256: (8, 512, 16, 256, 16),
     512: (16, 512, 16, 256, 16),
     8192: (128, 1024, 128, 256),
-    16384: (128, 1024, 128, 256),
+    16384: (128, 512, 80, 256, 160),
 }
 
 token_candidates = parse_csv_int("BENCH_TOKENS", list(V1_TUNED.keys()))
@@ -487,9 +483,7 @@ for num_tokens in token_candidates:
             w1_scale=w1_scale_s,
             w2_scale=w2_scale_s,
             w3_scale=w3_scale_s,
-            metadata_mode="recursive",
             direct_scaled_dot=direct_scaled_dot,
-            decode_mode=v2_decode_mode,
         )
 
     log("  V2: compiling + running...")

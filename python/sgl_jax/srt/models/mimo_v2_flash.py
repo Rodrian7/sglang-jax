@@ -128,6 +128,7 @@ class MiMoV2Moe(nnx.Module):
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
                 metadata_mode=getattr(config, "moe_metadata_mode", "recursive"),
+                enable_act_quant=getattr(config, "moe_fused_act_quant", True),
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(

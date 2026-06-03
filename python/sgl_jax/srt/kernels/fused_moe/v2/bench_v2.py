@@ -13,12 +13,6 @@ Env vars:
   BENCH_FP8     — 1 to enable fp8 weights
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
-  BENCH_DIRECT_SCALED_DOT_FFN1/FFN2 — optional comma-separated 0/1 hybrid sweep
-  BENCH_FFN1_DEQUANT_MODE — full or fchunk when FFN1 direct-scaled-dot is off
-  BENCH_FFN1_DEQUANT_CHUNK — comma-separated FFN1 dequant chunk sizes for fchunk
-  BENCH_W2_FETCH_ORDER — after_w13 or before_w13 for current-expert W2 DMA
-  BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
-  BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
@@ -217,7 +211,8 @@ def align_local_tokens_for_v2(local_num_tokens: int) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-jax.distributed.initialize()
+if os.environ.get("BENCH_SINGLE_HOST", "0") != "1":
+    jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
 from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
@@ -234,55 +229,25 @@ E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 bse = int(os.environ.get("BENCH_BSE", "256"))
+use_shared_expert = os.environ.get("BENCH_SHARED", "0") == "1"
+se_inter = int(os.environ.get("BENCH_SE_INTER", str(f)))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
 use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
-quant_block_k = int(os.environ.get("BENCH_QBK", "128"))
+_qbk_str = os.environ.get("BENCH_QBK", "128")
+quant_block_k = None if _qbk_str.lower() == "none" else int(_qbk_str)
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
-direct_scaled_dot_ffn1_modes = parse_csv_bool(
-    "BENCH_DIRECT_SCALED_DOT_FFN1",
-    [direct_scaled_dot],
-)
-direct_scaled_dot_ffn2_modes = parse_csv_bool(
-    "BENCH_DIRECT_SCALED_DOT_FFN2",
-    [direct_scaled_dot],
-)
-cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
-cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
-ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
-ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
-_default_mode = "recursive" if os.environ.get("BENCH_INKERNEL_MD", "1") == "1" else "jax"
-metadata_mode = os.environ.get("BENCH_METADATA_MODE", _default_mode)
-if metadata_mode not in ("recursive", "direct", "jax"):
-    raise ValueError(
-        f"BENCH_METADATA_MODE must be one of recursive/direct/jax; got {metadata_mode!r}"
-    )
+enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
-next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
-w2_fetch_orders = parse_csv_str("BENCH_W2_FETCH_ORDER", ["after_w13"])
-w2_fetch_priorities = parse_csv_int("BENCH_W2_FETCH_PRIORITY", [1])
-skip_inter_bt_sync_modes = parse_csv_bool(
-    "BENCH_SKIP_INTER_BT_SYNC",
-    [True],
-)
 interleave_bt_modes = parse_csv_bool(
     "BENCH_INTERLEAVE_BT",
     [True],
 )
-valid_ffn1_dequant_modes = {"full", "fchunk"}
-invalid_ffn1_dequant_modes = [
-    mode for mode in ffn1_dequant_modes if mode not in valid_ffn1_dequant_modes
-]
-if invalid_ffn1_dequant_modes:
-    raise ValueError(
-        f"Unsupported BENCH_FFN1_DEQUANT_MODE values {invalid_ffn1_dequant_modes}; "
-        "expected one of full or fchunk."
-    )
 valid_cross_expert_prefetch_modes = {"none", "full", "w13"}
 invalid_modes = [
     mode for mode in cross_expert_prefetch_modes if mode not in valid_cross_expert_prefetch_modes
@@ -292,24 +257,7 @@ if invalid_modes:
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
     )
-invalid_priorities = [
-    priority
-    for priority in (list(next_w2_prologue_priorities) + list(w2_fetch_priorities))
-    if priority not in (0, 1)
-]
-if invalid_priorities:
-    raise ValueError(
-        f"Unsupported DMA priority values {invalid_priorities}; "
-        "TPU DMA priority supports only 0 or 1."
-    )
-valid_w2_fetch_orders = {"after_w13", "before_w13"}
-invalid_w2_fetch_orders = [mode for mode in w2_fetch_orders if mode not in valid_w2_fetch_orders]
-if invalid_w2_fetch_orders:
-    raise ValueError(
-        f"Unsupported BENCH_W2_FETCH_ORDER values {invalid_w2_fetch_orders}; "
-        "expected one of after_w13 or before_w13."
-    )
-valid_routing_modes = {"random", "deterministic"}
+valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
         f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
@@ -360,7 +308,6 @@ disable_expert_stage_writeback = (
 )
 disable_expert_store_dma = all_disable or os.environ.get("DISABLE_EXPERT_STORE_DMA", "0") == "1"
 disable_expert_store_wait = all_disable or os.environ.get("DISABLE_EXPERT_STORE_WAIT", "0") == "1"
-disable_acc_and_store = all_disable or os.environ.get("DISABLE_ACC_AND_STORE", "0") == "1"
 disable_acc_load = all_disable or os.environ.get("DISABLE_ACC_LOAD", "0") == "1"
 disable_acc_compute = all_disable or os.environ.get("DISABLE_ACC_COMPUTE", "0") == "1"
 disable_acc_store_vmem = all_disable or os.environ.get("DISABLE_ACC_STORE_VMEM", "0") == "1"
@@ -388,7 +335,6 @@ ablation_flags = {
     "disable_expert_stage_writeback": disable_expert_stage_writeback,
     "disable_expert_store_dma": disable_expert_store_dma,
     "disable_expert_store_wait": disable_expert_store_wait,
-    "disable_acc_and_store": disable_acc_and_store,
     "disable_acc_load": disable_acc_load,
     "disable_acc_compute": disable_acc_compute,
     "disable_acc_store_vmem": disable_acc_store_vmem,
@@ -399,28 +345,9 @@ if active_ablation:
     log(f"ablation flags: {active_ablation}")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
-if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
-    log("input cast controls: " f"ffn1_fp8={cast_ffn1_input_fp8} ffn2_fp8={cast_ffn2_input_fp8}")
-if direct_scaled_dot_ffn1_modes != [direct_scaled_dot] or direct_scaled_dot_ffn2_modes != [
-    direct_scaled_dot
-]:
-    log(
-        "direct_scaled_dot hybrid sweep: "
-        f"ffn1={direct_scaled_dot_ffn1_modes} ffn2={direct_scaled_dot_ffn2_modes}"
-    )
-if ffn1_dequant_modes != ["full"] or ffn1_dequant_chunks != [None]:
-    log("ffn1_dequant sweep: " f"mode={ffn1_dequant_modes} chunk={ffn1_dequant_chunks}")
-log(f"metadata_mode={metadata_mode}")
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
-log(
-    "cross_expert_prefetch="
-    f"{cross_expert_prefetch_modes} next_w2_priority={next_w2_prologue_priorities}"
-)
-if w2_fetch_orders != ["after_w13"] or w2_fetch_priorities != [1]:
-    log("w2_fetch sweep: " f"order={w2_fetch_orders} priority={w2_fetch_priorities}")
-if skip_inter_bt_sync_modes != [True]:
-    log(f"skip_inter_bt_sync sweep: {skip_inter_bt_sync_modes}")
+log(f"cross_expert_prefetch={cross_expert_prefetch_modes}")
 if interleave_bt_modes != [True]:
     log(f"interleave_bt sweep: {interleave_bt_modes}")
 
@@ -525,9 +452,11 @@ def _estimate_vmem_bytes_v2(
     b_w3_scale = 0
     b_w2_scale = 0
     if use_fp8:
-        b_w1_scale = 2 * t_packing * (h_per_t // quant_block_k) * bf * 4
+        _n_sg = 1 if quant_block_k is None else h_per_t // quant_block_k
+        _n_sg2 = 1 if quant_block_k is None else bf // quant_block_k
+        b_w1_scale = 2 * t_packing * _n_sg * bf * 4
         b_w3_scale = b_w1_scale
-        b_w2_scale = 2 * t_packing * (bf // quant_block_k) * h_per_t * 4
+        b_w2_scale = 2 * t_packing * _n_sg2 * h_per_t * 4
 
     # Dequant scratch (fp8 + not direct_scaled_dot)
     b_w1_dq = 0
@@ -646,6 +575,8 @@ def generate_tune_candidates(
     vmem_headroom=0.95,
     max_configs=48,
     bse=256,
+    use_shared_expert=False,
+    se_inter=0,
     verbose=False,
 ):
     effective_budget = int(vmem_budget * vmem_headroom)
@@ -694,6 +625,10 @@ def generate_tune_candidates(
         )
         if not bts_cands:
             bts_cands = [bt]
+        if use_shared_expert:
+            # in-kernel SE DMAs the full bt-token block into the bts-sized staging
+            # buffer, so it requires bts >= bt.
+            bts_cands = [v for v in bts_cands if v >= bt] or [bt]
 
         for bts_val in bts_cands:
             btc_cands = _aligned_divisors(bts_val, 8)
@@ -701,57 +636,71 @@ def generate_tune_candidates(
                 continue
 
             for bf in bf_list:
+                # Sweep the shared-expert block size bse (<= bf, divides se_inter)
+                # only when SE is on; bse is irrelevant otherwise. Larger bse means
+                # fewer SE blocks -> less per-block SE weight-DMA overhead.
+                if use_shared_expert and se_inter > 0:
+                    bse_cands = sorted(
+                        {
+                            v
+                            for v in [128, 256, 512, 1024, 2048]
+                            if v <= bf and v <= se_inter and se_inter % v == 0
+                        }
+                    ) or [min(bf, se_inter)]
+                else:
+                    bse_cands = [bse]
                 for btc in btc_cands:
-                    bc = FusedMoEBlockConfig(
-                        bt=bt,
-                        bf=bf,
-                        btc=btc,
-                        bse=bse,
-                        bts=bts_val,
-                    )
-                    num_tokens_total = local_num_tokens * ep_size
-                    try:
-                        bc_eff = bc.effective_for(
-                            num_tokens=num_tokens_total,
+                    for bse_val in bse_cands:
+                        bc = FusedMoEBlockConfig(
+                            bt=bt,
+                            bf=bf,
+                            btc=btc,
+                            bse=bse_val,
+                            bts=bts_val,
+                        )
+                        num_tokens_total = local_num_tokens * ep_size
+                        try:
+                            bc_eff = bc.effective_for(
+                                num_tokens=num_tokens_total,
+                                ep_size=ep_size,
+                            )
+                        except ValueError:
+                            continue
+
+                        key = (bc_eff.bt, bc_eff.bf, bc_eff.btc, bc_eff.bts, bc_eff.bse)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        est = _estimate_vmem_bytes_v2(
+                            bt=bc_eff.bt,
+                            bf=bc_eff.bf,
+                            btc=bc_eff.btc,
+                            bse=bc_eff.bse,
+                            bts=bc_eff.bts,
+                            hidden_size=hidden_size,
+                            intermediate_size=intermediate_size,
+                            num_experts=num_experts,
+                            top_k=top_k,
                             ep_size=ep_size,
+                            num_tokens=num_tokens_total,
+                            use_fp8=use_fp8,
+                            quant_block_k=quant_block_k,
+                            direct_scaled_dot=direct_scaled_dot,
+                            interleave_bt=interleave_bt,
+                            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                            verbose=verbose and first_verbose,
                         )
-                    except ValueError:
-                        continue
-
-                    key = (bc_eff.bt, bc_eff.bf, bc_eff.btc, bc_eff.bts)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    est = _estimate_vmem_bytes_v2(
-                        bt=bc_eff.bt,
-                        bf=bc_eff.bf,
-                        btc=bc_eff.btc,
-                        bse=bc_eff.bse,
-                        bts=bc_eff.bts,
-                        hidden_size=hidden_size,
-                        intermediate_size=intermediate_size,
-                        num_experts=num_experts,
-                        top_k=top_k,
-                        ep_size=ep_size,
-                        num_tokens=num_tokens_total,
-                        use_fp8=use_fp8,
-                        quant_block_k=quant_block_k,
-                        direct_scaled_dot=direct_scaled_dot,
-                        interleave_bt=interleave_bt,
-                        enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-                        verbose=verbose and first_verbose,
-                    )
-                    first_verbose = False
-                    if est > effective_budget:
-                        log(
-                            f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
-                            f"btc={bc_eff.btc},bts={bc_eff.bts}: "
-                            f"{est/(1024*1024):.1f}MB > "
-                            f"{effective_budget/(1024*1024):.1f}MB"
-                        )
-                        continue
-                    configs.append(bc)
+                        first_verbose = False
+                        if est > effective_budget:
+                            log(
+                                f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
+                                f"btc={bc_eff.btc},bts={bc_eff.bts},bse={bc_eff.bse}: "
+                                f"{est/(1024*1024):.1f}MB > "
+                                f"{effective_budget/(1024*1024):.1f}MB"
+                            )
+                            continue
+                        configs.append(bc)
 
     if len(configs) <= max_configs:
         log(f"  tune: {len(configs)} configs (all pass VMEM filter)")
@@ -762,7 +711,7 @@ def generate_tune_candidates(
         bk = (cfg.bt, cfg.bts or cfg.bt)
         buckets.setdefault(bk, []).append(cfg)
     for bk in buckets:
-        buckets[bk].sort(key=lambda c: (c.bf, c.btc), reverse=True)
+        buckets[bk].sort(key=lambda c: (c.bf, c.bse, c.btc), reverse=True)
 
     selected = []
     selected_keys = set()
@@ -774,7 +723,7 @@ def generate_tune_candidates(
             if not bucket:
                 continue
             cfg = bucket.pop(0)
-            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts)
+            key = (cfg.bt, cfg.bf, cfg.btc, cfg.bts, cfg.bse)
             if key not in selected_keys:
                 selected_keys.add(key)
                 selected.append(cfg)
@@ -847,40 +796,136 @@ def make_deterministic_topk(num_tokens, top_k, num_experts):
     return topk_weights, topk_ids
 
 
+def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=0.7):
+    """Hot-expert routing: hot_load fraction of (token, k) slots route to
+    hot_frac fraction of experts; rest uniformly to the cold tail."""
+    local_tokens = num_tokens // num_devices
+    num_hot = max(1, int(num_experts * hot_frac))
+    per_device_ids = []
+    per_device_weights = []
+    rng = np.random.default_rng(42)
+    for i, dev in enumerate(jax.local_devices()):
+        is_hot = rng.random((local_tokens, top_k)) < hot_load
+        hot_ids = rng.integers(0, num_hot, size=(local_tokens, top_k), dtype=np.int32)
+        cold_ids = rng.integers(num_hot, num_experts, size=(local_tokens, top_k), dtype=np.int32)
+        ids_np = np.where(is_hot, hot_ids, cold_ids).astype(np.int32)
+        ids = jnp.array(ids_np)
+        weights = jnp.full((local_tokens, top_k), 1.0 / top_k, dtype=jnp.float32)
+        per_device_ids.append(jax.device_put(ids, dev))
+        per_device_weights.append(jax.device_put(weights, dev))
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_ids,
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_weights,
+    )
+    return topk_weights, topk_ids
+
+
 log("creating weight arrays...")
 w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
 w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
 w3 = make_sharded(k4, (E, d, f), jnp.bfloat16, 0.01)
+
+# Shared expert weights are dense (all tokens) and replicated across devices.
+w1_shared = w2_shared = w3_shared = None
+if use_shared_expert:
+    log(f"creating shared expert weights (se_inter={se_inter}, replicated)...")
+    repl_sharding = jax.sharding.NamedSharding(mesh, P())
+
+    def make_replicated(rng_key, shape, dtype, scale=1.0):
+        arrs = [
+            jax.device_put(jax.random.normal(rng_key, shape, dtype=dtype) * scale, dev)
+            for dev in jax.local_devices()
+        ]
+        return jax.make_array_from_single_device_arrays(shape, repl_sharding, arrs)
+
+    ks1, ks2, ks3 = jax.random.split(jax.random.fold_in(key, 777), 3)
+    w1_shared = make_replicated(ks1, (d, se_inter), jnp.bfloat16, 0.01)
+    w3_shared = make_replicated(ks2, (d, se_inter), jnp.bfloat16, 0.01)
+    w2_shared = make_replicated(ks3, (se_inter, d), jnp.bfloat16, 0.01)
 
 w1_scale_s = w2_scale_s = w3_scale_s = None
 qbk_arg = None
 if use_fp8:
     log(f"quantizing weights to fp8 (quant_block_k={quant_block_k})...")
 
-    @jax.jit
-    @jax.shard_map(
-        mesh=mesh,
-        in_specs=(P(("data", "tensor")),),
-        out_specs=(P(("data", "tensor")), P(("data", "tensor"))),
-        check_vma=False,
-    )
-    def quantize_shard_map(w):
-        local_w = w
-        E_loc, K_dim, N_dim = local_w.shape
-        w_f32 = local_w.astype(jnp.float32).reshape(
-            E_loc, K_dim // quant_block_k, quant_block_k, N_dim
+    if quant_block_k is None:
+
+        @jax.jit
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(P(("data", "tensor")),),
+            out_specs=(P(("data", "tensor")), P(("data", "tensor"))),
+            check_vma=False,
         )
-        amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
-        scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
-        w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
-        w_q = w_q.reshape(E_loc, K_dim, N_dim)
-        return w_q, scale.astype(jnp.float32)
+        def quantize_shard_map(w):
+            local_w = w
+            E_loc, K_dim, N_dim = local_w.shape
+            w_f32 = local_w.astype(jnp.float32)
+            amax = jnp.max(jnp.abs(w_f32), axis=1, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            scale = scale[:, :, None, :]  # (E, 1, N) -> (E, 1, 1, N)
+            return w_q, scale.astype(jnp.float32)
+
+    else:
+
+        @jax.jit
+        @jax.shard_map(
+            mesh=mesh,
+            in_specs=(P(("data", "tensor")),),
+            out_specs=(P(("data", "tensor")), P(("data", "tensor"))),
+            check_vma=False,
+        )
+        def quantize_shard_map(w):
+            local_w = w
+            E_loc, K_dim, N_dim = local_w.shape
+            w_f32 = local_w.astype(jnp.float32).reshape(
+                E_loc, K_dim // quant_block_k, quant_block_k, N_dim
+            )
+            amax = jnp.max(jnp.abs(w_f32), axis=2, keepdims=True)
+            scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+            w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+            w_q = w_q.reshape(E_loc, K_dim, N_dim)
+            return w_q, scale.astype(jnp.float32)
 
     w1, w1_scale_s = quantize_shard_map(w1)
     w2, w2_scale_s = quantize_shard_map(w2)
     w3, w3_scale_s = quantize_shard_map(w3)
     qbk_arg = quant_block_k
     log("fp8 quantization done")
+
+# Shared-expert fp8 quant (per-channel, replicated). The in-kernel SE reuses the
+# routed fp8 weight/token/output VMEM buffers, so SE weights must also be fp8.
+w1_shared_scale = w2_shared_scale = w3_shared_scale = None
+if use_shared_expert and use_fp8 and quant_block_k is None:
+    log("quantizing shared-expert weights to fp8 (per-channel, replicated)...")
+    repl_sharding2 = jax.sharding.NamedSharding(mesh, P())
+
+    def _quant_repl_pc(w):
+        # w: (K, N) -> fp8 (K, N) + per-channel scale (1, N) over the K axis.
+        w_f32 = w.astype(jnp.float32)
+        amax = jnp.max(jnp.abs(w_f32), axis=0, keepdims=True)  # (1, N)
+        scale = jnp.maximum(amax / 448.0, jnp.float32(1e-12))
+        w_q = (w_f32 / scale).astype(jnp.float8_e4m3fn)
+        return w_q, scale.astype(jnp.float32)
+
+    def _repl(x):
+        arrs = [jax.device_put(x, dev) for dev in jax.local_devices()]
+        return jax.make_array_from_single_device_arrays(x.shape, repl_sharding2, arrs)
+
+    w1s_q, w1s_sc = _quant_repl_pc(jax.device_get(w1_shared))
+    w3s_q, w3s_sc = _quant_repl_pc(jax.device_get(w3_shared))
+    w2s_q, w2s_sc = _quant_repl_pc(jax.device_get(w2_shared))
+    w1_shared, w1_shared_scale = _repl(np.asarray(w1s_q)), _repl(np.asarray(w1s_sc))
+    w3_shared, w3_shared_scale = _repl(np.asarray(w3s_q)), _repl(np.asarray(w3s_sc))
+    w2_shared, w2_shared_scale = _repl(np.asarray(w2s_q)), _repl(np.asarray(w2s_sc))
+    log("shared-expert fp8 quantization done")
 
 log("weights ready")
 
@@ -906,6 +951,8 @@ for num_tokens in token_candidates:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             bse=bse,
+            use_shared_expert=use_shared_expert,
+            se_inter=se_inter,
             verbose=(num_tokens == token_candidates[0]),
         )
         block_configs_to_try = tune_configs
@@ -923,6 +970,8 @@ for num_tokens in token_candidates:
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     if routing_mode == "deterministic":
         topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
+    elif routing_mode == "hot_expert":
+        topk_wts, topk_idx = make_hot_expert_topk(num_tokens, top_k, E)
     else:
         gating_local_shape = (num_tokens // num_devices, E)
         gating_per_dev = []
@@ -948,14 +997,6 @@ for num_tokens in token_candidates:
         for bc_raw in block_configs_to_try
         for flags in itertools.product(
             cross_expert_prefetch_modes,
-            next_w2_prologue_priorities,
-            direct_scaled_dot_ffn1_modes,
-            direct_scaled_dot_ffn2_modes,
-            ffn1_dequant_modes,
-            ffn1_dequant_chunks,
-            w2_fetch_orders,
-            w2_fetch_priorities,
-            skip_inter_bt_sync_modes,
             interleave_bt_modes,
         )
     ]
@@ -964,35 +1005,13 @@ for num_tokens in token_candidates:
     for (
         bc,
         xprefetch_mode,
-        next_w2_priority,
-        direct_ffn1,
-        direct_ffn2,
-        ffn1_dequant_mode,
-        ffn1_dequant_chunk,
-        w2_fetch_order,
-        w2_fetch_priority,
-        skip_inter_bt_sync,
         interleave_bt,
     ) in configs_to_try:
-        if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
-            continue
-        if direct_ffn1 and (
-            ffn1_dequant_mode != ffn1_dequant_modes[0]
-            or ffn1_dequant_chunk != ffn1_dequant_chunks[0]
-        ):
-            continue
-        if ffn1_dequant_mode != "fchunk" and ffn1_dequant_chunk is not None:
-            continue
         bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
-        ffn1_mode_tag = "direct" if direct_ffn1 else ffn1_dequant_mode
         tag = (
-            f"bt={bt},bf={bf},btc={btc},bts={bts},"
-            f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
-            f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
-            f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
-            f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
-            f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
-            f"skip_ibt={int(skip_inter_bt_sync)},"
+            f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
+            f"xprefetch={xprefetch_mode},"
+            f"direct={int(direct_scaled_dot)},"
             f"ilv_bt={int(interleave_bt)}"
         )
 
@@ -1011,13 +1030,9 @@ for num_tokens in token_candidates:
 
         tag_resolved = (
             f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
-            f"btc={bc_resolved.btc},bts={bc_resolved.bts},"
-            f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
-            f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
-            f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
-            f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
-            f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
-            f"skip_ibt={int(skip_inter_bt_sync)},"
+            f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
+            f"xprefetch={xprefetch_mode},"
+            f"direct={int(direct_scaled_dot)},"
             f"ilv_bt={int(interleave_bt)}"
         )
         resolved_key = (
@@ -1026,14 +1041,7 @@ for num_tokens in token_candidates:
             bc_resolved.btc,
             bc_resolved.bts,
             xprefetch_mode,
-            next_w2_priority,
-            direct_ffn1,
-            direct_ffn2,
-            ffn1_dequant_mode,
-            ffn1_dequant_chunk,
-            w2_fetch_order,
-            w2_fetch_priority,
-            skip_inter_bt_sync,
+            direct_scaled_dot,
             interleave_bt,
         )
         if resolved_key in seen_resolved_configs:
@@ -1056,6 +1064,12 @@ for num_tokens in token_candidates:
                 w1_scale=w1_scale_s,
                 w2_scale=w2_scale_s,
                 w3_scale=w3_scale_s,
+                w1_shared=w1_shared,
+                w2_shared=w2_shared,
+                w3_shared=w3_shared,
+                w1_shared_scale=w1_shared_scale,
+                w2_shared_scale=w2_shared_scale,
+                w3_shared_scale=w3_shared_scale,
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
@@ -1078,26 +1092,15 @@ for num_tokens in token_candidates:
                 disable_expert_stage_writeback=disable_expert_stage_writeback,
                 disable_expert_store_dma=disable_expert_store_dma,
                 disable_expert_store_wait=disable_expert_store_wait,
-                disable_acc_and_store=disable_acc_and_store,
                 disable_acc_load=disable_acc_load,
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
                 direct_scaled_dot=direct_scaled_dot,
-                direct_scaled_dot_ffn1=direct_ffn1,
-                direct_scaled_dot_ffn2=direct_ffn2,
-                ffn1_dequant_mode=ffn1_dequant_mode,
-                ffn1_dequant_chunk=ffn1_dequant_chunk,
-                cast_ffn1_input_fp8=cast_ffn1_input_fp8,
-                cast_ffn2_input_fp8=cast_ffn2_input_fp8,
+                enable_act_quant=enable_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
-                next_w2_prologue_priority=next_w2_priority,
-                w2_fetch_order=w2_fetch_order,
-                w2_fetch_priority=w2_fetch_priority,
-                skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-                metadata_mode=metadata_mode,
             )
 
         try:
@@ -1197,19 +1200,16 @@ if check_correctness:
             w1_scale=w1_scale_s,
             w2_scale=w2_scale_s,
             w3_scale=w3_scale_s,
+            w1_shared=w1_shared,
+            w2_shared=w2_shared,
+            w3_shared=w3_shared,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
             direct_scaled_dot=direct_scaled_dot,
-            direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
-            direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
-            ffn1_dequant_mode=ffn1_dequant_modes[0],
-            ffn1_dequant_chunk=ffn1_dequant_chunks[0],
-            cast_ffn1_input_fp8=cast_ffn1_input_fp8,
-            cast_ffn2_input_fp8=cast_ffn2_input_fp8,
-            w2_fetch_order=w2_fetch_orders[0],
-            w2_fetch_priority=w2_fetch_priorities[0],
-            skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
+            enable_act_quant=enable_act_quant,
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-            metadata_mode=metadata_mode,
         )
         ref_kwargs = {}
         if use_fp8:
@@ -1217,6 +1217,14 @@ if check_correctness:
             ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)
             ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
             ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
+        if use_shared_expert:
+            ref_kwargs["w1_shared"] = jax.device_get(w1_shared)
+            ref_kwargs["w2_shared"] = jax.device_get(w2_shared)
+            ref_kwargs["w3_shared"] = jax.device_get(w3_shared)
+            if w1_shared_scale is not None:
+                ref_kwargs["w1_shared_scale"] = jax.device_get(w1_shared_scale)
+                ref_kwargs["w2_shared_scale"] = jax.device_get(w2_shared_scale)
+                ref_kwargs["w3_shared_scale"] = jax.device_get(w3_shared_scale)
         ref = ref_moe(
             jax.device_get(tokens_c),
             jax.device_get(w1),
@@ -1234,7 +1242,8 @@ if check_correctness:
         max_err = np.max(np.abs(result_f32 - ref_f32))
         rel_err = float(max_err / (np.max(np.abs(ref_f32)) + 1e-6))
         log(f"max_abs_err={max_err:.4f}, rel_err={rel_err:.6f}")
-        if rel_err > 0.05:
+        bench_tol = float(os.environ.get("BENCH_TOL", "0.05"))
+        if rel_err > bench_tol:
             log("FAIL: relative error too high")
             sys.exit(1)
         log("PASS")

@@ -76,6 +76,7 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         metadata_mode: str = "recursive",
+        enable_act_quant: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -109,6 +110,7 @@ class FusedEPMoE(nnx.Module):
                 f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
             )
         self.metadata_mode = metadata_mode
+        self.enable_act_quant_cfg = enable_act_quant
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -546,6 +548,24 @@ class FusedEPMoEV2(FusedEPMoE):
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
 
+        # SE per-channel scales are stored 3D (1, 1, out); the v2 kernel reads them
+        # 2D (1, out). Squeeze here. None for bf16 SE weights / no shared expert.
+        w1_shared_scale = (
+            self.w1_shared_scale.value[:, 0, :] if self.w1_shared_scale is not None else None
+        )
+        w3_shared_scale = (
+            self.w3_shared_scale.value[:, 0, :] if self.w3_shared_scale is not None else None
+        )
+        w2_shared_scale = (
+            self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
+        )
+        # In-kernel act-quant (fp8 token) needs fp8 weights. Honor the explicit
+        # opt-in OR the quant-config signal, then guard on fp8 (w1_scale present)
+        # so bf16 models stay out of the act_quant kernel gate.
+        enable_act_quant = (
+            self.enable_act_quant_cfg or self.activation_quantized_dtype is not None
+        ) and (w1_scale is not None)
+
         if block_config is None:
             block_config = get_tuned_fused_moe_v2_block_config(
                 num_tokens=hidden_states.shape[0],
@@ -558,6 +578,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 ep_size=self.ep_size,
                 use_shared_expert=self.w1_shared is not None,
                 use_grouped_topk=self.use_grouped_topk,
+                enable_act_quant=enable_act_quant,
             )
 
         direct_scaled_dot = w1_scale is not None
@@ -579,7 +600,6 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_weight_load=self.disable_weight_load,
             disable_shared_expert=self.disable_shared_expert,
             disable_sync_barrier=self.disable_sync_barrier,
-            metadata_mode=self.metadata_mode,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -587,8 +607,11 @@ class FusedEPMoEV2(FusedEPMoE):
             w1_shared=w1_shared_val,
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
+            enable_act_quant=enable_act_quant,
             direct_scaled_dot=direct_scaled_dot,
-            skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
