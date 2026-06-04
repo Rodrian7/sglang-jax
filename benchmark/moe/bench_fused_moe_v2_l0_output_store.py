@@ -66,8 +66,7 @@ def _output_store_l0_kernel(
         pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=dma_sem).wait()
 
     def body(i, _):
-        tile = x_hbm.at[pl.ds(0, rows), pl.ds(0, hidden_size)][...]
-        tile = tile + jnp.asarray(i + 1, dtype=tile.dtype)
+        tile = jnp.full((rows, hidden_size), i + 1, dtype=stage_vmem.dtype)
 
         if mode == "direct_hbm_store":
             target = out_hbm.at[pl.ds(0, rows), pl.ds(0, hidden_size)]
