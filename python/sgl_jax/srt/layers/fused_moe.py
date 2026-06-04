@@ -672,6 +672,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_acc_store_vmem=self.disable_acc_store_vmem,
             disable_output_store=self.disable_output_store,
             disable_shared_expert=self.disable_shared_expert,
+            disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
             metadata_mode=self.metadata_mode,
             metadata_window_prefetch_first_expert=os.environ.get(

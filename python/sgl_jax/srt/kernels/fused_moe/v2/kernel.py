@@ -325,6 +325,7 @@ def _fused_ep_moe_kernel(
     disable_a2a_gather_local_copy: bool = False,
     disable_a2a_gather_remote_copy: bool = False,
     disable_shared_expert: bool = False,
+    disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
     disable_weight_load: bool = False,
     disable_w1_load: bool = False,
@@ -558,7 +559,8 @@ def _fused_ep_moe_kernel(
     # Copies routing + metadata into SMEM via VMEM staging (HBM→VMEM→SMEM).
     def all_reduce_metadata(*, bt_id, bt_sem_id, t2e_routing):
         if disable_a2a:
-            return
+            if not disable_all_reduce_metadata:
+                return
 
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
@@ -629,6 +631,81 @@ def _fused_ep_moe_kernel(
 
             pl.run_scoped(
                 _copy_precomputed,
+                pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+                pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+                pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
+                pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
+                pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
+            )
+            return
+
+        if disable_all_reduce_metadata:
+
+            def _local_metadata(
+                t2e_routing_vmem,
+                d2e_count_vmem,
+                offsets_vmem,
+                starts_vmem,
+                sizes_vmem,
+            ):
+                offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+                t2e_routing_vmem[...] = t2e_routing[:, :routing_smem_top_k]
+
+                expert_iota = lax.broadcasted_iota(
+                    jnp.int32,
+                    (1, 1, padded_num_experts),
+                    2,
+                )
+                routing_expanded = jnp.expand_dims(
+                    t2e_routing[:, :top_k],
+                    axis=2,
+                )
+                mask = (routing_expanded == expert_iota).astype(jnp.int32)
+                local_sizes = jnp.sum(
+                    mask,
+                    axis=(0, 1),
+                    keepdims=True,
+                ).reshape(1, padded_num_experts)
+
+                starts_vmem[...] = jnp.zeros_like(starts_vmem)
+                sizes_vmem[...] = local_sizes
+                d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+                d2e_count_vmem[my_id] = local_sizes
+
+                offsets_copy = pltpu.async_copy(
+                    src_ref=offsets_vmem,
+                    dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
+                    sem=offsets_sem,
+                )
+                t2e_routing_copy = pltpu.async_copy(
+                    src_ref=t2e_routing_vmem,
+                    dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
+                    sem=routing_sem,
+                )
+                starts_copy = pltpu.async_copy(
+                    src_ref=starts_vmem,
+                    dst_ref=expert_starts_x2_smem.at[bt_sem_id],
+                    sem=local_sems.at[bt_sem_id, 1],
+                )
+                sizes_copy = pltpu.async_copy(
+                    src_ref=sizes_vmem,
+                    dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
+                    sem=local_sems.at[bt_sem_id, 2],
+                )
+                d2e_count_copy = pltpu.async_copy(
+                    src_ref=d2e_count_vmem,
+                    dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                    sem=local_sems.at[bt_sem_id, 3],
+                )
+
+                t2e_routing_copy.wait()
+                offsets_copy.wait()
+                starts_copy.wait()
+                sizes_copy.wait()
+                d2e_count_copy.wait()
+
+            pl.run_scoped(
+                _local_metadata,
                 pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
                 pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
                 pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
@@ -2502,6 +2579,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_a2a_gather_local_copy",
         "disable_a2a_gather_remote_copy",
         "disable_shared_expert",
+        "disable_all_reduce_metadata",
         "disable_sync_barrier",
         "disable_weight_load",
         "disable_w1_load",
@@ -2569,6 +2647,7 @@ def fused_ep_moe_v2(
     disable_a2a_gather_local_copy: bool = False,
     disable_a2a_gather_remote_copy: bool = False,
     disable_shared_expert: bool = False,
+    disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
     disable_weight_load: bool = False,
     disable_w1_load: bool = False,
@@ -2718,6 +2797,10 @@ def fused_ep_moe_v2(
             f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
         )
     needs_jax_allreduce = (metadata_mode == "jax") and ep_size > 1
+    if ep_size > 1 and not disable_a2a and disable_all_reduce_metadata:
+        raise ValueError(
+            "disable_all_reduce_metadata is only supported with disable_a2a=True or ep_size=1."
+        )
 
     padded_num_experts = align_to(num_experts, 128)
     pad_topk_to_128 = _env_bool("FUSED_MOE_V2_PAD_TOPK_TO_128", True)
@@ -2955,6 +3038,7 @@ def fused_ep_moe_v2(
                 disable_a2a_gather_local_copy=disable_a2a_gather_local_copy,
                 disable_a2a_gather_remote_copy=disable_a2a_gather_remote_copy,
                 disable_shared_expert=disable_shared_expert,
+                disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
                 disable_weight_load=disable_weight_load,
                 disable_w1_load=disable_w1_load,

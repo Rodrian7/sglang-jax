@@ -607,6 +607,7 @@ def run_all(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    disable_all_reduce_metadata: bool = False,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
@@ -712,6 +713,7 @@ def run_all(
             "disable_acc_compute": disable_acc_compute,
             "disable_acc_store_vmem": disable_acc_store_vmem,
             "disable_output_store": disable_output_store,
+            "disable_all_reduce_metadata": disable_all_reduce_metadata,
         }.items()
         if enabled
     ]
@@ -839,6 +841,7 @@ def run_all(
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
+                disable_all_reduce_metadata=disable_all_reduce_metadata,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=1,
                 top_k_groups=1,
@@ -1337,6 +1340,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-acc-compute", action="store_true")
     parser.add_argument("--disable-acc-store-vmem", action="store_true")
     parser.add_argument("--disable-output-store", action="store_true")
+    parser.add_argument("--disable-all-reduce-metadata", action="store_true")
+    parser.add_argument(
+        "--disable-all-ablation",
+        action="store_true",
+        help=(
+            "Disable all controllable production stages while keeping the expert loop active. "
+            "Use this to measure the residual skeleton floor."
+        ),
+    )
+    parser.add_argument(
+        "--enable-weight-load",
+        action="store_true",
+        help=(
+            "With --disable-all-ablation, keep W1/W3/W2 weight and scale loads enabled "
+            "to measure the pure load-weight path."
+        ),
+    )
     parser.add_argument(
         "--cross-expert-prefetch-mode",
         type=str,
@@ -1405,6 +1425,10 @@ if __name__ == "__main__":
     weight_dtype = DTYPE_MAP[args.weight_dtype]
     quant_block_k = args.quant_block_k if args.quant_block_k and args.quant_block_k > 0 else None
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
+    disable_all = args.disable_all_ablation
+    enable_weight_load = args.enable_weight_load
+    disable_weight_dma = disable_all and not enable_weight_load
+    disable_weight_scale_load = disable_all and not enable_weight_load
     try:
         run_all(
             args.iters,
@@ -1435,39 +1459,52 @@ if __name__ == "__main__":
             print_routing_stats=args.print_routing_stats,
             print_pipeline_stats=args.print_pipeline_stats,
             routing_mode=args.routing_mode,
-            disable_a2a=args.disable_a2a,
-            disable_dynamic_ffn1=args.disable_dynamic_ffn1,
-            disable_dynamic_ffn2=args.disable_dynamic_ffn2,
-            disable_weight_load=args.disable_weight_load,
-            disable_sync_barrier=args.disable_sync_barrier,
-            disable_a2a_scatter=args.disable_a2a_scatter,
-            disable_a2a_scatter_local_copy=args.disable_a2a_scatter_local_copy,
-            disable_a2a_scatter_remote_copy=args.disable_a2a_scatter_remote_copy,
-            disable_a2a_scatter_recv_wait=args.disable_a2a_scatter_recv_wait,
-            disable_a2a_scatter_send_wait=args.disable_a2a_scatter_send_wait,
-            disable_a2a_gather=args.disable_a2a_gather,
-            disable_a2a_gather_local_copy=args.disable_a2a_gather_local_copy,
-            disable_a2a_gather_remote_copy=args.disable_a2a_gather_remote_copy,
-            disable_w1_load=args.disable_w1_load,
-            disable_w3_load=args.disable_w3_load,
-            disable_w2_load=args.disable_w2_load,
-            disable_w1_scale_load=args.disable_scale_load or args.disable_w1_scale_load,
-            disable_w3_scale_load=args.disable_scale_load or args.disable_w3_scale_load,
-            disable_w2_scale_load=args.disable_scale_load or args.disable_w2_scale_load,
-            disable_w1_scale_apply=args.disable_scale_apply or args.disable_w1_scale_apply,
-            disable_w3_scale_apply=args.disable_scale_apply or args.disable_w3_scale_apply,
-            disable_w2_scale_apply=args.disable_scale_apply or args.disable_w2_scale_apply,
-            disable_expert_x_load=args.disable_expert_x_load,
+            disable_a2a=disable_all or args.disable_a2a,
+            disable_dynamic_ffn1=disable_all or args.disable_dynamic_ffn1,
+            disable_dynamic_ffn2=disable_all or args.disable_dynamic_ffn2,
+            disable_weight_load=disable_weight_dma or args.disable_weight_load,
+            disable_sync_barrier=disable_all or args.disable_sync_barrier,
+            disable_a2a_scatter=disable_all or args.disable_a2a_scatter,
+            disable_a2a_scatter_local_copy=disable_all or args.disable_a2a_scatter_local_copy,
+            disable_a2a_scatter_remote_copy=disable_all or args.disable_a2a_scatter_remote_copy,
+            disable_a2a_scatter_recv_wait=disable_all or args.disable_a2a_scatter_recv_wait,
+            disable_a2a_scatter_send_wait=disable_all or args.disable_a2a_scatter_send_wait,
+            disable_a2a_gather=disable_all or args.disable_a2a_gather,
+            disable_a2a_gather_local_copy=disable_all or args.disable_a2a_gather_local_copy,
+            disable_a2a_gather_remote_copy=disable_all or args.disable_a2a_gather_remote_copy,
+            disable_w1_load=disable_weight_dma or args.disable_w1_load,
+            disable_w3_load=disable_weight_dma or args.disable_w3_load,
+            disable_w2_load=disable_weight_dma or args.disable_w2_load,
+            disable_w1_scale_load=disable_weight_scale_load
+            or args.disable_scale_load
+            or args.disable_w1_scale_load,
+            disable_w3_scale_load=disable_weight_scale_load
+            or args.disable_scale_load
+            or args.disable_w3_scale_load,
+            disable_w2_scale_load=disable_weight_scale_load
+            or args.disable_scale_load
+            or args.disable_w2_scale_load,
+            disable_w1_scale_apply=disable_all
+            or args.disable_scale_apply
+            or args.disable_w1_scale_apply,
+            disable_w3_scale_apply=disable_all
+            or args.disable_scale_apply
+            or args.disable_w3_scale_apply,
+            disable_w2_scale_apply=disable_all
+            or args.disable_scale_apply
+            or args.disable_w2_scale_apply,
+            disable_expert_x_load=disable_all or args.disable_expert_x_load,
             disable_expert_ffn=args.disable_expert_ffn,
-            disable_expert_store=args.disable_expert_store,
-            disable_expert_stage_writeback=args.disable_expert_stage_writeback,
-            disable_expert_store_dma=args.disable_expert_store_dma,
-            disable_expert_store_wait=args.disable_expert_store_wait,
-            disable_acc_and_store=args.disable_acc_and_store,
-            disable_acc_load=args.disable_acc_load,
-            disable_acc_compute=args.disable_acc_compute,
-            disable_acc_store_vmem=args.disable_acc_store_vmem,
-            disable_output_store=args.disable_output_store,
+            disable_expert_store=disable_all or args.disable_expert_store,
+            disable_expert_stage_writeback=disable_all or args.disable_expert_stage_writeback,
+            disable_expert_store_dma=disable_all or args.disable_expert_store_dma,
+            disable_expert_store_wait=disable_all or args.disable_expert_store_wait,
+            disable_acc_and_store=disable_all or args.disable_acc_and_store,
+            disable_acc_load=disable_all or args.disable_acc_load,
+            disable_acc_compute=disable_all or args.disable_acc_compute,
+            disable_acc_store_vmem=disable_all or args.disable_acc_store_vmem,
+            disable_output_store=disable_all or args.disable_output_store,
+            disable_all_reduce_metadata=disable_all or args.disable_all_reduce_metadata,
             cross_expert_prefetch_mode=args.cross_expert_prefetch_mode,
             next_w2_prologue_priority=args.next_w2_prologue_priority,
             w2_fetch_order=args.w2_fetch_order,
