@@ -1,6 +1,7 @@
 """MiMo-V2-Flash model implementation for SGLang-JAX."""
 
 import logging
+import os
 from typing import Any
 
 import jax
@@ -128,6 +129,7 @@ class MiMoV2Moe(nnx.Module):
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
                 metadata_mode=getattr(config, "moe_metadata_mode", "recursive"),
+                disable_post_output_sync=os.environ.get("MOE_DISABLE_POST_OUTPUT_SYNC", "0") == "1",
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(
