@@ -449,11 +449,12 @@ class BaseSpecWorker:
             dext_fb, logits_metadata=dext_logits_metadata,
         )
 
-        rep_logits, rep_hidden = replicate_to_mesh(
-            self.mesh, draft_logits_output.next_token_logits,
-            draft_logits_output.hidden_states,
+        topk_p, topk_index = topk_probs_from_logits(
+            draft_logits_output.next_token_logits, self.topk,
         )
-        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
+        rep_hidden = replicate_to_mesh_jit(
+            self.mesh, draft_logits_output.hidden_states,
+        )
 
         # === Phase 5: device_get — all TPU work done ===
         jax.copy_to_host_async(topk_p)
