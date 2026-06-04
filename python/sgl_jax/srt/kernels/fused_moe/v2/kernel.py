@@ -327,6 +327,9 @@ def _fused_ep_moe_kernel(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    disable_metadata_pre_sync: bool = False,
+    disable_metadata_post_sync: bool = False,
+    disable_kernel_start_sync: bool = False,
     disable_weight_load: bool = False,
     disable_w1_load: bool = False,
     disable_w3_load: bool = False,
@@ -757,7 +760,8 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = local_sizes
 
-            sync_barrier()
+            if not disable_metadata_pre_sync:
+                sync_barrier()
 
             if metadata_mode == "direct":
                 # Port from v1 (fused-moe-calibration @ bed5b39984, kernel.py:808-852).
@@ -920,7 +924,8 @@ def _fused_ep_moe_kernel(
                         sem=md_send_sem,
                     ).wait()
 
-            sync_barrier()
+            if not disable_metadata_post_sync:
+                sync_barrier()
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
@@ -2458,7 +2463,8 @@ def _fused_ep_moe_kernel(
         return e_sem_id
 
     # ===== Kernel start =====
-    sync_barrier()
+    if not disable_kernel_start_sync:
+        sync_barrier()
 
     if use_gather_bank:
 
@@ -2591,6 +2597,9 @@ def jax_allreduce_metadata_by_bt(
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
+        "disable_metadata_pre_sync",
+        "disable_metadata_post_sync",
+        "disable_kernel_start_sync",
         "disable_weight_load",
         "disable_w1_load",
         "disable_w3_load",
@@ -2661,6 +2670,9 @@ def fused_ep_moe_v2(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    disable_metadata_pre_sync: bool = False,
+    disable_metadata_post_sync: bool = False,
+    disable_kernel_start_sync: bool = False,
     disable_weight_load: bool = False,
     disable_w1_load: bool = False,
     disable_w3_load: bool = False,
@@ -2921,6 +2933,12 @@ def fused_ep_moe_v2(
         scope_name += "-no_post_gather_path"
     if disable_post_output_sync:
         scope_name += "-no_post_output_sync"
+    if disable_metadata_pre_sync:
+        scope_name += "-no_metadata_pre_sync"
+    if disable_metadata_post_sync:
+        scope_name += "-no_metadata_post_sync"
+    if disable_kernel_start_sync:
+        scope_name += "-no_kernel_start_sync"
     if skip_inter_bt_sync:
         scope_name += "-skip_inter_bt_sync"
     if interleave_bt:
@@ -3060,6 +3078,9 @@ def fused_ep_moe_v2(
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
+                disable_metadata_pre_sync=disable_metadata_pre_sync,
+                disable_metadata_post_sync=disable_metadata_post_sync,
+                disable_kernel_start_sync=disable_kernel_start_sync,
                 disable_weight_load=disable_weight_load,
                 disable_w1_load=disable_w1_load,
                 disable_w3_load=disable_w3_load,

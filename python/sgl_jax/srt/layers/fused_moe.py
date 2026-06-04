@@ -107,6 +107,9 @@ class FusedEPMoE(nnx.Module):
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
+        disable_metadata_pre_sync: bool = False,
+        disable_metadata_post_sync: bool = False,
+        disable_kernel_start_sync: bool = False,
         metadata_mode: str = "recursive",
         cross_expert_prefetch_mode: str = "full",
         next_w2_prologue_priority: int = 1,
@@ -170,6 +173,9 @@ class FusedEPMoE(nnx.Module):
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
+        self.disable_metadata_pre_sync = disable_metadata_pre_sync
+        self.disable_metadata_post_sync = disable_metadata_post_sync
+        self.disable_kernel_start_sync = disable_kernel_start_sync
         if metadata_mode not in ("recursive", "direct", "jax"):
             raise ValueError(
                 f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
@@ -680,6 +686,9 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
+            disable_metadata_pre_sync=self.disable_metadata_pre_sync,
+            disable_metadata_post_sync=self.disable_metadata_post_sync,
+            disable_kernel_start_sync=self.disable_kernel_start_sync,
             metadata_mode=self.metadata_mode,
             metadata_window_prefetch_first_expert=os.environ.get(
                 "MOE_METADATA_WINDOW_PREFETCH_FIRST_EXPERT", "0"

@@ -579,6 +579,9 @@ def run_all(
     disable_dynamic_ffn2: bool = False,
     disable_weight_load: bool = False,
     disable_sync_barrier: bool = False,
+    disable_metadata_pre_sync: bool = False,
+    disable_metadata_post_sync: bool = False,
+    disable_kernel_start_sync: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_scatter_local_copy: bool = False,
     disable_a2a_scatter_remote_copy: bool = False,
@@ -687,6 +690,9 @@ def run_all(
             "disable_dynamic_ffn2": disable_dynamic_ffn2,
             "disable_weight_load": disable_weight_load,
             "disable_sync_barrier": disable_sync_barrier,
+            "disable_metadata_pre_sync": disable_metadata_pre_sync,
+            "disable_metadata_post_sync": disable_metadata_post_sync,
+            "disable_kernel_start_sync": disable_kernel_start_sync,
             "disable_a2a_scatter": disable_a2a_scatter,
             "disable_a2a_scatter_local_copy": disable_a2a_scatter_local_copy,
             "disable_a2a_scatter_remote_copy": disable_a2a_scatter_remote_copy,
@@ -817,6 +823,9 @@ def run_all(
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
                 disable_weight_load=disable_weight_load,
                 disable_sync_barrier=disable_sync_barrier,
+                disable_metadata_pre_sync=disable_metadata_pre_sync,
+                disable_metadata_post_sync=disable_metadata_post_sync,
+                disable_kernel_start_sync=disable_kernel_start_sync,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
                 disable_a2a_scatter_remote_copy=disable_a2a_scatter_remote_copy,
@@ -1359,6 +1368,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip only the post-gather sync_barrier before start_send_bo.",
     )
+    parser.add_argument(
+        "--disable-metadata-pre-sync",
+        action="store_true",
+        help="Skip only the direct-metadata sync_barrier before metadata remote copies.",
+    )
+    parser.add_argument(
+        "--disable-metadata-post-sync",
+        action="store_true",
+        help="Skip only the direct-metadata sync_barrier after metadata send/recv waits.",
+    )
+    parser.add_argument(
+        "--disable-kernel-start-sync",
+        action="store_true",
+        help="Skip only the kernel-entry sync_barrier.",
+    )
     parser.add_argument("--disable-all-reduce-metadata", action="store_true")
     parser.add_argument(
         "--disable-all-ablation",
@@ -1483,6 +1507,9 @@ if __name__ == "__main__":
             disable_dynamic_ffn2=disable_all or args.disable_dynamic_ffn2,
             disable_weight_load=disable_weight_dma or args.disable_weight_load,
             disable_sync_barrier=disable_all or args.disable_sync_barrier,
+            disable_metadata_pre_sync=disable_all or args.disable_metadata_pre_sync,
+            disable_metadata_post_sync=disable_all or args.disable_metadata_post_sync,
+            disable_kernel_start_sync=disable_all or args.disable_kernel_start_sync,
             disable_a2a_scatter=disable_all or args.disable_a2a_scatter,
             disable_a2a_scatter_local_copy=disable_all or args.disable_a2a_scatter_local_copy,
             disable_a2a_scatter_remote_copy=disable_all or args.disable_a2a_scatter_remote_copy,
