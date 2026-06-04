@@ -1612,14 +1612,11 @@ def get_default_block_sizes(
 
 def get_vmem_limit():
     try:
-        cap = pltpu.get_tpu_info().vmem_capacity_bytes
-        # Device-dependent budget. On v7 the full VMEM capacity is fastest and is
-        # required to compile some (decode, hd256, bkv>=256) layouts without an XLA
-        # MSA "conflicting pending required assignment" CHECK-failure; the tuned
-        # table's v7 entries are measured against it. On v6e/v5 the Mosaic
-        # scheduler emits faster code with the conservative half budget (full
-        # regresses e.g. mixed hd128 num_tokens=4096 by ~68%), so keep upstream //2.
-        vmem_limit_bytes = cap if get_tpu_version() == 7 else cap // 2
+        # Use full VMEM capacity. Required to compile some (decode, hd256,
+        # bkv>=256) layouts the tuned table selects without an XLA MSA
+        # "conflicting pending required assignment" CHECK-failure that the
+        # default //2 budget triggers.
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     except Exception:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     return vmem_limit_bytes
@@ -1843,10 +1840,7 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = pltpu.VMEM(
-            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
-            q.dtype,
-        )
+        bo_double_buf = bq_double_buf
 
         if use_causal_mask:
             bkvmask_double_buf = None
@@ -1860,10 +1854,7 @@ def ragged_paged_attention(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
-        m_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
-            out_dtype,
-        )
+        m_scratch = l_scratch
 
         acc_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
