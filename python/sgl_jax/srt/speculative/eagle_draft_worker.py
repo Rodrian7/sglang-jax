@@ -52,6 +52,7 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
         self.hot_token_ids = None
+        self._hot_token_ids_np = None
 
         req_to_token_pool, _ = target_worker.get_memory_pool()
 
@@ -98,12 +99,18 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.draft_model_runner.model.hot_token_ids,
                     sharding=(NamedSharding(self._worker.mesh, P())),
                 )
+                self._hot_token_ids_np = np.asarray(
+                    self.draft_model_runner.model.hot_token_ids
+                )
         else:
             if self.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
                     self.draft_model_runner.model.hot_token_ids,
                     sharding=(NamedSharding(self._worker.mesh, P())),
+                )
+                self._hot_token_ids_np = np.asarray(
+                    self.draft_model_runner.model.hot_token_ids
                 )
                 head.data = head.data[self.hot_token_ids]
 
@@ -366,7 +373,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
-            model_worker_batch.spec_info_padded.topk_index = self.hot_token_ids[topk_index]
+            model_worker_batch.spec_info_padded.topk_index = self._hot_token_ids_np[topk_index]
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                 build_tree_mask_for_draft_decode(
