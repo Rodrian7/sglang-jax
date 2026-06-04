@@ -24,6 +24,7 @@ import statistics
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
@@ -190,6 +191,24 @@ def run(args: argparse.Namespace) -> None:
                 ep_size=args.ep_size,
             )
 
+        if not args.skip_validation:
+            out = compute()
+            jax.block_until_ready(out)
+            out_host = np.asarray(out)
+            expected = np.asarray(args.repeats, dtype=out_host.dtype)
+            if not np.all(out_host == expected):
+                raise AssertionError(
+                    "L0 output validation failed "
+                    f"mode={mode} expected={expected} "
+                    f"min={out_host.min()} max={out_host.max()}"
+                )
+            print(
+                "L0_OUTPUT_STORE_VALIDATE "
+                f"name={scope_name} mode={mode} expected={expected} "
+                f"shape={out_host.shape}",
+                flush=True,
+            )
+
         times = multiple_iteration_timeit_from_trace(
             compute_func=compute,
             data_generator=lambda: (),
@@ -222,6 +241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--trace-root", default="/tmp/tpu_logs/v2_l0_output_store_trace")
+    parser.add_argument("--skip-validation", action="store_true")
     args = parser.parse_args()
     args.modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     return args
