@@ -351,6 +351,7 @@ def _fused_ep_moe_kernel(
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
     disable_post_gather_path: bool = False,
+    disable_post_output_sync: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
@@ -2433,7 +2434,8 @@ def _fused_ep_moe_kernel(
                 out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            sync_barrier()
+            if not disable_post_output_sync:
+                sync_barrier()
             start_send_bo(bt_id=bt_id)
 
             for tail_e_id in range(local_num_experts):
@@ -2484,7 +2486,8 @@ def _fused_ep_moe_kernel(
                 out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            sync_barrier()
+            if not disable_post_output_sync:
+                sync_barrier()
             start_send_bo(bt_id=bt_id)
 
             tail_start = max(local_num_experts - expert_buffer_count, 0)
@@ -2612,6 +2615,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_acc_store_vmem",
         "disable_output_store",
         "disable_post_gather_path",
+        "disable_post_output_sync",
         "metadata_mode",
         "enable_bt_scatter_overlap",
         "block_config",
@@ -2681,6 +2685,7 @@ def fused_ep_moe_v2(
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
     disable_post_gather_path: bool = False,
+    disable_post_output_sync: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     w1_shared: jax.Array | None = None,
@@ -2914,6 +2919,8 @@ def fused_ep_moe_v2(
         scope_name += "-no_acc_store"
     if disable_post_gather_path:
         scope_name += "-no_post_gather_path"
+    if disable_post_output_sync:
+        scope_name += "-no_post_output_sync"
     if skip_inter_bt_sync:
         scope_name += "-skip_inter_bt_sync"
     if interleave_bt:
@@ -3077,6 +3084,7 @@ def fused_ep_moe_v2(
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
                 disable_post_gather_path=disable_post_gather_path,
+                disable_post_output_sync=disable_post_output_sync,
                 metadata_mode=metadata_mode,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
