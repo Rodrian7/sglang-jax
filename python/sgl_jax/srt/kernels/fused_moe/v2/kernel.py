@@ -353,6 +353,7 @@ def _fused_ep_moe_kernel(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    direct_output_store: bool = False,
     disable_post_gather_path: bool = False,
     disable_post_output_sync: bool = False,
     metadata_mode: str = "recursive",
@@ -2100,10 +2101,11 @@ def _fused_ep_moe_kernel(
 
     # ===== Output accumulation =====
 
-    def acc_and_store_output(*, bt_sem_id, out_buf_id, gather_bank_id):
+    def acc_and_store_output(*, bt_id, bt_sem_id, out_buf_id, gather_bank_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
         assert bt % acc_bt == 0
         num_acc_tiles = bt // acc_bt
+        bt_start = bt_id * bt
 
         def start_load_acc_bt(*, tile_start, buf_id):
             if disable_acc_and_store or disable_acc_load:
@@ -2174,10 +2176,13 @@ def _fused_ep_moe_kernel(
                 ]
                 output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
 
-            target = b_output_x2_vmem.at[
-                out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
-            ]
             if not disable_acc_and_store and not disable_acc_store_vmem:
+                if direct_output_store:
+                    target = output_hbm.at[pl.ds(bt_start + out_offset, acc_bt)]
+                else:
+                    target = b_output_x2_vmem.at[
+                        out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
+                    ]
                 target[...] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
 
         start_load_acc_bt(tile_start=0, buf_id=0)
@@ -2201,7 +2206,7 @@ def _fused_ep_moe_kernel(
     # ===== Output DMA =====
 
     def start_send_bo(*, bt_id, priority=0):
-        if disable_acc_and_store or disable_output_store:
+        if disable_acc_and_store or disable_output_store or direct_output_store:
             return
         bt_sem_id = bt_bank_id(bt_id)
         bt_start = bt_id * bt
@@ -2212,7 +2217,7 @@ def _fused_ep_moe_kernel(
         ).start(priority=priority)
 
     def wait_store_output(*, bt_id):
-        if disable_acc_and_store or disable_output_store:
+        if disable_acc_and_store or disable_output_store or direct_output_store:
             return
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
         bt_sem_id = bt_bank_id(bt_id)
@@ -2435,11 +2440,12 @@ def _fused_ep_moe_kernel(
         if not skip_post_gather and not disable_post_gather_path:
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id)
             acc_and_store_output(
+                bt_id=bt_id,
                 bt_sem_id=bt_sem_id,
                 out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            if not disable_post_output_sync:
+            if not disable_post_output_sync and not direct_output_store:
                 sync_barrier()
             start_send_bo(bt_id=bt_id)
 
@@ -2488,11 +2494,12 @@ def _fused_ep_moe_kernel(
                 gather_bank_id=gather_bank_id,
             )
             acc_and_store_output(
+                bt_id=bt_id,
                 bt_sem_id=bt_sem_id,
                 out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            if not disable_post_output_sync:
+            if not disable_post_output_sync and not direct_output_store:
                 sync_barrier()
             start_send_bo(bt_id=bt_id)
 
@@ -2623,6 +2630,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_acc_compute",
         "disable_acc_store_vmem",
         "disable_output_store",
+        "direct_output_store",
         "disable_post_gather_path",
         "disable_post_output_sync",
         "metadata_mode",
@@ -2696,6 +2704,7 @@ def fused_ep_moe_v2(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    direct_output_store: bool = False,
     disable_post_gather_path: bool = False,
     disable_post_output_sync: bool = False,
     metadata_mode: str = "recursive",
@@ -2929,6 +2938,8 @@ def fused_ep_moe_v2(
         )
     if disable_acc_and_store:
         scope_name += "-no_acc_store"
+    if direct_output_store:
+        scope_name += "-direct_output_store"
     if disable_post_gather_path:
         scope_name += "-no_post_gather_path"
     if disable_post_output_sync:
@@ -3104,6 +3115,7 @@ def fused_ep_moe_v2(
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
+                direct_output_store=direct_output_store,
                 disable_post_gather_path=disable_post_gather_path,
                 disable_post_output_sync=disable_post_output_sync,
                 metadata_mode=metadata_mode,

@@ -610,6 +610,7 @@ def run_all(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    direct_output_store: bool = False,
     disable_post_gather_path: bool = False,
     disable_post_output_sync: bool = False,
     disable_all_reduce_metadata: bool = False,
@@ -721,6 +722,7 @@ def run_all(
             "disable_acc_compute": disable_acc_compute,
             "disable_acc_store_vmem": disable_acc_store_vmem,
             "disable_output_store": disable_output_store,
+            "direct_output_store": direct_output_store,
             "disable_post_gather_path": disable_post_gather_path,
             "disable_post_output_sync": disable_post_output_sync,
             "disable_all_reduce_metadata": disable_all_reduce_metadata,
@@ -854,6 +856,7 @@ def run_all(
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
+                direct_output_store=direct_output_store,
                 disable_post_gather_path=disable_post_gather_path,
                 disable_post_output_sync=disable_post_output_sync,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
@@ -1355,6 +1358,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-acc-compute", action="store_true")
     parser.add_argument("--disable-acc-store-vmem", action="store_true")
     parser.add_argument("--disable-output-store", action="store_true")
+    parser.add_argument("--direct-output-store", action="store_true")
     parser.add_argument(
         "--disable-post-gather-path",
         action="store_true",
@@ -1550,6 +1554,7 @@ if __name__ == "__main__":
             disable_acc_compute=disable_all or args.disable_acc_compute,
             disable_acc_store_vmem=disable_all or args.disable_acc_store_vmem,
             disable_output_store=disable_all or args.disable_output_store,
+            direct_output_store=args.direct_output_store,
             disable_post_gather_path=disable_all or args.disable_post_gather_path,
             disable_post_output_sync=disable_all or args.disable_post_output_sync,
             disable_all_reduce_metadata=disable_all or args.disable_all_reduce_metadata,

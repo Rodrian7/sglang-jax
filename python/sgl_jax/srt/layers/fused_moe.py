@@ -102,6 +102,7 @@ class FusedEPMoE(nnx.Module):
         disable_acc_compute: bool = False,
         disable_acc_store_vmem: bool = False,
         disable_output_store: bool = False,
+        direct_output_store: bool = False,
         disable_post_gather_path: bool = False,
         disable_post_output_sync: bool = False,
         disable_shared_expert: bool = False,
@@ -168,6 +169,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_acc_compute = disable_acc_compute
         self.disable_acc_store_vmem = disable_acc_store_vmem
         self.disable_output_store = disable_output_store
+        self.direct_output_store = direct_output_store
         self.disable_post_gather_path = disable_post_gather_path
         self.disable_post_output_sync = disable_post_output_sync
         self.disable_shared_expert = disable_shared_expert
@@ -681,6 +683,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_acc_compute=self.disable_acc_compute,
             disable_acc_store_vmem=self.disable_acc_store_vmem,
             disable_output_store=self.disable_output_store,
+            direct_output_store=self.direct_output_store,
             disable_post_gather_path=self.disable_post_gather_path,
             disable_post_output_sync=self.disable_post_output_sync,
             disable_shared_expert=self.disable_shared_expert,
