@@ -91,6 +91,28 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (1, 512, 1, 512),
         ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 512): (1, 512, 1, 512),
         ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (1, 512, 1, 512),
+        # SWA mixed/prefill (p/m) — originally left to heuristic (bq=4 bkv=1024,
+        # reads 8x the 128-token window). SMEM = f(max_num_seqs*pages_per_seq),
+        # independent of bq/bkv (get_smem_estimate_bytes), so these fit the same
+        # SMEM the heuristic already runs at. Hand-set to the proven full-attn
+        # ("m",None,...) block values (bq 4->32 is the +75% lever; bkv 256/512
+        # << 1024 cuts wasted KV read). Tune later if it pays off. 2026-06-04.
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 8): (8, 256, 8, 256),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 16): (16, 256, 16, 256),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 32): (32, 256, 32, 256),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 64): (32, 256, 32, 256),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 128): (32, 256, 32, 256),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 256): (32, 256, 32, 256),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 512): (32, 512, 32, 512),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 1024): (32, 512, 32, 512),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 4096): (32, 512, 32, 512),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 8192): (32, 512, 32, 512),
+        ("m", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 16384): (32, 512, 32, 512),
+        ("p", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 2048): (32, 512, 32, 512),
+        ("p", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 4096): (32, 512, 32, 512),
+        ("p", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 8192): (32, 512, 32, 512),
+        ("p", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 16384): (32, 512, 32, 512),
     },
 }
 
