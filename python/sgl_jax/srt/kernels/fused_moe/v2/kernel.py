@@ -2423,7 +2423,7 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
-        if not skip_post_gather and not disable_post_gather_path:
+        if not skip_post_gather:
             wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
 
         if not skip_post_gather and not disable_post_gather_path:
@@ -2472,6 +2472,9 @@ def _fused_ep_moe_kernel(
             out_buf_id = bt_bank_id(bt_id)
 
             wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
+            if disable_post_gather_path:
+                return None
+
             wait_a2a_gather_recv_all(
                 bt_sem_id=bt_sem_id,
                 gather_bank_id=gather_bank_id,
@@ -2495,8 +2498,7 @@ def _fused_ep_moe_kernel(
                 )
             return None
 
-        if not disable_post_gather_path:
-            lax.fori_loop(0, num_bt, _run_bt_post_gather, None, unroll=False)
+        lax.fori_loop(0, num_bt, _run_bt_post_gather, None, unroll=False)
     else:
         lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
 

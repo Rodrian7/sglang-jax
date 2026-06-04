@@ -1346,7 +1346,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-post-gather-path",
         action="store_true",
-        help="Skip per-expert gather issue and the post-loop gather/output tail.",
+        help=(
+            "Skip per-expert gather issue and the post-loop gather/output tail, "
+            "while still draining scatter sends."
+        ),
     )
     parser.add_argument("--disable-all-reduce-metadata", action="store_true")
     parser.add_argument(
