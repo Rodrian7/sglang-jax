@@ -121,7 +121,7 @@ def output_store_l0(
                 out_specs=hbm_spec,
                 scratch_shapes=(
                     pltpu.VMEM((rows, hidden_size), x.dtype),
-                    pltpu.SemaphoreType.DMA((1,)),
+                    pltpu.SemaphoreType.DMA,
                     pltpu.SemaphoreType.BARRIER,
                 ),
             ),
