@@ -2,7 +2,10 @@
 
 This isolates the final output write pattern from the production kernel:
 
-* ``direct_hbm_store`` computes a tile and writes it directly to HBM.
+* ``direct_hbm_store`` computes a tile and attempts to write it directly to
+  HBM. This is mostly a negative-control probe: current Pallas TPU kernels only
+  allow normal load/store on VMEM/SMEM refs, so this mode is not in the default
+  run set.
 * ``staged_sync_dma`` computes a tile, stages it in VMEM, synchronizes, then DMA
   copies VMEM to HBM.
 * ``staged_no_sync_dma`` computes a tile, stages it in VMEM, then immediately
@@ -208,7 +211,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--modes",
-        default="direct_hbm_store,staged_sync_dma,staged_no_sync_dma",
+        default="staged_sync_dma,staged_no_sync_dma",
         help="Comma-separated modes.",
     )
     parser.add_argument("--num-tokens", type=int, default=64)
