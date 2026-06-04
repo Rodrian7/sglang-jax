@@ -1,6 +1,7 @@
 """MiMo-V2-Flash model implementation for SGLang-JAX."""
 
 import logging
+import os
 from typing import Any
 
 import jax
@@ -128,6 +129,9 @@ class MiMoV2Moe(nnx.Module):
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
                 use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", True),
+                # MiMo's fp8 checkpoint has no moe.activation_dtype, so act_quant
+                # is opt-in via env (SGLJAX_MOE_ACT_QUANT=1) for A/B testing.
+                enable_act_quant=os.environ.get("SGLJAX_MOE_ACT_QUANT", "0") == "1",
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(
@@ -144,6 +148,9 @@ class MiMoV2Moe(nnx.Module):
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
                 use_jax_allreduce_metadata=getattr(config, "use_jax_allreduce_metadata", True),
+                # MiMo's fp8 checkpoint has no moe.activation_dtype, so act_quant
+                # is opt-in via env (SGLJAX_MOE_ACT_QUANT=1) for A/B testing.
+                enable_act_quant=os.environ.get("SGLJAX_MOE_ACT_QUANT", "0") == "1",
             )
         else:
             self.experts = EPMoE(
