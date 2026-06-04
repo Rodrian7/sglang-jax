@@ -130,6 +130,12 @@ class MiMoV2Moe(nnx.Module):
                 quantization_config=getattr(config, "quantization_config", None),
                 metadata_mode=getattr(config, "moe_metadata_mode", "recursive"),
                 disable_post_output_sync=os.environ.get("MOE_DISABLE_POST_OUTPUT_SYNC", "0") == "1",
+                wait_gather_send_before_output_store=(
+                    os.environ.get("MOE_WAIT_GATHER_SEND_BEFORE_OUTPUT_STORE", "0") == "1"
+                ),
+                post_output_sync_after_output_store=(
+                    os.environ.get("MOE_POST_OUTPUT_SYNC_AFTER_OUTPUT_STORE", "0") == "1"
+                ),
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(
