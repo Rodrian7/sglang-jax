@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -565,6 +567,10 @@ class FusedEPMoEV2(FusedEPMoE):
         enable_act_quant = (
             self.enable_act_quant_cfg or self.activation_quantized_dtype is not None
         ) and (w1_scale is not None)
+        # Env kill-switch for A/B: SGLJAX_MOE_ACT_QUANT=0 forces the bf16-token
+        # MoE path regardless of config/quant signal.
+        if os.environ.get("SGLJAX_MOE_ACT_QUANT") == "0":
+            enable_act_quant = False
 
         if block_config is None:
             block_config = get_tuned_fused_moe_v2_block_config(
