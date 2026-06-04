@@ -194,18 +194,21 @@ def run(args: argparse.Namespace) -> None:
         if not args.skip_validation:
             out = compute()
             jax.block_until_ready(out)
-            out_host = np.asarray(out)
-            expected = np.asarray(args.repeats, dtype=out_host.dtype)
-            if not np.all(out_host == expected):
-                raise AssertionError(
-                    "L0 output validation failed "
-                    f"mode={mode} expected={expected} "
-                    f"min={out_host.min()} max={out_host.max()}"
-                )
+            checked_shapes = []
+            for shard in out.addressable_shards:
+                shard_host = np.asarray(shard.data)
+                checked_shapes.append(shard_host.shape)
+                expected = np.asarray(args.repeats, dtype=shard_host.dtype)
+                if not np.all(shard_host == expected):
+                    raise AssertionError(
+                        "L0 output validation failed "
+                        f"mode={mode} expected={expected} "
+                        f"min={shard_host.min()} max={shard_host.max()}"
+                    )
             print(
                 "L0_OUTPUT_STORE_VALIDATE "
                 f"name={scope_name} mode={mode} expected={expected} "
-                f"shape={out_host.shape}",
+                f"addressable_shapes={checked_shapes}",
                 flush=True,
             )
 
