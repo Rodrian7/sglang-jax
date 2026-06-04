@@ -227,6 +227,7 @@ class BaseSpecWorker:
         draft_attn = draft_mr.attn_backend
         data_sharding = NamedSharding(target_mr.mesh, P("data"))
         sel = model_worker_batch.logits_indices_selector
+        sel_np = np.asarray(sel)
         bs = len(model_worker_batch.seq_lens)
         draft_n = self.speculative_num_draft_tokens
         accept_width = self.speculative_num_steps + 1
@@ -234,19 +235,34 @@ class BaseSpecWorker:
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp > 1 else bs
         expert_loc = get_global_expert_location_metadata()
 
-        # === Phase 1: CPU — verify + dext metadata (pre-compute) ===
+        # === Phase 1a: tree-independent metadata (overlaps with build_tree TPU) ===
 
-        if model_worker_batch.forward_mode.is_target_verify():
-            cm = spec_info.custom_mask
-            if cm is not None:
-                cm.copy_to_host_async()
+        cm = spec_info.custom_mask
+        if cm is not None:
+            if hasattr(cm, 'dtype') and cm.dtype == jnp.bool:
+                cm = cm.astype(jnp.int32)
+            cm.copy_to_host_async()
 
-        verify_forward_metadata = target_attn.get_eagle_forward_metadata(model_worker_batch)
+        verify_meta = target_attn.compute_verify_metadata_numpy(
+            cache_loc=model_worker_batch.cache_loc,
+            seq_lens=model_worker_batch.seq_lens,
+            draft_token_num=spec_info.draft_token_num,
+            logits_indices_selector=sel_np,
+            dp_size=dp,
+            per_dp_bs=per_dp_bs,
+        )
+        has_swa = len(verify_meta) > 7
+        if has_swa:
+            (verify_pi, verify_ext_sl, verify_cu_q, verify_cu_kv,
+             verify_seq_lens, aligned_seq_lens, verify_dist, swa_pi) = verify_meta
+        else:
+            (verify_pi, verify_ext_sl, verify_cu_q, verify_cu_kv,
+             verify_seq_lens, aligned_seq_lens, verify_dist) = verify_meta
 
         dext_seq_lens = model_worker_batch.seq_lens.copy()
-        dext_seq_lens[sel] += draft_n - 1
+        dext_seq_lens[sel_np] += draft_n - 1
         dext_extend_seq_lens = np.zeros(bs, dtype=np.int32)
-        dext_extend_seq_lens[sel] = accept_width
+        dext_extend_seq_lens[sel_np] = accept_width
         dext_logits_indices = (
             dext_extend_seq_lens.reshape(dp, per_dp_bs)
             .cumsum(axis=1, dtype=np.int32).ravel() - 1
@@ -258,38 +274,83 @@ class BaseSpecWorker:
                 dext_seq_lens=dext_seq_lens,
                 extend_seq_lens=dext_extend_seq_lens,
                 allocate_lens=np.asarray(cur_allocate_lens),
-                logits_indices_selector=np.asarray(sel),
+                logits_indices_selector=sel_np,
                 dp_size=dp,
                 per_dp_bs=per_dp_bs,
             )
         )
 
-        # === Phase 2: batch upload verify + dext arrays ===
-        (
-            input_ids, seq_lens_dev, out_cache_loc, positions, req_pool_indices,
-            cache_loc, extend_prefix_lens, extend_seq_lens_dev,
-            dext_pi_dev, dext_cu_q_dev, dext_cu_kv_dev, dext_sl_dev, dext_dist_dev,
-            dext_extend_seq_lens_dev, dext_logits_indices_dev, dext_seq_lens_dev,
-        ) = device_array(
-            [model_worker_batch.input_ids, model_worker_batch.seq_lens,
-             model_worker_batch.out_cache_loc, model_worker_batch.positions,
-             model_worker_batch.req_pool_indices, model_worker_batch.cache_loc,
-             model_worker_batch.extend_prefix_lens, model_worker_batch.extend_seq_lens,
-             dext_pi, dext_cu_q, dext_cu_kv, dext_sl, dext_dist,
-             dext_extend_seq_lens, dext_logits_indices, dext_seq_lens],
-            sharding=data_sharding,
-        )
+        # === Phase 1b: H2D upload numpy-only arrays (still overlaps with build_tree) ===
+        numpy_arrays = [
+            model_worker_batch.seq_lens, model_worker_batch.out_cache_loc,
+            model_worker_batch.req_pool_indices, model_worker_batch.cache_loc,
+            model_worker_batch.extend_prefix_lens,
+            verify_pi, verify_ext_sl, verify_cu_q, verify_cu_kv,
+            verify_seq_lens, verify_dist,
+            dext_pi, dext_cu_q, dext_cu_kv, dext_sl, dext_dist,
+            dext_extend_seq_lens, dext_logits_indices, dext_seq_lens,
+        ]
+        if has_swa:
+            numpy_arrays.append(swa_pi)
+
+        uploaded = device_array(numpy_arrays, sharding=data_sharding)
+
+        idx = 0
+        seq_lens_dev = uploaded[idx]; idx += 1
+        out_cache_loc = uploaded[idx]; idx += 1
+        req_pool_indices = uploaded[idx]; idx += 1
+        cache_loc = uploaded[idx]; idx += 1
+        extend_prefix_lens = uploaded[idx]; idx += 1
+        verify_pi_dev = uploaded[idx]; idx += 1
+        verify_ext_sl_dev = uploaded[idx]; idx += 1
+        verify_cu_q_dev = uploaded[idx]; idx += 1
+        verify_cu_kv_dev = uploaded[idx]; idx += 1
+        verify_sl_dev = uploaded[idx]; idx += 1
+        verify_dist_dev = uploaded[idx]; idx += 1
+        dext_pi_dev = uploaded[idx]; idx += 1
+        dext_cu_q_dev = uploaded[idx]; idx += 1
+        dext_cu_kv_dev = uploaded[idx]; idx += 1
+        dext_sl_dev = uploaded[idx]; idx += 1
+        dext_dist_dev = uploaded[idx]; idx += 1
+        dext_extend_seq_lens_dev = uploaded[idx]; idx += 1
+        dext_logits_indices_dev = uploaded[idx]; idx += 1
+        dext_seq_lens_dev = uploaded[idx]; idx += 1
+        swa_pi_dev = uploaded[idx] if has_swa else None
+
+        # === Phase 1c: custom_mask repack (blocks on build_tree completion) ===
+        custom_mask_dev = None
+        if cm is not None:
+            cm_host = np.asarray(cm)
+            packed = target_attn.repack_custom_mask_numpy(
+                cm_host, verify_seq_lens, aligned_seq_lens,
+                spec_info.draft_token_num, dp, per_dp_bs,
+            )
+            custom_mask_dev = device_array(packed, sharding=data_sharding)
+
+        # === Phase 2: build verify metadata + ForwardBatch ===
+        verify_forward_metadata = FlashAttentionMetadata()
+        verify_forward_metadata.cu_q_lens = verify_cu_q_dev
+        verify_forward_metadata.cu_kv_lens = verify_cu_kv_dev
+        verify_forward_metadata.page_indices = verify_pi_dev
+        verify_forward_metadata.seq_lens = verify_sl_dev
+        verify_forward_metadata.distribution = verify_dist_dev
+        verify_forward_metadata.custom_mask = custom_mask_dev
+        if swa_pi_dev is not None:
+            verify_forward_metadata.swa_page_indices = swa_pi_dev
+
+        input_ids_dev = jax.device_put(spec_info.draft_token, data_sharding)
+        positions_dev = jax.device_put(spec_info.positions, data_sharding)
 
         # === Phase 3: dispatch verify chain ===
         verify_fb = ForwardBatch(
             bid=model_worker_batch.bid,
             forward_mode=model_worker_batch.forward_mode,
             batch_size=bs,
-            input_ids=input_ids, seq_lens=seq_lens_dev,
-            out_cache_loc=out_cache_loc, positions=positions,
+            input_ids=input_ids_dev, seq_lens=seq_lens_dev,
+            out_cache_loc=out_cache_loc, positions=positions_dev,
             req_pool_indices=req_pool_indices, cache_loc=cache_loc,
             extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens_dev,
+            extend_seq_lens=verify_ext_sl_dev,
             attn_backend=target_attn,
             spec_info=spec_info,
             spec_algorithm=model_worker_batch.spec_algorithm,
@@ -322,10 +383,12 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs, self.mesh,
         )
 
+        positions_gather = replicate_to_mesh(self.mesh, spec_info.positions)
+
         if is_all_greedy:
             gathered_hs, dext_positions, verified_id, accept_length = (
                 _postprocess_and_gather(
-                    logits_output.hidden_states, model_worker_batch.positions,
+                    logits_output.hidden_states, positions_gather,
                     accept_index, accept_length, predict,
                     draft_n=draft_n, accept_width=accept_width,
                 )
@@ -335,7 +398,7 @@ class BaseSpecWorker:
                 _postprocess_and_gather_with_logits(
                     logits_output.next_token_logits,
                     logits_output.hidden_states,
-                    model_worker_batch.positions,
+                    positions_gather,
                     accept_index, accept_length, predict,
                     draft_n=draft_n, accept_width=accept_width,
                 )
@@ -403,9 +466,9 @@ class BaseSpecWorker:
         predict_host = np.asarray(predict_host)
         accept_length_host = np.asarray(accept_length_host)
 
-        select_index = np.asarray(sel) * accept_width + accept_length_host[sel] - 1
-        topk_p_host = np.asarray(topk_p)[sel]
-        topk_index_host = np.asarray(topk_index)[sel]
+        select_index = sel_np * accept_width + accept_length_host[sel_np] - 1
+        topk_p_host = np.asarray(topk_p)[sel_np]
+        topk_index_host = np.asarray(topk_index)[sel_np]
         hidden_host = np.asarray(rep_hidden)[select_index]
         verified_id_host = np.asarray(verified_id)[select_index]
 

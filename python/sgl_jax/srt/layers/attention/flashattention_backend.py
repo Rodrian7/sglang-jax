@@ -356,6 +356,107 @@ class FlashAttention(AttentionBackend):
             )
         return metadata
 
+    def compute_verify_metadata_numpy(
+        self,
+        cache_loc: np.ndarray,
+        seq_lens: np.ndarray,
+        draft_token_num: int,
+        logits_indices_selector: np.ndarray,
+        dp_size: int,
+        per_dp_bs: int,
+    ) -> tuple[np.ndarray, ...]:
+        """Tree-independent TARGET_VERIFY metadata. Returns numpy arrays (no device upload).
+
+        Returns (page_indices, extend_seq_lens, cu_q_lens, cu_kv_lens,
+                 verify_seq_lens, aligned_seq_lens, distribution[, swa_page_indices]).
+        """
+        indices = np.arange(0, len(cache_loc), self.page_size)
+        page_indices = (cache_loc[indices] // self.page_size).astype(np.int32)
+
+        padded_batch_size = len(seq_lens)
+        extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
+        extend_seq_lens[logits_indices_selector] = draft_token_num
+        cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
+
+        verify_seq_lens = np.copy(seq_lens) + extend_seq_lens
+        aligned_seq_lens = (
+            (verify_seq_lens + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
+
+        seq_2d = seq_lens.reshape(dp_size, per_dp_bs)
+        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+        distribution = np.column_stack(
+            [np.zeros_like(local_n), local_n, local_n]
+        ).ravel()
+
+        result = (
+            np.array(page_indices), extend_seq_lens, cu_q_lens, cu_kv_lens,
+            verify_seq_lens, aligned_seq_lens, distribution,
+        )
+
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
+            if isinstance(swa_mapping, list):
+                full_2d = full_loc.reshape(dp_size, -1)
+                swa_2d = np.empty_like(full_2d)
+                for r in range(dp_size):
+                    swa_2d[r] = np.asarray(swa_mapping[r])[full_2d[r]]
+                swa_loc = swa_2d.ravel()
+            else:
+                swa_loc = np.asarray(swa_mapping)[full_loc]
+            swa_pi = (swa_loc // self.page_size).astype(np.int32)
+            return result + (swa_pi,)
+
+        return result
+
+    def repack_custom_mask_numpy(
+        self,
+        cm: np.ndarray,
+        verify_seq_lens: np.ndarray,
+        aligned_seq_lens: np.ndarray,
+        draft_token_num: int,
+        dp_size: int,
+        per_dp_bs: int,
+    ) -> np.ndarray:
+        """Repack tree mask from build_tree layout to page-aligned DP layout.
+
+        Takes host numpy mask (already device_get'd) and returns repacked numpy.
+        """
+        q = draft_token_num
+        cm_total = len(cm)
+        per_rank_mask_target = ((cm_total // dp_size + 7) // 8) * 8 or 8
+
+        cm_kl = np.where(verify_seq_lens > 0, verify_seq_lens, q - 1).astype(np.int64)
+        cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
+
+        rank_lens = np.zeros(dp_size, dtype=np.int64)
+        for r in range(dp_size):
+            rank_lens[r] = int(np.sum(
+                q * aligned_seq_lens[r * per_dp_bs : (r + 1) * per_dp_bs]
+            ))
+        per_rank_len = max(int(np.max(rank_lens)), per_rank_mask_target)
+        out = np.zeros(dp_size * per_rank_len, dtype=np.int32)
+
+        for r in range(dp_size):
+            dst = r * per_rank_len
+            for j in range(per_dp_bs):
+                s = r * per_dp_bs + j
+                kla = int(aligned_seq_lens[s])
+                if kla == 0:
+                    continue
+                if verify_seq_lens[s] > 0:
+                    kl = int(verify_seq_lens[s])
+                    src = int(cm_off[s])
+                    for row in range(q):
+                        out[dst : dst + kl] = cm[src : src + kl]
+                        src += kl
+                        dst += kla
+                else:
+                    dst += q * kla
+        return out
+
     def compute_dext_metadata_numpy(
         self,
         cache_loc: np.ndarray,
