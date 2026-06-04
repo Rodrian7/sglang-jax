@@ -350,6 +350,7 @@ def _fused_ep_moe_kernel(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    disable_post_gather_path: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
@@ -2392,13 +2393,14 @@ def _fused_ep_moe_kernel(
                 bf0_w13_prefetched,
                 a2a_bank_id,
             )
-            start_a2a_gather(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=e_sem_id_local,
-                local_e_id=local_e_id,
-                a2a_bank_id=a2a_bank_id,
-                gather_bank_id=gather_bank_id,
-            )
+            if not disable_post_gather_path:
+                start_a2a_gather(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id,
+                    a2a_bank_id=a2a_bank_id,
+                    gather_bank_id=gather_bank_id,
+                )
 
             for _ in range(se_after):
                 run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
@@ -2421,10 +2423,10 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
-        if not skip_post_gather:
+        if not skip_post_gather and not disable_post_gather_path:
             wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
 
-        if not skip_post_gather:
+        if not skip_post_gather and not disable_post_gather_path:
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id, gather_bank_id=gather_bank_id)
             acc_and_store_output(
                 bt_sem_id=bt_sem_id,
@@ -2493,14 +2495,15 @@ def _fused_ep_moe_kernel(
                 )
             return None
 
-        lax.fori_loop(0, num_bt, _run_bt_post_gather, None, unroll=False)
+        if not disable_post_gather_path:
+            lax.fori_loop(0, num_bt, _run_bt_post_gather, None, unroll=False)
     else:
         lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
 
-    if use_gather_bank:
+    if use_gather_bank and not disable_post_gather_path:
         for _bt_i in range(num_bt):
             wait_store_output(bt_id=jnp.int32(_bt_i))
-    else:
+    elif not use_gather_bank:
         wait_store_output(bt_id=jnp.int32(num_bt - 2))
         wait_store_output(bt_id=jnp.int32(num_bt - 1))
 
@@ -2606,6 +2609,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_acc_compute",
         "disable_acc_store_vmem",
         "disable_output_store",
+        "disable_post_gather_path",
         "metadata_mode",
         "enable_bt_scatter_overlap",
         "block_config",
@@ -2674,6 +2678,7 @@ def fused_ep_moe_v2(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    disable_post_gather_path: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     w1_shared: jax.Array | None = None,
@@ -2905,6 +2910,8 @@ def fused_ep_moe_v2(
         )
     if disable_acc_and_store:
         scope_name += "-no_acc_store"
+    if disable_post_gather_path:
+        scope_name += "-no_post_gather_path"
     if skip_inter_bt_sync:
         scope_name += "-skip_inter_bt_sync"
     if interleave_bt:
@@ -3067,6 +3074,7 @@ def fused_ep_moe_v2(
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
+                disable_post_gather_path=disable_post_gather_path,
                 metadata_mode=metadata_mode,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,

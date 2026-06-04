@@ -607,6 +607,7 @@ def run_all(
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
     disable_output_store: bool = False,
+    disable_post_gather_path: bool = False,
     disable_all_reduce_metadata: bool = False,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
@@ -713,6 +714,7 @@ def run_all(
             "disable_acc_compute": disable_acc_compute,
             "disable_acc_store_vmem": disable_acc_store_vmem,
             "disable_output_store": disable_output_store,
+            "disable_post_gather_path": disable_post_gather_path,
             "disable_all_reduce_metadata": disable_all_reduce_metadata,
         }.items()
         if enabled
@@ -841,6 +843,7 @@ def run_all(
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
                 disable_output_store=disable_output_store,
+                disable_post_gather_path=disable_post_gather_path,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=1,
@@ -1340,6 +1343,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-acc-compute", action="store_true")
     parser.add_argument("--disable-acc-store-vmem", action="store_true")
     parser.add_argument("--disable-output-store", action="store_true")
+    parser.add_argument(
+        "--disable-post-gather-path",
+        action="store_true",
+        help="Skip per-expert gather issue and the post-loop gather/output tail.",
+    )
     parser.add_argument("--disable-all-reduce-metadata", action="store_true")
     parser.add_argument(
         "--disable-all-ablation",
@@ -1504,6 +1512,7 @@ if __name__ == "__main__":
             disable_acc_compute=disable_all or args.disable_acc_compute,
             disable_acc_store_vmem=disable_all or args.disable_acc_store_vmem,
             disable_output_store=disable_all or args.disable_output_store,
+            disable_post_gather_path=disable_all or args.disable_post_gather_path,
             disable_all_reduce_metadata=disable_all or args.disable_all_reduce_metadata,
             cross_expert_prefetch_mode=args.cross_expert_prefetch_mode,
             next_w2_prologue_priority=args.next_w2_prologue_priority,
