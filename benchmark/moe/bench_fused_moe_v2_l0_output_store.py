@@ -47,10 +47,10 @@ def _output_store_l0_kernel(
     hidden_size: int,
     repeats: int,
     num_devices: int,
-    tp_size: int,
+    tensor_axis_size: int,
 ):
     def get_mesh_device_id(ep_rank):
-        return (ep_rank // tp_size, ep_rank % tp_size)
+        return (ep_rank // tensor_axis_size, ep_rank % tensor_axis_size)
 
     def sync_barrier():
         for i in range(num_devices):
@@ -111,7 +111,7 @@ def output_store_l0(
                 hidden_size=hidden_size,
                 repeats=repeats,
                 num_devices=ep_size,
-                tp_size=1,
+                tensor_axis_size=ep_size,
             ),
             out_shape=jax.ShapeDtypeStruct((rows, hidden_size), x.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
