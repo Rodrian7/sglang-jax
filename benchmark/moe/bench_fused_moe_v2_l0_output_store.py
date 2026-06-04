@@ -70,9 +70,11 @@ def _output_store_l0_kernel(
         tile = tile + jnp.asarray(i + 1, dtype=tile.dtype)
 
         if mode == "direct_hbm_store":
-            out_hbm.at[pl.ds(0, rows), pl.ds(0, hidden_size)] = tile
+            target = out_hbm.at[pl.ds(0, rows), pl.ds(0, hidden_size)]
+            target[...] = tile
         else:
-            stage_vmem.at[pl.ds(0, rows), pl.ds(0, hidden_size)] = tile
+            target = stage_vmem.at[pl.ds(0, rows), pl.ds(0, hidden_size)]
+            target[...] = tile
             if mode == "staged_sync_dma":
                 sync_barrier()
             pltpu.make_async_copy(
