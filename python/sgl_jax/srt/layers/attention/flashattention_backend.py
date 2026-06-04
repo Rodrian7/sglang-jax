@@ -356,6 +356,59 @@ class FlashAttention(AttentionBackend):
             )
         return metadata
 
+    def compute_dext_metadata_numpy(
+        self,
+        cache_loc: np.ndarray,
+        dext_seq_lens: np.ndarray,
+        extend_seq_lens: np.ndarray,
+        allocate_lens: np.ndarray,
+        logits_indices_selector: np.ndarray,
+        dp_size: int,
+        per_dp_bs: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """CPU-only DRAFT_EXTEND metadata. Returns numpy arrays (no device_array)."""
+        indices = np.arange(0, len(cache_loc), self.page_size)
+        page_indices = (cache_loc[indices] // self.page_size).astype(np.int32)
+
+        cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
+
+        aligned_seq_lens = (
+            (dext_seq_lens + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
+
+        sel = logits_indices_selector
+        full_pg = page_indices.shape[0]
+        per_dp_pg = full_pg // dp_size
+        alloc_pg = cdiv(allocate_lens.astype(np.int64), self.page_size)
+        need_pg = (aligned_seq_lens[sel] // self.page_size).astype(np.int64)
+        rank_of = (sel // per_dp_bs).astype(np.int64)
+        new_pi = np.zeros(full_pg, dtype=np.int32)
+        src_off = np.zeros(dp_size, dtype=np.int64)
+        dst_off = np.zeros(dp_size, dtype=np.int64)
+        for k in range(len(sel)):
+            r = int(rank_of[k])
+            n = int(need_pg[k])
+            s = r * per_dp_pg + src_off[r]
+            d = r * per_dp_pg + dst_off[r]
+            new_pi[d : d + n] = page_indices[s : s + n]
+            src_off[r] += int(alloc_pg[k])
+            dst_off[r] += n
+
+        seq_2d = np.asarray(dext_seq_lens).reshape(dp_size, per_dp_bs)
+        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+        distribution = np.column_stack(
+            [np.zeros_like(local_n), local_n, local_n]
+        ).ravel()
+
+        return (
+            np.array(new_pi),
+            cu_q_lens,
+            cu_kv_lens,
+            np.array(dext_seq_lens),
+            distribution,
+        )
+
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
 
         indices = np.arange(0, len(batch.cache_loc), self.page_size)

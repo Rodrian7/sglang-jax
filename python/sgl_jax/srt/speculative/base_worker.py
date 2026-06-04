@@ -185,8 +185,7 @@ class BaseSpecWorker:
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
         self.draft_worker.draft(model_worker_batch)
-        batch_output = self.verify(model_worker_batch, cur_allocate_lens)
-        self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+        batch_output = self.verify_and_extend(model_worker_batch, cur_allocate_lens)
         return batch_output
 
     def forward_target_extend(self, model_worker_batch: ModelWorkerBatch, sampling_metadata):
@@ -206,65 +205,107 @@ class BaseSpecWorker:
             model_worker_batch.seq_lens,
         )
 
-    def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
+    def verify_and_extend(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+        from sgl_jax.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode, ForwardBatch, ForwardMode,
+            get_global_expert_location_metadata,
+        )
+        from sgl_jax.srt.speculative.eagle_draft_worker import topk_probs_from_logits
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
         from sgl_jax.srt.utils.jax_utils import device_array
-        from sgl_jax.srt.model_executor.forward_batch_info import get_global_expert_location_metadata
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
 
-        mr = self.target_worker.model_runner
-        attn_backend = mr.attn_backend
-        data_sharding = NamedSharding(mr.mesh, P("data"))
+        target_mr = self.target_worker.model_runner
+        draft_mr = self.draft_worker.draft_model_runner
+        target_attn = target_mr.attn_backend
+        draft_attn = draft_mr.attn_backend
+        data_sharding = NamedSharding(target_mr.mesh, P("data"))
+        sel = model_worker_batch.logits_indices_selector
+        bs = len(model_worker_batch.seq_lens)
+        draft_n = self.speculative_num_draft_tokens
+        accept_width = self.speculative_num_steps + 1
+        dp = model_worker_batch.dp_size
+        per_dp_bs = model_worker_batch.per_dp_bs_size if dp > 1 else bs
+        expert_loc = get_global_expert_location_metadata()
+
+        # === Phase 1: CPU — verify + dext metadata (pre-compute) ===
 
         if model_worker_batch.forward_mode.is_target_verify():
-            cm = model_worker_batch.spec_info_padded.custom_mask
+            cm = spec_info.custom_mask
             if cm is not None:
                 cm.copy_to_host_async()
 
-        # Batch ForwardBatch arrays into single device_array (bypass init_new)
-        (input_ids, seq_lens, out_cache_loc, positions, req_pool_indices,
-         cache_loc, extend_prefix_lens, extend_seq_lens) = device_array(
+        verify_forward_metadata = target_attn.get_eagle_forward_metadata(model_worker_batch)
+
+        dext_seq_lens = model_worker_batch.seq_lens.copy()
+        dext_seq_lens[sel] += draft_n - 1
+        dext_extend_seq_lens = np.zeros(bs, dtype=np.int32)
+        dext_extend_seq_lens[sel] = accept_width
+        dext_logits_indices = (
+            dext_extend_seq_lens.reshape(dp, per_dp_bs)
+            .cumsum(axis=1, dtype=np.int32).ravel() - 1
+        )
+
+        dext_pi, dext_cu_q, dext_cu_kv, dext_sl, dext_dist = (
+            draft_attn.compute_dext_metadata_numpy(
+                cache_loc=model_worker_batch.cache_loc,
+                dext_seq_lens=dext_seq_lens,
+                extend_seq_lens=dext_extend_seq_lens,
+                allocate_lens=np.asarray(cur_allocate_lens),
+                logits_indices_selector=np.asarray(sel),
+                dp_size=dp,
+                per_dp_bs=per_dp_bs,
+            )
+        )
+
+        # === Phase 2: batch upload verify + dext arrays ===
+        (
+            input_ids, seq_lens_dev, out_cache_loc, positions, req_pool_indices,
+            cache_loc, extend_prefix_lens, extend_seq_lens_dev,
+            dext_pi_dev, dext_cu_q_dev, dext_cu_kv_dev, dext_sl_dev, dext_dist_dev,
+            dext_extend_seq_lens_dev, dext_logits_indices_dev, dext_seq_lens_dev,
+        ) = device_array(
             [model_worker_batch.input_ids, model_worker_batch.seq_lens,
              model_worker_batch.out_cache_loc, model_worker_batch.positions,
              model_worker_batch.req_pool_indices, model_worker_batch.cache_loc,
-             model_worker_batch.extend_prefix_lens, model_worker_batch.extend_seq_lens],
+             model_worker_batch.extend_prefix_lens, model_worker_batch.extend_seq_lens,
+             dext_pi, dext_cu_q, dext_cu_kv, dext_sl, dext_dist,
+             dext_extend_seq_lens, dext_logits_indices, dext_seq_lens],
             sharding=data_sharding,
         )
 
-        forward_batch = ForwardBatch(
+        # === Phase 3: dispatch verify chain ===
+        verify_fb = ForwardBatch(
             bid=model_worker_batch.bid,
             forward_mode=model_worker_batch.forward_mode,
-            batch_size=len(model_worker_batch.seq_lens),
-            input_ids=input_ids,
-            seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            positions=positions,
-            req_pool_indices=req_pool_indices,
-            cache_loc=cache_loc,
+            batch_size=bs,
+            input_ids=input_ids, seq_lens=seq_lens_dev,
+            out_cache_loc=out_cache_loc, positions=positions,
+            req_pool_indices=req_pool_indices, cache_loc=cache_loc,
             extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            attn_backend=attn_backend,
-            spec_info=model_worker_batch.spec_info_padded,
+            extend_seq_lens=extend_seq_lens_dev,
+            attn_backend=target_attn,
+            spec_info=spec_info,
             spec_algorithm=model_worker_batch.spec_algorithm,
             capture_hidden_mode=model_worker_batch.capture_hidden_mode,
-            expert_location_metadata=get_global_expert_location_metadata(),
+            expert_location_metadata=expert_loc,
         )
-        model_worker_batch.forward_batch = forward_batch
-
-        forward_metadata = attn_backend.get_eagle_forward_metadata(model_worker_batch)
-        logits_metadata = LogitsMetadata.for_target_verify(model_worker_batch)
-        attn_backend.forward_metadata = forward_metadata
+        model_worker_batch.forward_batch = verify_fb
+        target_attn.forward_metadata = verify_forward_metadata
+        verify_logits_metadata = LogitsMetadata.for_target_verify(model_worker_batch)
 
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True,
-            forward_metadata=forward_metadata, logits_metadata=logits_metadata,
+            forward_metadata=verify_forward_metadata,
+            logits_metadata=verify_logits_metadata,
         )
+
         is_all_greedy = model_worker_batch.sampling_info.is_all_greedy
         if is_all_greedy:
             logits_output.hidden_states = replicate_to_mesh(
@@ -275,29 +316,22 @@ class BaseSpecWorker:
                 self.mesh, logits_output.next_token_logits, logits_output.hidden_states
             )
         spec_info.hidden_states = logits_output.hidden_states
-        (
-            predict,
-            accept_index,
-            accept_length,
-        ) = spec_info.sample(
-            model_worker_batch,
-            logits_output,
-            self.draft_worker.draft_model_runner.rngs,
-            self.mesh,
+
+        predict, accept_index, accept_length = spec_info.sample(
+            model_worker_batch, logits_output,
+            self.draft_worker.draft_model_runner.rngs, self.mesh,
         )
-        draft_n = self.speculative_num_draft_tokens
-        accept_width = self.speculative_num_steps + 1
+
         if is_all_greedy:
-            logits_output.hidden_states, model_worker_batch.positions, verified_id, accept_length = (
+            gathered_hs, dext_positions, verified_id, accept_length = (
                 _postprocess_and_gather(
-                    logits_output.hidden_states,
-                    model_worker_batch.positions,
+                    logits_output.hidden_states, model_worker_batch.positions,
                     accept_index, accept_length, predict,
                     draft_n=draft_n, accept_width=accept_width,
                 )
             )
         else:
-            logits_output.next_token_logits, logits_output.hidden_states, model_worker_batch.positions, verified_id, accept_length = (
+            logits_output.next_token_logits, gathered_hs, dext_positions, verified_id, accept_length = (
                 _postprocess_and_gather_with_logits(
                     logits_output.next_token_logits,
                     logits_output.hidden_states,
@@ -306,24 +340,91 @@ class BaseSpecWorker:
                     draft_n=draft_n, accept_width=accept_width,
                 )
             )
-        predict, accept_length = jax.device_get((predict, accept_length))
-        predict = np.asarray(predict)
-        accept_length = np.asarray(accept_length)
-        new_seq_lens = model_worker_batch.seq_lens + accept_length
+
+        # === Phase 4: dispatch dext immediately (no device_get!) ===
+        dext_forward_metadata = FlashAttentionMetadata()
+        dext_forward_metadata.cu_q_lens = dext_cu_q_dev
+        dext_forward_metadata.cu_kv_lens = dext_cu_kv_dev
+        dext_forward_metadata.page_indices = dext_pi_dev
+        dext_forward_metadata.seq_lens = dext_sl_dev
+        dext_forward_metadata.distribution = dext_dist_dev
+        dext_forward_metadata.custom_mask = None
+        draft_attn.forward_metadata = dext_forward_metadata
+
+        dext_spec_info = EagleDraftInput(
+            hidden_states=gathered_hs,
+            accept_length=accept_length,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        dext_fb = ForwardBatch(
+            bid=model_worker_batch.bid,
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            batch_size=bs,
+            input_ids=verified_id,
+            seq_lens=dext_seq_lens_dev,
+            out_cache_loc=out_cache_loc,
+            positions=dext_positions,
+            req_pool_indices=req_pool_indices,
+            cache_loc=cache_loc,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=dext_extend_seq_lens_dev,
+            attn_backend=draft_attn,
+            spec_info=dext_spec_info,
+            spec_algorithm=model_worker_batch.spec_algorithm,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            expert_location_metadata=expert_loc,
+        )
+
+        dext_logits_metadata = LogitsMetadata.for_draft_extend(
+            extend_seq_lens=dext_extend_seq_lens_dev,
+            logits_indices=dext_logits_indices_dev,
+            accept_lens=accept_length,
+        )
+
+        draft_logits_output, _, _ = draft_mr.forward(
+            dext_fb, logits_metadata=dext_logits_metadata,
+        )
+
+        rep_logits, rep_hidden = replicate_to_mesh(
+            self.mesh, draft_logits_output.next_token_logits,
+            draft_logits_output.hidden_states,
+        )
+        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
+
+        # === Phase 5: device_get — all TPU work done ===
+        jax.copy_to_host_async(topk_p)
+        jax.copy_to_host_async(topk_index)
+        jax.copy_to_host_async(rep_hidden)
+        if hasattr(verified_id, "copy_to_host_async"):
+            jax.copy_to_host_async(verified_id)
+
+        predict_host, accept_length_host = jax.device_get((predict, accept_length))
+        predict_host = np.asarray(predict_host)
+        accept_length_host = np.asarray(accept_length_host)
+
+        select_index = np.asarray(sel) * accept_width + accept_length_host[sel] - 1
+        topk_p_host = np.asarray(topk_p)[sel]
+        topk_index_host = np.asarray(topk_index)[sel]
+        hidden_host = np.asarray(rep_hidden)[select_index]
+        verified_id_host = np.asarray(verified_id)[select_index]
+
+        new_seq_lens = model_worker_batch.seq_lens + accept_length_host
         next_draft_input = EagleDraftInput(
-            verified_id=verified_id,
+            verified_id=verified_id_host,
+            hidden_states=hidden_host,
+            topk_p=topk_p_host,
+            topk_index=topk_index_host,
             new_seq_lens=new_seq_lens,
             allocate_lens=cur_allocate_lens,
-            hidden_states=logits_output.hidden_states,
         )
 
         model_worker_batch.spec_info_padded = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=predict_host,
             next_draft_input=next_draft_input,
-            accept_lens=accept_length,
-            # FIXME(pc) this field is for overlap
+            accept_lens=accept_length_host,
             allocate_lens=cur_allocate_lens,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
