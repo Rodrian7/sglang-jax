@@ -15,14 +15,38 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.tp_worker import ModelWorker
 
 
-@partial(jax.jit, donate_argnames=["hidden_states"])
-def _gather_verified(hidden_states, positions, safe_index):
-    return hidden_states[safe_index, :], positions[safe_index]
+@partial(jax.jit, static_argnames=["draft_n", "accept_width"],
+         donate_argnames=["hidden_states"])
+def _postprocess_and_gather(
+    hidden_states, positions, accept_index, accept_length, predict, draft_n, accept_width
+):
+    accept_length = accept_length + 1
+    accept_index_flat = accept_index.reshape(-1)
+    mask = accept_index_flat >= 0
+    safe_pred_idx = jnp.where(mask, accept_index_flat, 0)
+    verified_id = jnp.where(mask, predict.ravel()[safe_pred_idx], 0)
+    n = accept_index_flat.shape[0]
+    req_ids = jnp.arange(n) // accept_width
+    per_req_last = req_ids * draft_n + draft_n - 1
+    safe_index = jnp.where(accept_index_flat >= 0, accept_index_flat, per_req_last)
+    return hidden_states[safe_index, :], positions[safe_index], verified_id, accept_length
 
 
-@partial(jax.jit, donate_argnames=["hidden_states", "logits"])
-def _gather_verified_with_logits(logits, hidden_states, positions, safe_index):
-    return logits[safe_index, :], hidden_states[safe_index, :], positions[safe_index]
+@partial(jax.jit, static_argnames=["draft_n", "accept_width"],
+         donate_argnames=["hidden_states", "logits"])
+def _postprocess_and_gather_with_logits(
+    logits, hidden_states, positions, accept_index, accept_length, predict, draft_n, accept_width
+):
+    accept_length = accept_length + 1
+    accept_index_flat = accept_index.reshape(-1)
+    mask = accept_index_flat >= 0
+    safe_pred_idx = jnp.where(mask, accept_index_flat, 0)
+    verified_id = jnp.where(mask, predict.ravel()[safe_pred_idx], 0)
+    n = accept_index_flat.shape[0]
+    req_ids = jnp.arange(n) // accept_width
+    per_req_last = req_ids * draft_n + draft_n - 1
+    safe_index = jnp.where(accept_index_flat >= 0, accept_index_flat, per_req_last)
+    return logits[safe_index, :], hidden_states[safe_index, :], positions[safe_index], verified_id, accept_length
 
 
 def replicate_to_mesh(
@@ -198,6 +222,11 @@ class BaseSpecWorker:
         attn_backend = mr.attn_backend
         data_sharding = NamedSharding(mr.mesh, P("data"))
 
+        if model_worker_batch.forward_mode.is_target_verify():
+            cm = model_worker_batch.spec_info_padded.custom_mask
+            if cm is not None:
+                cm.copy_to_host_async()
+
         # Batch ForwardBatch arrays into single device_array (bypass init_new)
         (input_ids, seq_lens, out_cache_loc, positions, req_pool_indices,
          cache_loc, extend_prefix_lens, extend_seq_lens) = device_array(
@@ -248,43 +277,38 @@ class BaseSpecWorker:
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
-            verified_id,
-            accept_length,
             accept_index,
+            accept_length,
         ) = spec_info.sample(
             model_worker_batch,
             logits_output,
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
-        # accept_index uses -1 for rejected slots; gathering with -1 picks the
-        # global last element, so dext later writes rejected tokens' draft-KV at
-        # a foreign position inside each req's page (corrupts prefix KV for all
-        # but the last req at bs>1). Redirect -1 to each req's own last slot.
-        # accept_index has length bs*(spec_steps+1); the gathered tensors have
-        # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
         draft_n = self.speculative_num_draft_tokens
         accept_width = self.speculative_num_steps + 1
-        req_ids = np.arange(len(accept_index)) // accept_width
-        per_req_last = req_ids * draft_n + draft_n - 1
-        safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
         if is_all_greedy:
-            logits_output.hidden_states, model_worker_batch.positions = (
-                _gather_verified(
+            logits_output.hidden_states, model_worker_batch.positions, verified_id, accept_length = (
+                _postprocess_and_gather(
                     logits_output.hidden_states,
                     model_worker_batch.positions,
-                    safe_index,
+                    accept_index, accept_length, predict,
+                    draft_n=draft_n, accept_width=accept_width,
                 )
             )
         else:
-            logits_output.next_token_logits, logits_output.hidden_states, model_worker_batch.positions = (
-                _gather_verified_with_logits(
+            logits_output.next_token_logits, logits_output.hidden_states, model_worker_batch.positions, verified_id, accept_length = (
+                _postprocess_and_gather_with_logits(
                     logits_output.next_token_logits,
                     logits_output.hidden_states,
                     model_worker_batch.positions,
-                    safe_index,
+                    accept_index, accept_length, predict,
+                    draft_n=draft_n, accept_width=accept_width,
                 )
             )
+        predict, accept_length = jax.device_get((predict, accept_length))
+        predict = np.asarray(predict)
+        accept_length = np.asarray(accept_length)
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,

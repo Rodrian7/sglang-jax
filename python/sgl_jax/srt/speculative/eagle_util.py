@@ -63,11 +63,11 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> jax.Array:
     if isinstance(value, jax.Array):
         return value
     if isinstance(value, numpy.ndarray):
-        return jnp.asarray(value, dtype=jnp.int32)
+        return jnp.asarray(value if value.dtype == numpy.int32 else value.astype(numpy.int32))
     if isinstance(value, (int, numpy.integer)):
-        return jnp.asarray(int(value), dtype=jnp.int32)
+        return numpy.asarray(value, dtype=numpy.int32)
     if isinstance(value, (list, tuple)):
-        return jnp.asarray(value, dtype=jnp.int32)
+        return jnp.asarray(numpy.asarray(value, dtype=numpy.int32))
     if _is_jax_leaf(value):
         return jnp.asarray(fallback, dtype=jnp.int32)
     try:
@@ -619,7 +619,7 @@ class EagleDraftInput:
         self.num_tokens_per_batch = topk
         self.num_tokens_for_logprob_per_batch = topk
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
+        model_worker_batch.seq_lens_sum = int(np.sum(model_worker_batch.seq_lens))
 
     @classmethod
     def create_idle_input(
@@ -975,18 +975,7 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
-        predict, accept_index, accept_length = jax.device_get(
-            (predict, accept_index, accept_length)
-        )
-        predict = np.asarray(predict)
-        accept_index = np.asarray(accept_index)
-        accept_length = np.asarray(accept_length)
-
-        accept_length = accept_length + 1
-        accept_index = accept_index.flatten()
-        verified_id = np.zeros_like(accept_index, dtype=predict.dtype)
-        verified_id[accept_index != -1] = predict[accept_index[accept_index != -1]]
-        return predict, verified_id, accept_length, accept_index
+        return predict, accept_index, accept_length
 
 
 def _generate_simulated_accept_index(
