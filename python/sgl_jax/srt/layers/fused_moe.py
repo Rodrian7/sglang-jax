@@ -105,6 +105,8 @@ class FusedEPMoE(nnx.Module):
         direct_output_store: bool = False,
         disable_post_gather_path: bool = False,
         disable_post_output_sync: bool = False,
+        wait_gather_send_before_output_store: bool = False,
+        post_output_sync_after_output_store: bool = False,
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
@@ -172,6 +174,8 @@ class FusedEPMoE(nnx.Module):
         self.direct_output_store = direct_output_store
         self.disable_post_gather_path = disable_post_gather_path
         self.disable_post_output_sync = disable_post_output_sync
+        self.wait_gather_send_before_output_store = wait_gather_send_before_output_store
+        self.post_output_sync_after_output_store = post_output_sync_after_output_store
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
@@ -686,6 +690,8 @@ class FusedEPMoEV2(FusedEPMoE):
             direct_output_store=self.direct_output_store,
             disable_post_gather_path=self.disable_post_gather_path,
             disable_post_output_sync=self.disable_post_output_sync,
+            wait_gather_send_before_output_store=self.wait_gather_send_before_output_store,
+            post_output_sync_after_output_store=self.post_output_sync_after_output_store,
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,

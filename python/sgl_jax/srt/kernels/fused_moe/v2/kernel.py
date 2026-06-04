@@ -356,6 +356,8 @@ def _fused_ep_moe_kernel(
     direct_output_store: bool = False,
     disable_post_gather_path: bool = False,
     disable_post_output_sync: bool = False,
+    wait_gather_send_before_output_store: bool = False,
+    post_output_sync_after_output_store: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
@@ -2445,18 +2447,37 @@ def _fused_ep_moe_kernel(
                 out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            if not disable_post_output_sync and not direct_output_store:
+            if (
+                not disable_post_output_sync
+                and not post_output_sync_after_output_store
+                and not direct_output_store
+            ):
                 sync_barrier()
+
+            def wait_gather_send_all():
+                for tail_e_id in range(local_num_experts):
+                    wait_a2a_gather_send(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=tail_e_id,
+                        local_e_id=tail_e_id,
+                        a2a_bank_id=a2a_bank_id,
+                        gather_bank_id=gather_bank_id,
+                    )
+
+            if wait_gather_send_before_output_store:
+                wait_gather_send_all()
+
             start_send_bo(bt_id=bt_id)
 
-            for tail_e_id in range(local_num_experts):
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=tail_e_id,
-                    local_e_id=tail_e_id,
-                    a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
-                )
+            if (
+                not disable_post_output_sync
+                and post_output_sync_after_output_store
+                and not direct_output_store
+            ):
+                sync_barrier()
+
+            if not wait_gather_send_before_output_store:
+                wait_gather_send_all()
 
             if skip_inter_bt_sync:
                 pass
@@ -2499,19 +2520,38 @@ def _fused_ep_moe_kernel(
                 out_buf_id=out_buf_id,
                 gather_bank_id=gather_bank_id,
             )
-            if not disable_post_output_sync and not direct_output_store:
+            if (
+                not disable_post_output_sync
+                and not post_output_sync_after_output_store
+                and not direct_output_store
+            ):
                 sync_barrier()
+
+            def wait_gather_send_tail():
+                tail_start = max(local_num_experts - expert_buffer_count, 0)
+                for tail_e_id in range(tail_start, local_num_experts):
+                    wait_a2a_gather_send(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=tail_e_id,
+                        local_e_id=tail_e_id,
+                        a2a_bank_id=a2a_bank_id,
+                        gather_bank_id=gather_bank_id,
+                    )
+
+            if wait_gather_send_before_output_store:
+                wait_gather_send_tail()
+
             start_send_bo(bt_id=bt_id)
 
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
-            for tail_e_id in range(tail_start, local_num_experts):
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=tail_e_id,
-                    local_e_id=tail_e_id,
-                    a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
-                )
+            if (
+                not disable_post_output_sync
+                and post_output_sync_after_output_store
+                and not direct_output_store
+            ):
+                sync_barrier()
+
+            if not wait_gather_send_before_output_store:
+                wait_gather_send_tail()
             return None
 
         lax.fori_loop(0, num_bt, _run_bt_post_gather, None, unroll=False)
@@ -2633,6 +2673,8 @@ def jax_allreduce_metadata_by_bt(
         "direct_output_store",
         "disable_post_gather_path",
         "disable_post_output_sync",
+        "wait_gather_send_before_output_store",
+        "post_output_sync_after_output_store",
         "metadata_mode",
         "enable_bt_scatter_overlap",
         "block_config",
@@ -2707,6 +2749,8 @@ def fused_ep_moe_v2(
     direct_output_store: bool = False,
     disable_post_gather_path: bool = False,
     disable_post_output_sync: bool = False,
+    wait_gather_send_before_output_store: bool = False,
+    post_output_sync_after_output_store: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     w1_shared: jax.Array | None = None,
@@ -2944,6 +2988,10 @@ def fused_ep_moe_v2(
         scope_name += "-no_post_gather_path"
     if disable_post_output_sync:
         scope_name += "-no_post_output_sync"
+    if wait_gather_send_before_output_store:
+        scope_name += "-wait_gather_send_before_output_store"
+    if post_output_sync_after_output_store:
+        scope_name += "-post_output_sync_after_output_store"
     if disable_metadata_pre_sync:
         scope_name += "-no_metadata_pre_sync"
     if disable_metadata_post_sync:
@@ -3118,6 +3166,8 @@ def fused_ep_moe_v2(
                 direct_output_store=direct_output_store,
                 disable_post_gather_path=disable_post_gather_path,
                 disable_post_output_sync=disable_post_output_sync,
+                wait_gather_send_before_output_store=wait_gather_send_before_output_store,
+                post_output_sync_after_output_store=post_output_sync_after_output_store,
                 metadata_mode=metadata_mode,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,

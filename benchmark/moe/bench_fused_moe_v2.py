@@ -613,6 +613,8 @@ def run_all(
     direct_output_store: bool = False,
     disable_post_gather_path: bool = False,
     disable_post_output_sync: bool = False,
+    wait_gather_send_before_output_store: bool = False,
+    post_output_sync_after_output_store: bool = False,
     disable_all_reduce_metadata: bool = False,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
@@ -725,6 +727,8 @@ def run_all(
             "direct_output_store": direct_output_store,
             "disable_post_gather_path": disable_post_gather_path,
             "disable_post_output_sync": disable_post_output_sync,
+            "wait_gather_send_before_output_store": wait_gather_send_before_output_store,
+            "post_output_sync_after_output_store": post_output_sync_after_output_store,
             "disable_all_reduce_metadata": disable_all_reduce_metadata,
         }.items()
         if enabled
@@ -859,6 +863,8 @@ def run_all(
                 direct_output_store=direct_output_store,
                 disable_post_gather_path=disable_post_gather_path,
                 disable_post_output_sync=disable_post_output_sync,
+                wait_gather_send_before_output_store=wait_gather_send_before_output_store,
+                post_output_sync_after_output_store=post_output_sync_after_output_store,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=1,
@@ -1373,6 +1379,16 @@ def parse_args() -> argparse.Namespace:
         help="Skip only the post-gather sync_barrier before start_send_bo.",
     )
     parser.add_argument(
+        "--wait-gather-send-before-output-store",
+        action="store_true",
+        help="Drain gather-send DMA before starting the final output HBM DMA.",
+    )
+    parser.add_argument(
+        "--post-output-sync-after-output-store",
+        action="store_true",
+        help="Move the post-output sync_barrier after start_send_bo instead of before it.",
+    )
+    parser.add_argument(
         "--disable-metadata-pre-sync",
         action="store_true",
         help="Skip only the direct-metadata sync_barrier before metadata remote copies.",
@@ -1557,6 +1573,8 @@ if __name__ == "__main__":
             direct_output_store=args.direct_output_store,
             disable_post_gather_path=disable_all or args.disable_post_gather_path,
             disable_post_output_sync=disable_all or args.disable_post_output_sync,
+            wait_gather_send_before_output_store=args.wait_gather_send_before_output_store,
+            post_output_sync_after_output_store=args.post_output_sync_after_output_store,
             disable_all_reduce_metadata=disable_all or args.disable_all_reduce_metadata,
             cross_expert_prefetch_mode=args.cross_expert_prefetch_mode,
             next_w2_prologue_priority=args.next_w2_prologue_priority,
