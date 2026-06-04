@@ -518,13 +518,26 @@ TUNED_BLOCK_SIZES_RAW = {
     (7, 8192, 8192, 14336, "float8_e4m3fn", "float8_e4m3fn"): (1024, 4096, 1024),
     (7, 8192, 8192, 4096, "float8_e4m3fn", "float8_e4m3fn"): (1024, 2048, 4096),
     # go/keep-sorted end
+    # MiMo-V2-Pro q_proj W8A16 (bf16 x fp8e4m3, block[128,128]), 6144x6144,
+    # tuned 2026-06-04 on TPU7x (qmm_tuner). Decode buckets (8-256) fp8 beats
+    # bf16; prefill buckets (512-2048) fp8 loses but kept tuned to avoid the
+    # (128,128,128) fallback. (Outside keep-sorted: appended block.)
+    (7, 8, 6144, 6144, "bfloat16", "float8_e4m3fn"): (8, 6144, 1024, 2),
+    (7, 16, 6144, 6144, "bfloat16", "float8_e4m3fn"): (16, 512, 6144, 2),
+    (7, 32, 6144, 6144, "bfloat16", "float8_e4m3fn"): (32, 6144, 1024, 2),
+    (7, 64, 6144, 6144, "bfloat16", "float8_e4m3fn"): (64, 6144, 1024, 1),
+    (7, 128, 6144, 6144, "bfloat16", "float8_e4m3fn"): (128, 6144, 1024, 1),
+    (7, 256, 6144, 6144, "bfloat16", "float8_e4m3fn"): (256, 2048, 2048, 2),
+    (7, 512, 6144, 6144, "bfloat16", "float8_e4m3fn"): (256, 6144, 1024, 1),
+    (7, 1024, 6144, 6144, "bfloat16", "float8_e4m3fn"): (256, 2048, 6144, 2),
+    (7, 2048, 6144, 6144, "bfloat16", "float8_e4m3fn"): (256, 2048, 6144, 2),
 }
 
 TUNED_BLOCK_SIZES: dict[TunedKey, TunedValue] = {
     TunedKey(*key): TunedValue(*value) for key, value in TUNED_BLOCK_SIZES_RAW.items()
 }
 
-DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
+DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 64 * 1024 * 1024}
 
 
 def get_device_vmem_limit() -> int:
