@@ -344,37 +344,39 @@ def _weight_dma_l1_kernel(
             start_sem_self_w3(slot, priority=1)
             start_sem_self_w2(slot, priority=w2_fetch_priority)
 
-    for bf_id in range(num_bf_tiles):
-        slot = bf_id % 2
-        if path == "w1":
-            start_w1(slot, bf_id)
-            wait_w1(slot)
-        elif path == "w3":
-            start_w3(slot, bf_id)
-            wait_w3(slot)
-        elif path == "w2":
-            start_w2(slot, bf_id)
-            wait_w2(slot)
-        elif path == "w13":
-            if issue_together:
+    def run_simple_issue_wait():
+        for bf_id in range(num_bf_tiles):
+            slot = bf_id % 2
+            if path == "w1":
                 start_w1(slot, bf_id)
-                start_w3(slot, bf_id)
                 wait_w1(slot)
+            elif path == "w3":
+                start_w3(slot, bf_id)
                 wait_w3(slot)
+            elif path == "w2":
+                start_w2(slot, bf_id)
+                wait_w2(slot)
+            elif path == "w13":
+                if issue_together:
+                    start_w1(slot, bf_id)
+                    start_w3(slot, bf_id)
+                    wait_w1(slot)
+                    wait_w3(slot)
+                else:
+                    start_w1(slot, bf_id)
+                    wait_w1(slot)
+                    start_w3(slot, bf_id)
+                    wait_w3(slot)
+            elif path == "w13_w2":
+                start_w13_w2(slot, bf_id)
+                wait_w13_w2(slot)
             else:
-                start_w1(slot, bf_id)
-                wait_w1(slot)
-                start_w3(slot, bf_id)
-                wait_w3(slot)
-        elif path == "w13_w2":
-            start_w13_w2(slot, bf_id)
-            wait_w13_w2(slot)
-        elif path in ("pipeline_w13_w2", "empty_loop", "sem_self_wait"):
-            pass
-        else:
-            raise ValueError(f"Unsupported L1 weight DMA path: {path}")
+                raise ValueError(f"Unsupported L1 weight DMA path: {path}")
 
-    if path == "pipeline_w13_w2":
+    if path in ("w1", "w3", "w2", "w13", "w13_w2"):
+        for _expert_i in range(num_expert_iters):
+            run_simple_issue_wait()
+    elif path == "pipeline_w13_w2":
         for _expert_i in range(num_expert_iters):
             if drain_policy == "end":
                 for bf_id in range(num_bf_tiles):
@@ -419,7 +421,7 @@ def _weight_dma_l1_kernel(
                     if next_bf_id < num_bf_tiles:
                         start_sem_self_w13_w2(slot)
     else:
-        pass
+        raise ValueError(f"Unsupported L1 weight DMA path: {path}")
 
 
 @functools.partial(
@@ -717,7 +719,7 @@ def parse_args() -> argparse.Namespace:
         "--num-expert-iters",
         type=int,
         default=1,
-        help="Number of production-shaped expert iterations for pipeline_w13_w2.",
+        help="Number of repeated expert-shaped iterations for L1 paths.",
     )
     parser.add_argument("--quant-block-k", type=int, default=128)
     parser.add_argument("--num-experts", type=int, default=384)
