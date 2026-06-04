@@ -565,7 +565,9 @@ def _fused_ep_moe_kernel(
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
 
-        if metadata_mode == "jax" and metadata_starts_hbm is not None:
+        if metadata_starts_hbm is not None and (
+            metadata_mode == "jax" or disable_all_reduce_metadata
+        ):
 
             def _copy_precomputed(
                 t2e_routing_vmem,
@@ -2796,7 +2798,9 @@ def fused_ep_moe_v2(
         raise ValueError(
             f"metadata_mode must be one of {{'recursive','direct','jax'}}; got {metadata_mode!r}"
         )
-    needs_jax_allreduce = (metadata_mode == "jax") and ep_size > 1
+    needs_precomputed_metadata = ep_size > 1 and (
+        metadata_mode == "jax" or disable_all_reduce_metadata
+    )
     if ep_size > 1 and not disable_a2a and disable_all_reduce_metadata:
         raise ValueError(
             "disable_all_reduce_metadata is only supported with disable_a2a=True or ep_size=1."
@@ -3105,9 +3109,9 @@ def fused_ep_moe_v2(
                     None if w1_shared is None else hbm_spec,  # w1_shared
                     None if w3_shared is None else hbm_spec,  # w3_shared
                     None if w2_shared is None else hbm_spec,  # w2_shared
-                    None if not needs_jax_allreduce else hbm_spec,  # metadata_starts
-                    None if not needs_jax_allreduce else hbm_spec,  # metadata_sizes
-                    None if not needs_jax_allreduce else hbm_spec,  # metadata_d2e_counts
+                    None if not needs_precomputed_metadata else hbm_spec,  # metadata_starts
+                    None if not needs_precomputed_metadata else hbm_spec,  # metadata_sizes
+                    None if not needs_precomputed_metadata else hbm_spec,  # metadata_d2e_counts
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -3162,7 +3166,7 @@ def fused_ep_moe_v2(
         w3_shared=None,
         w2_shared=None,
     ):
-        if needs_jax_allreduce:
+        if needs_precomputed_metadata:
             md_starts, md_sizes, md_d2e = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k],
                 padded_num_experts,
