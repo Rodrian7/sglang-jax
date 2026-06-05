@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
 from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+    _build_eagle_tree_structure_impl,
     build_eagle_tree_structure,
 )
 from sgl_jax.srt.kernels.speculative.kernel import (
@@ -295,6 +296,13 @@ def build_tree_mask_for_draft_decode(
     return jnp.asarray(concatenated, dtype=jnp.int32)
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "topk", "num_verify_tokens", "max_seq_len_per_req",
+        "batch_size", "speculative_num_steps", "mesh",
+    ],
+)
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: jax.Array,
@@ -309,47 +317,32 @@ def build_tree_kernel_efficient(
     speculative_num_steps: int,
     mesh: Mesh,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """JAX implementation of build_tree_kernel_efficient.
+    # --- inlined preprocess: top-k selection + draft token gather ---
+    score_tensor = score_list.reshape(score_list.shape[0], -1)
+    _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
+    top_scores_index = jnp.sort(top_scores_index, axis=-1)
 
-    Args:
-        verified_id: Verified token IDs from previous step
-        score_list: List of score tensors from draft model
-        token_list: List of token tensors from draft model
-        parents_list: List of parent index tensors
-        seq_lens: Sequence lengths
-        seq_lens_sum: Sum of sequence lengths
-        topk: Number of top-k candidates
-        num_verify_tokens: Number of tokens to verify
-        max_seq_len_per_req: Maximum allowed sequence length per request (static bound)
+    draft_tokens = jnp.take_along_axis(token_list, top_scores_index, axis=1)
+    draft_tokens = jnp.concatenate(
+        [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
+    ).flatten()
 
-    Returns:
-        tuple of (tree_mask, positions, retrive_index, retrive_next_token,
-                 retrive_next_sibling, draft_tokens)
-    """
-    rep = NamedSharding(mesh, P())
-    verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
-        (verified_id, score_list, token_list, parents_list, seq_lens), rep
-    )
-    parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
-        verified_id,
-        score_list,
-        token_list,
-        parents_list,
-        num_verify_tokens,
-        batch_size,
-        speculative_num_steps,
-    )
+    if speculative_num_steps > 1:
+        parent_list = parents_list
+    else:
+        parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
 
+    # --- build tree structure (shard_map + Pallas, no separate JIT boundary) ---
     tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
-        build_eagle_tree_structure(
+        _build_eagle_tree_structure_impl(
             parent_list=parent_list,
             selected_index=top_scores_index,
             verified_seq_len=seq_lens,
+            seq_lens_sum=seq_lens_sum,
             draft_token_num=num_verify_tokens,
             topk=topk,
-            seq_lens_sum=seq_lens_sum,
             max_context_len=max_seq_len_per_req,
-            tree_mask_mode=0,  # FULL_MASK
+            tree_mask_mode=0,
             mesh=mesh,
         )
     )

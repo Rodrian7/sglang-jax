@@ -412,43 +412,19 @@ def build_eagle_tree_structure_pallas_call(
     )
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "draft_token_num",
-        "topk",
-        "max_context_len",
-        "tree_mask_mode",
-        "mesh",
-    ),
-)
-def build_eagle_tree_structure(
+def _build_eagle_tree_structure_impl(
     parent_list: jax.Array,
     selected_index: jax.Array,
     verified_seq_len: jax.Array,
     seq_lens_sum: jax.Array,
+    *,
     draft_token_num: int,
     topk: int,
     max_context_len: int,
-    tree_mask_mode: int = 0,  # FULL_MASK = 0
+    tree_mask_mode: int = 0,
     mesh: jax.sharding.Mesh | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """
-    Build eagle tree using a Pallas kernel.
-    Args:
-        parent_list: Parent indices array [bs, topk * (depth-1) + 1]
-        selected_index: Selected token indices [bs, draft_token_num - 1]
-        verified_seq_len: Sequence lengths [bs]
-        draft_token_num: Number of draft tokens (num_verify_tokens)
-        topk: Top-k value
-        seq_lens_sum: Sum of sequence lengths
-        tree_mask_mode: Tree mask mode (0=FULL_MASK)
-        mesh: jax mesh used for distributed computation
-        max_context_len: The max context length per request.
-
-    Returns:
-        tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
-    """
+    """Non-JIT core of build_eagle_tree_structure. Safe to call inside an outer JIT."""
     in_specs = (
         P(),  # parent_list
         P(),  # selected_index
@@ -488,3 +464,33 @@ def build_eagle_tree_structure(
         seq_lens_sum,
     )
     return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "draft_token_num",
+        "topk",
+        "max_context_len",
+        "tree_mask_mode",
+        "mesh",
+    ),
+)
+def build_eagle_tree_structure(
+    parent_list: jax.Array,
+    selected_index: jax.Array,
+    verified_seq_len: jax.Array,
+    seq_lens_sum: jax.Array,
+    draft_token_num: int,
+    topk: int,
+    max_context_len: int,
+    tree_mask_mode: int = 0,  # FULL_MASK = 0
+    mesh: jax.sharding.Mesh | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Standalone JIT wrapper — kept for tests/benchmarks."""
+    return _build_eagle_tree_structure_impl(
+        parent_list, selected_index, verified_seq_len, seq_lens_sum,
+        draft_token_num=draft_token_num, topk=topk,
+        max_context_len=max_context_len, tree_mask_mode=tree_mask_mode,
+        mesh=mesh,
+    )
