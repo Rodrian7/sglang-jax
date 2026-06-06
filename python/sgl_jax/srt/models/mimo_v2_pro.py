@@ -7,11 +7,15 @@ a per-shard-interleaved layout that requires special dequantization handling.
 """
 
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.layers.attention.fp8_qkv_decode import build_qkv_fp8_local
 from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -64,6 +68,36 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
                 self.model.layers,
                 specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
                 target_kv_heads_fn=lambda attn: attn.k_head_num,
+            )
+            # Build fused-QKV fp8 (W8A16) DECODE weights from the dequant'd bf16 q/k/v.
+            # Reuses MiMoV2Attention's metadata + decode branch (from mimo_v2_flash).
+            # Gated by env (default on) so baseline A/B runs the same deployment with bf16.
+            n_built = 0
+            if os.environ.get("SGLJAX_QKV_FP8_DECODE", "1") == "1":
+                for layer in self.model.layers:
+                    attn = getattr(layer, "self_attn", None)
+                    if attn is None or not hasattr(attn, "_qkv_nf_pad"):
+                        continue
+                    nf_pad = attn._qkv_nf_pad
+                    fused_wq, fused_ws = jax.jit(
+                        jax.shard_map(
+                            lambda q, k, v, _nf=nf_pad: build_qkv_fp8_local(q, k, v, _nf),
+                            mesh=self.mesh,
+                            in_specs=(P(None, "tensor"), P(None, "tensor"), P(None, "tensor")),
+                            out_specs=(P(None, "tensor"), P(None, "tensor")),
+                            check_vma=False,
+                        )
+                    )(
+                        attn.q_proj.weight.value,
+                        attn.k_proj.weight.value,
+                        attn.v_proj.weight.value,
+                    )
+                    attn.qkv_fp8_wq = nnx.Param(fused_wq)
+                    attn.qkv_fp8_ws = nnx.Param(fused_ws)
+                    attn.has_fp8_qkv = True
+                    n_built += 1
+            logger.info(
+                "MiMoV2Pro: built fused-QKV fp8 W8A16 decode weights for %d attn layers.", n_built
             )
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
