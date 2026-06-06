@@ -12,6 +12,11 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.attention.fp8_qkv_decode import BN as _QKV_FP8_BN
+from sgl_jax.srt.layers.attention.fp8_qkv_decode import (
+    build_qkv_fp8_local,
+    fp8_qkv_w8a16_local,
+)
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -264,6 +269,25 @@ class MiMoV2Attention(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
+        # FP8 W8A16 fused-QKV *decode* path. Decode (M≈8 tok/device) is HBM-bound; reading
+        # q/k/v weights as fp8 (half the bytes) via a streamed kernel beats bf16 XLA, while
+        # prefill stays bf16 (fp8 prefill GEMM caps ~0.85x under the model's [128,128] quant).
+        # Metadata only here; the fp8 weights are built + attached at post-load (fp8 models).
+        self._qkv_tp = (
+            self.mesh.shape["tensor"]
+            if (self.mesh is not None and "tensor" in self.mesh.shape)
+            else 1
+        )
+        _ql, _kl, _vl = (
+            self.q_size // self._qkv_tp,
+            self.k_size // self._qkv_tp,
+            self.v_size // self._qkv_tp,
+        )
+        self._qkv_local = (_ql, _kl, _vl)
+        _nf_local = _ql + _kl + _vl
+        self._qkv_nf_pad = ((_nf_local + _QKV_FP8_BN - 1) // _QKV_FP8_BN) * _QKV_FP8_BN
+        self.has_fp8_qkv = False  # flipped True at post-load fill for fp8-quantized models
+
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
@@ -307,9 +331,29 @@ class MiMoV2Attention(nnx.Module):
         *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        if self.has_fp8_qkv and forward_batch.forward_mode.is_decode():
+            # Decode: one streamed fp8 W8A16 kernel for fused q/k/v (HBM-bound win).
+            ql, kl, vl = self._qkv_local
+
+            def _qkv_fp8(x, wq, ws):
+                fused = fp8_qkv_w8a16_local(x, wq, ws, _QKV_FP8_BN)  # [m, nf_pad] per device
+                return (
+                    fused[:, :ql],
+                    fused[:, ql : ql + kl],
+                    fused[:, ql + kl : ql + kl + vl],
+                )
+
+            q, k, v = jax.shard_map(
+                _qkv_fp8,
+                mesh=self.mesh,
+                in_specs=(P("data", None), P(None, "tensor"), P(None, "tensor")),
+                out_specs=(P("data", "tensor"), P("data", "tensor"), P("data", "tensor")),
+                check_vma=False,
+            )(hidden_states, self.qkv_fp8_wq.value, self.qkv_fp8_ws.value)
+        else:
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
 
         q = q.reshape(-1, self.q_head_num, self.head_dim, out_sharding=P("data", "tensor", None))
         k = k.reshape(
@@ -624,6 +668,31 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 self.model.layers,
                 specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
                 target_kv_heads_fn=lambda attn: attn.k_head_num,
+            )
+            # 5. Build fused-QKV fp8 (W8A16) DECODE weights from the dequant'd bf16 q/k/v.
+            #    Re-quantizing the already-fp8-derived bf16 is near-lossless (~2.5e-3). Built
+            #    per-device under shard_map so the TP-interleaved layout is assembled correctly.
+            n_built = 0
+            for layer in self.model.layers:
+                attn = getattr(layer, "self_attn", None)
+                if attn is None or not hasattr(attn, "_qkv_nf_pad"):
+                    continue
+                nf_pad = attn._qkv_nf_pad
+                fused_wq, fused_ws = jax.jit(
+                    jax.shard_map(
+                        lambda q, k, v, _nf=nf_pad: build_qkv_fp8_local(q, k, v, _nf),
+                        mesh=self.mesh,
+                        in_specs=(P(None, "tensor"), P(None, "tensor"), P(None, "tensor")),
+                        out_specs=(P(None, "tensor"), P(None, "tensor")),
+                        check_vma=False,
+                    )
+                )(attn.q_proj.weight.value, attn.k_proj.weight.value, attn.v_proj.weight.value)
+                attn.qkv_fp8_wq = nnx.Param(fused_wq)
+                attn.qkv_fp8_ws = nnx.Param(fused_ws)
+                attn.has_fp8_qkv = True
+                n_built += 1
+            logger.info(
+                "Built fused-QKV fp8 W8A16 decode weights for %d attention layers.", n_built
             )
 
     @staticmethod
