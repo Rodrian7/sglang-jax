@@ -672,25 +672,27 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             # 5. Build fused-QKV fp8 (W8A16) DECODE weights from the dequant'd bf16 q/k/v.
             #    Re-quantizing the already-fp8-derived bf16 is near-lossless (~2.5e-3). Built
             #    per-device under shard_map so the TP-interleaved layout is assembled correctly.
+            #    Gated by env (default on) so baseline A/B can run the same deployment with bf16.
             n_built = 0
-            for layer in self.model.layers:
-                attn = getattr(layer, "self_attn", None)
-                if attn is None or not hasattr(attn, "_qkv_nf_pad"):
-                    continue
-                nf_pad = attn._qkv_nf_pad
-                fused_wq, fused_ws = jax.jit(
-                    jax.shard_map(
-                        lambda q, k, v, _nf=nf_pad: build_qkv_fp8_local(q, k, v, _nf),
-                        mesh=self.mesh,
-                        in_specs=(P(None, "tensor"), P(None, "tensor"), P(None, "tensor")),
-                        out_specs=(P(None, "tensor"), P(None, "tensor")),
-                        check_vma=False,
-                    )
-                )(attn.q_proj.weight.value, attn.k_proj.weight.value, attn.v_proj.weight.value)
-                attn.qkv_fp8_wq = nnx.Param(fused_wq)
-                attn.qkv_fp8_ws = nnx.Param(fused_ws)
-                attn.has_fp8_qkv = True
-                n_built += 1
+            if os.environ.get("SGLJAX_QKV_FP8_DECODE", "1") == "1":
+                for layer in self.model.layers:
+                    attn = getattr(layer, "self_attn", None)
+                    if attn is None or not hasattr(attn, "_qkv_nf_pad"):
+                        continue
+                    nf_pad = attn._qkv_nf_pad
+                    fused_wq, fused_ws = jax.jit(
+                        jax.shard_map(
+                            lambda q, k, v, _nf=nf_pad: build_qkv_fp8_local(q, k, v, _nf),
+                            mesh=self.mesh,
+                            in_specs=(P(None, "tensor"), P(None, "tensor"), P(None, "tensor")),
+                            out_specs=(P(None, "tensor"), P(None, "tensor")),
+                            check_vma=False,
+                        )
+                    )(attn.q_proj.weight.value, attn.k_proj.weight.value, attn.v_proj.weight.value)
+                    attn.qkv_fp8_wq = nnx.Param(fused_wq)
+                    attn.qkv_fp8_ws = nnx.Param(fused_ws)
+                    attn.has_fp8_qkv = True
+                    n_built += 1
             logger.info(
                 "Built fused-QKV fp8 W8A16 decode weights for %d attention layers.", n_built
             )
