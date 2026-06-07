@@ -14,6 +14,7 @@ Env vars:
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_EXPERT_ORDER — comma-separated forward/reverse expert loop order
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
@@ -248,6 +249,7 @@ interleave_bt_modes = parse_csv_bool(
     "BENCH_INTERLEAVE_BT",
     [True],
 )
+expert_loop_orders = parse_csv_str("BENCH_EXPERT_ORDER", ["forward"])
 valid_cross_expert_prefetch_modes = {"none", "full", "w13"}
 invalid_modes = [
     mode for mode in cross_expert_prefetch_modes if mode not in valid_cross_expert_prefetch_modes
@@ -256,6 +258,15 @@ if invalid_modes:
     raise ValueError(
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
+    )
+valid_expert_loop_orders = {"forward", "reverse"}
+invalid_expert_loop_orders = [
+    mode for mode in expert_loop_orders if mode not in valid_expert_loop_orders
+]
+if invalid_expert_loop_orders:
+    raise ValueError(
+        f"Unsupported BENCH_EXPERT_ORDER values {invalid_expert_loop_orders}; "
+        "expected one of forward or reverse."
     )
 valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
@@ -998,6 +1009,7 @@ for num_tokens in token_candidates:
         for flags in itertools.product(
             cross_expert_prefetch_modes,
             interleave_bt_modes,
+            expert_loop_orders,
         )
     ]
     seen_resolved_configs = set()
@@ -1006,13 +1018,15 @@ for num_tokens in token_candidates:
         bc,
         xprefetch_mode,
         interleave_bt,
+        expert_loop_order,
     ) in configs_to_try:
         bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
         tag = (
             f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
             f"xprefetch={xprefetch_mode},"
             f"direct={int(direct_scaled_dot)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"expert_order={expert_loop_order}"
         )
 
         padded_nt = num_tokens
@@ -1033,7 +1047,8 @@ for num_tokens in token_candidates:
             f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
             f"xprefetch={xprefetch_mode},"
             f"direct={int(direct_scaled_dot)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"expert_order={expert_loop_order}"
         )
         resolved_key = (
             bc_resolved.bt,
@@ -1043,6 +1058,7 @@ for num_tokens in token_candidates:
             xprefetch_mode,
             direct_scaled_dot,
             interleave_bt,
+            expert_loop_order,
         )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
@@ -1100,6 +1116,7 @@ for num_tokens in token_candidates:
                 enable_act_quant=enable_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
                 interleave_bt=interleave_bt,
+                expert_loop_order=expert_loop_order,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
             )
 

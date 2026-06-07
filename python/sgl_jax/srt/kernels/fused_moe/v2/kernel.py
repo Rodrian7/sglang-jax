@@ -353,6 +353,7 @@ def _fused_ep_moe_kernel(
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
     interleave_bt: bool = True,
+    expert_loop_order: str = "forward",
     direct_scaled_dot: bool = False,
     bt: int,
     bf: int,
@@ -1094,8 +1095,11 @@ def _fused_ep_moe_kernel(
         if not can_cross_expert_prefetch:
             return jnp.bool_(False), jnp.int32(0)
 
-        local_e_valid = local_e_id < local_num_experts
-        safe_local_e_id = jnp.minimum(local_e_id, jnp.int32(local_num_experts - 1))
+        local_e_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
+        safe_local_e_id = jnp.minimum(
+            jnp.maximum(local_e_id, jnp.int32(0)),
+            jnp.int32(local_num_experts - 1),
+        )
         e_id = my_id * local_num_experts + safe_local_e_id
         has_tokens_to_prefetch = jnp.logical_and(
             jnp.logical_and(enabled, local_e_valid),
@@ -1196,7 +1200,14 @@ def _fused_ep_moe_kernel(
 
     # ===== Expert FFN: Strix-style double-buffer pipeline =====
 
-    def expert_ffn(bt_sem_id, e_sem_id, local_e_id, bf0_prefetched, a2a_bank_id):
+    def expert_ffn(
+        bt_sem_id,
+        e_sem_id,
+        local_e_id,
+        next_local_e_id,
+        bf0_prefetched,
+        a2a_bank_id,
+    ):
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         has_tokens = dyn_sz > 0
@@ -1207,7 +1218,7 @@ def _fused_ep_moe_kernel(
         def _run_inactive(_):
             return start_prefetch_expert_bf0(
                 bt_sem_id,
-                local_e_id + jnp.int32(1),
+                next_local_e_id,
                 include_w2=can_full_cross_expert_prefetch,
             )
 
@@ -1492,7 +1503,7 @@ def _fused_ep_moe_kernel(
                         if bf_id == num_bf - 2:
                             next_has_prefetch = start_prefetch_expert_bf0(
                                 bt_sem_id,
-                                local_e_id + jnp.int32(1),
+                                next_local_e_id,
                                 slot=slot,
                                 priority=1,
                                 enabled=(num_bts_tiles == jnp.int32(1)),
@@ -1588,7 +1599,7 @@ def _fused_ep_moe_kernel(
                     if can_full_cross_expert_prefetch and bf_id == num_bf - 2:
                         next_has_prefetch = start_prefetch_expert_bf0(
                             bt_sem_id,
-                            local_e_id + jnp.int32(1),
+                            next_local_e_id,
                             slot=slot,
                             priority=1,
                             enabled=(num_bts_tiles == jnp.int32(1)),
@@ -2118,8 +2129,15 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(0, se_total_blocks, _se_body, None)
 
-        def compute_expert_batch(local_e_id, carry):
+        def loop_to_local_e_id(loop_i):
+            if expert_loop_order == "reverse":
+                return jnp.int32(local_num_experts - 1) - loop_i
+            return loop_i
+
+        def compute_expert_batch(loop_i, carry):
             bf0_w13_prefetched = carry
+            local_e_id = loop_to_local_e_id(loop_i)
+            next_local_e_id = loop_to_local_e_id(loop_i + jnp.int32(1))
             e_sem_id_local = local_e_id
 
             wait_a2a_scatter_recv(
@@ -2132,6 +2150,7 @@ def _fused_ep_moe_kernel(
                 bt_sem_id,
                 e_sem_id_local,
                 local_e_id,
+                next_local_e_id,
                 bf0_w13_prefetched,
                 a2a_bank_id,
             )
@@ -2331,6 +2350,7 @@ def _fused_ep_moe_kernel(
         "direct_scaled_dot",
         "cross_expert_prefetch_mode",
         "interleave_bt",
+        "expert_loop_order",
         "enable_act_quant",
     ],
 )
@@ -2394,6 +2414,7 @@ def fused_ep_moe_v2(
     direct_scaled_dot: bool = False,
     cross_expert_prefetch_mode: str = "full",
     interleave_bt: bool = True,
+    expert_loop_order: str = "forward",
     enable_act_quant: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
@@ -2402,6 +2423,10 @@ def fused_ep_moe_v2(
         raise ValueError(
             f"Unsupported {cross_expert_prefetch_mode=}; "
             "expected one of 'none', 'full', or 'w13'."
+        )
+    if expert_loop_order not in ("forward", "reverse"):
+        raise ValueError(
+            f"Unsupported {expert_loop_order=}; expected one of 'forward' or 'reverse'."
         )
     if enable_act_quant:
         if not direct_scaled_dot:
@@ -2609,6 +2634,8 @@ def fused_ep_moe_v2(
         scope_name += "-bt_scatter_overlap"
     if interleave_bt:
         scope_name += "-interleave_bt"
+    if expert_loop_order != "forward":
+        scope_name += f"-expert_order_{expert_loop_order}"
     if w1_shared is not None:
         scope_name += f"-se_bse_{bse}"
     if enable_act_quant:
@@ -2746,6 +2773,7 @@ def fused_ep_moe_v2(
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
                 interleave_bt=interleave_bt,
+                expert_loop_order=expert_loop_order,
                 enable_act_quant=enable_act_quant,
                 direct_scaled_dot=direct_scaled_dot,
                 bt=bt,
