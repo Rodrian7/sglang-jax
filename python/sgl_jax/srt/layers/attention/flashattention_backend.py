@@ -505,6 +505,7 @@ class FlashAttention(AttentionBackend):
         token_to_kv_pool: KVCache,
         causal: int = 1,
         attention_sink: jax.Array = None,
+        inkernel_rope: dict | None = None,
     ):
         """
         Args:
@@ -575,6 +576,7 @@ class FlashAttention(AttentionBackend):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
 
+            _ir = inkernel_rope or {}
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention_v3(
                 queries,
@@ -590,6 +592,10 @@ class FlashAttention(AttentionBackend):
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
                 mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
+                apply_qrope=inkernel_rope is not None,
+                rope_theta=_ir.get("theta", 1000000.0),
+                rotary_dim=_ir.get("rotary_dim", 0),
+                is_neox=_ir.get("is_neox", True),
             )
 
             return result, updated_kv_cache_fused

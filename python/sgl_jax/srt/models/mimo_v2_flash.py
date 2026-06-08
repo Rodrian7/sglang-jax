@@ -329,7 +329,18 @@ class MiMoV2Attention(nnx.Module):
             pad_size = self.head_dim - self.v_head_dim
             v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_size)))
 
-        q, k = self.rotary_emb(positions, q, k)
+        if os.environ.get("SGLJAX_INKERNEL_ROPE", "0") == "1":
+            # In-kernel q-rope: rope only k externally (k is written to the cache);
+            # the RPA kernel ropes q on load, saving the q->rope HBM round-trip.
+            _, k = self.rotary_emb(positions, q, k)
+            inkernel_rope = {
+                "theta": self.rotary_emb.base,
+                "rotary_dim": self.rotary_emb.rotary_dim,
+                "is_neox": self.rotary_emb.is_neox_style,
+            }
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+            inkernel_rope = None
         if self.attention_value_scale is not None:
             v = v * self.attention_value_scale
 
@@ -340,6 +351,7 @@ class MiMoV2Attention(nnx.Module):
             forward_batch,
             token_to_kv_pool,
             attention_sink=self.attention_sink_bias.value if self.attention_sink_bias else None,
+            inkernel_rope=inkernel_rope,
         )
 
         # V was padded to head_dim for fused KV cache; slice back to v_head_dim
