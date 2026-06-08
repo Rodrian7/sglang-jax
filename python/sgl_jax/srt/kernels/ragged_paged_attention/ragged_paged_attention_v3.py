@@ -304,40 +304,6 @@ def get_kv_cache_shape(
     )
 
 
-def _rope_q_inplace(q, base_pos, heads_per_token, rope_theta, rotary_dim, is_neox):
-    """Apply RoPE to a packed q score block in-kernel (rope-on-load).
-
-    q: [R, head_dim] where row r -> token (r // heads_per_token), so the absolute
-    rotary position of row r is ``base_pos + r // heads_per_token`` (token-major,
-    matching the q_span computation in flash_attention_step1_qk_softmax).
-    inv_freq is a compile-time constant from (rope_theta, rotary_dim).
-    """
-    r = q.shape[0]
-    half = rotary_dim // 2
-    # iota-based inv_freq (avoid a captured constant array, which Mosaic rejects):
-    # theta^(-2i/rotary_dim) = (1/theta)^(i * 2/rotary_dim), i = 0..half-1
-    inv_freq = (1.0 / rope_theta) ** (
-        lax.iota(jnp.int32, half).astype(jnp.float32) * (2.0 / rotary_dim)
-    )  # [half]
-    tok = (lax.broadcasted_iota(jnp.int32, (r, 1), 0) // heads_per_token).astype(jnp.float32)
-    pos = base_pos.astype(jnp.float32) + tok  # [R, 1]
-    freqs = pos * inv_freq[None, :]  # [R, rotary_dim // 2]
-    cos = jnp.cos(freqs).astype(q.dtype)
-    sin = jnp.sin(freqs).astype(q.dtype)
-    xr = q[:, :rotary_dim]
-    if is_neox:
-        x1, x2 = jnp.split(xr, 2, axis=-1)
-        o1, o2 = x1 * cos - x2 * sin, x2 * cos + x1 * sin
-        rot = jnp.concatenate((o1, o2), axis=-1)
-    else:
-        x1, x2 = xr[:, ::2], xr[:, 1::2]
-        o1, o2 = x1 * cos - x2 * sin, x2 * cos + x1 * sin
-        rot = jnp.stack((o1, o2), axis=-1).reshape(r, rotary_dim)
-    if rotary_dim < q.shape[1]:
-        return jnp.concatenate((rot, q[:, rotary_dim:]), axis=-1)
-    return rot
-
-
 def _ragged_paged_attention_kernel(*args, **kwargs):
     # distribution_ref is at index 5 (after kv_lens, page_indices, cu_q_lens,
     # cu_kv_lens, cu_seq_mask_lens).
@@ -404,10 +370,6 @@ def _ragged_paged_attention_kernel_loop(
     tpu_version: int = 6,
     debug_mode: bool = False,
     mask_aligned_to_cu_kv: bool = False,
-    apply_qrope: bool = False,
-    rope_theta: float = 1000000.0,
-    rotary_dim: int = 0,
-    is_neox: bool = True,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -489,13 +451,6 @@ def _ragged_paged_attention_kernel_loop(
         assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert k.dtype == v.dtype
-
-        # In-kernel RoPE on q (rope-on-load): rotate the loaded q block here so the
-        # rotated q never round-trips HBM. k stays rope'd externally (in the cache).
-        if apply_qrope:
-            q = _rope_q_inplace(
-                q, processed_q_len, num_q_heads_per_kv_head, rope_theta, rotary_dim, is_neox
-            )
 
         # Follow FlashAttention-2 forward pass.
         if q_scale is not None:
@@ -1683,10 +1638,6 @@ def get_vmem_limit():
         "disable_semaphore_checks",
         "debug_mode",
         "mask_aligned_to_cu_kv",
-        "apply_qrope",
-        "rope_theta",
-        "rotary_dim",
-        "is_neox",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1722,10 +1673,6 @@ def ragged_paged_attention(
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
     mask_aligned_to_cu_kv: bool = False,
-    apply_qrope: bool = False,
-    rope_theta: float = 1000000.0,
-    rotary_dim: int = 0,
-    is_neox: bool = True,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -1957,10 +1904,6 @@ def ragged_paged_attention(
                 tpu_version=tpu_version,
                 debug_mode=debug_mode,
                 mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
-                apply_qrope=apply_qrope,
-                rope_theta=rope_theta,
-                rotary_dim=rotary_dim,
-                is_neox=is_neox,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
