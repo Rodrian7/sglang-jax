@@ -59,7 +59,10 @@ def main() -> int:
     ap.add_argument("--model-path", help="checkpoint dir containing config.json")
     ap.add_argument("--phase", choices=["decode", "prefill", "both"], default="both")
     ap.add_argument(
-        "--batch", type=int, default=512, help="decode batch (tokens) / #seqs emitting logits"
+        "--batch",
+        type=int,
+        default=512,
+        help="decode batch (tokens) / #seqs emitting logits",
     )
     ap.add_argument("--seq-len", type=int, default=4096, help="decode KV context length")
     ap.add_argument("--chunk", type=int, default=16384, help="prefill chunk tokens")
@@ -79,7 +82,7 @@ def main() -> int:
         help="effective collective BW; ~40 measured, 100 hw",
     )
     # output
-    ap.add_argument("--view", choices=["a", "b", "c", "d", "e", "all"], default="all")
+    ap.add_argument("--view", choices=["a", "b", "c", "d", "e", "f", "all"], default="all")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--pprof", default=None, help="write jaxpr_util pprof profile here (.pb.gz)")
     ap.add_argument("--list", action="store_true", help="list supported architectures and exit")
@@ -148,6 +151,15 @@ def main() -> int:
             ga = interp.graph_analysis(config, phase, par, peaks)
             print("\n" + render_graph_views(ga))
             out_json.setdefault("graph", {})[phase] = ga
+        if args.view in ("f", "all"):
+            from sgl_jax.srt.utils.roofline import graph_from_jaxpr as gjax
+
+            fa = gjax.analyze_reference(arch, config, phase, par, peaks)
+            print("\n" + gjax.render_auto_graph(fa))
+            if fa is not None:
+                out_json.setdefault("auto_graph", {})[phase] = {
+                    k: v for k, v in fa.items() if k != "path"
+                }
         out_json["phases"][phase] = model.to_dict()
 
     if args.json_out:
