@@ -490,12 +490,12 @@ def _ragged_paged_attention_kernel_loop(
         assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert k.dtype == v.dtype
 
-        # In-kernel RoPE on q (rope-on-load): rotate the loaded q block here so the
-        # rotated q never round-trips HBM. k stays rope'd externally (in the cache).
-        if apply_qrope:
-            q = _rope_q_inplace(
-                q, processed_q_len, num_q_heads_per_kv_head, rope_theta, rotary_dim, is_neox
-            )
+        # NOTE: In-kernel RoPE on q is applied ONCE per bq block in VMEM right after
+        # the q fetch (see _rope_bq_in_vmem at the wait_fetch_bq site), NOT here.
+        # step1 runs inside the bkv/kv-head inner loops, so roping here recomputes the
+        # cos/sin transcendentals O(num_kv_blocks * num_kv_heads) times per q block
+        # (measured -21% e2e throughput on MiMo-V2-Pro). q reaching this point is
+        # already rope'd. k stays rope'd externally (in the cache).
 
         # Follow FlashAttention-2 forward pass.
         if q_scale is not None:
@@ -870,6 +870,20 @@ def _ragged_paged_attention_kernel_loop(
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
+    def _rope_bq_in_vmem(bq_sem_idx, base_pos):
+        # In-kernel RoPE on q, applied ONCE per bq block right after the q fetch, so
+        # the rotated q never round-trips HBM and cos/sin is computed once per q
+        # block. A naive placement inside the score loop recomputes it once per kv
+        # block (measured -21% e2e throughput on MiMo-V2-Pro). k stays rope'd
+        # externally (already rope'd in the KV cache). The per-kv-head VMEM view is
+        # the same token-major [bq_sz * heads, head_dim] layout that load_bq reads.
+        rows = bq_sz * num_q_heads_per_kv_head
+        for kv_head_idx in range(actual_num_kv_heads):
+            qref = bq_x2_ref.at[bq_sem_idx, kv_head_idx].reshape(rows, head_dim)
+            qref[...] = _rope_q_inplace(
+                qref[...], base_pos, num_q_heads_per_kv_head, rope_theta, rotary_dim, is_neox
+            )
+
     def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
         start *= bkv_stride
         sz *= bkv_stride
@@ -1030,6 +1044,9 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.when(bkv_idx == start_bkv_idx)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                    # Rope the q VMEM block once (rope-on-load), now that it is resident.
+                    if apply_qrope:
+                        _rope_bq_in_vmem(bq_sem_idx, processed_q_len)
 
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
