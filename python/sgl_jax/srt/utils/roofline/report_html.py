@@ -1,18 +1,20 @@
 """Interactive HTML roofline report.
 
-Bakes a model's config-derived constants + quant coefficients + hardware peaks
-into a single self-contained HTML page that re-runs the (closed-form) cost model
-**in the browser**: pick the parallelism layout (tp/dp constrained to valid mesh
-combos so an illegal layout can't be selected) and drag the workload knobs
-(batch, seq_len, chunk, phase, sequence-parallel); the roofline, the per-category
-cost table and the bottleneck summary update live. No server, no external JS
-libs (vanilla + high-DPI canvas), works offline.
+Bakes a model's config-derived constants + hardware peaks into a single
+self-contained HTML page that re-runs the (closed-form) cost model **in the
+browser**: pick the parallelism layout (tp/dp constrained to valid mesh combos),
+the quantization scheme (per-tensor / per-channel / block-wise + block size +
+W8A16/W8A8), and drag the workload knobs; the roofline, a per-op dataflow view,
+the per-category cost table and the bottleneck summary update live. No server,
+no external JS libs (vanilla + high-DPI canvas), works offline.
 
 The JS cost model mirrors ``descriptors._mimo_v2_family`` + ``parallelism`` +
-``ops`` (same op list/formulas/mesh semantics: tensor axis t = tp//dp, fused-MoE
-EP = devices, MoE global tokens = per-DP tokens * dp, SP reduce-scatter/all-gather
-gated on should_scatter). Closed-form roofline only (View B/C/D); jaxpr View F
-needs a real trace and stays Python-side.
+``ops`` (tensor axis t = tp//dp, fused-MoE EP = devices, MoE global tokens =
+per-DP tokens * dp, SP reduce-scatter/all-gather gated on should_scatter).
+Quant model: fp8 weight = 1 byte + scale (per-tensor ~0 / per-channel 4/k /
+block 4/B^2 bytes per elem); block-wise stays bf16 MXU rate (HBM-only), while
+per-tensor/per-channel + fp8 activations reach the fp8 MXU rate. Closed-form
+roofline only (View B/C/D); jaxpr View F needs a real trace.
 """
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ from __future__ import annotations
 import json
 from collections import Counter
 
-from . import quant
 from .report import HardwarePeaks
 
 
@@ -29,20 +30,6 @@ def _cfg(config, *names, default=None):
         if config.get(n) is not None:
             return config[n]
     return default
-
-
-def _quant_bake(qs):
-    K = N = M = 4096
-    out = {}
-    for role, q in qs.items():
-        out[role] = {
-            "wbpe": q.w_bytes(K, N) / (K * N),
-            "wspe": q.weight_scale_bytes(K, N) / (K * N),
-            "abpe": q.a_bytes(M, K) / (M * K),
-            "aspe": q.act_scale_bytes(M, K) / (M * K),
-            "peak": q.peak_kind(),
-        }
-    return out
 
 
 def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
@@ -58,7 +45,6 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         return bool(mlf[i]) if i < len(mlf) else True
 
     combo = Counter((is_swa(i), is_moe(i)) for i in range(L))
-    qs = quant.quant_specs_from_config(config)
     full = dict(
         nh=_cfg(config, "num_attention_heads"),
         nkv=_cfg(config, "num_key_value_heads"),
@@ -88,7 +74,6 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "n_swa": combo[(True, True)] + combo[(True, False)],
         "n_moe": combo[(False, True)] + combo[(True, True)],
         "n_dense": combo[(False, False)] + combo[(True, False)],
-        "quant": _quant_bake(qs),
         "peaks": {
             "bf16_tflops": peaks.bf16_tflops,
             "fp8_tflops": peaks.fp8_tflops,
@@ -122,9 +107,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
  #wrap{display:flex;flex-wrap:wrap;gap:20px;padding:20px}
  #left{flex:0 0 300px} #right{flex:1 1 760px;min-width:680px}
  h1{font-size:17px;margin:0 0 2px} .sub{color:#667;font-size:11px;margin-bottom:14px}
- .ctl{margin:12px 0} .ctl label{display:block;color:#445;font-size:11px;margin-bottom:4px;font-weight:600}
+ .ctl{margin:11px 0} .ctl label{display:block;color:#445;font-size:11px;margin-bottom:4px;font-weight:600}
  .ctl .v{color:#0a5;font-weight:700}
  input[type=range]{width:100%} select{background:#fff;color:#1c2330;border:1px solid #bcc;border-radius:5px;padding:4px 8px;font-size:13px}
+ select:disabled{background:#eef;color:#aab}
  .seg{display:inline-flex;border:1px solid #bcc;border-radius:6px;overflow:hidden}
  .seg button{background:#fff;color:#556;border:0;padding:5px 14px;cursor:pointer;font-size:13px}
  .seg button.on{background:#2563eb;color:#fff}
@@ -137,14 +123,25 @@ _TEMPLATE = r"""<!DOCTYPE html>
  .b-HBM{background:#dbeafe;color:#1e40af} .b-ICI{background:#fce7f3;color:#9d174d} .b-compute{background:#dcfce7;color:#166534}
  #tip{position:fixed;pointer-events:none;background:#1c2330;color:#fff;border-radius:5px;padding:5px 8px;font-size:11px;display:none;z-index:9;box-shadow:0 2px 8px #0004}
  .legend{font-size:11px;color:#556;margin-top:6px}
+ #df{background:#fff;border:1px solid #dde;border-radius:8px;box-shadow:0 1px 4px #0001;padding:14px 16px;width:1040px;box-sizing:border-box}
+ .dfrow{display:flex;align-items:center;margin:3px 0;font-size:12px}
+ .dfrow .nm{flex:0 0 168px;color:#334} .dfrow .barwrap{flex:1 1 auto;background:#f1f4f8;border-radius:4px;height:16px;margin:0 8px}
+ .dfrow .bar{height:16px;border-radius:4px} .dfrow .ms{flex:0 0 130px;text-align:right;color:#556}
+ .dfarrow{color:#cbd5e1;font-size:11px;margin-left:80px}
 </style></head><body>
 <div id="wrap">
  <div id="left">
   <h1>Roofline · <span id="arch"></span></h1>
-  <div class="sub">per-device · v7x · adjust the layout/workload, recomputed live in-browser</div>
+  <div class="sub">per-device · v7x · adjust layout / quant / workload, recomputed live</div>
   <div class="ctl"><label>phase</label>
     <span class="seg"><button id="ph-decode" class="on">decode</button><button id="ph-prefill">prefill</button></span>
     &nbsp; <label style="display:inline">SP</label> <input type="checkbox" id="sp"></div>
+  <div class="ctl"><label>weight quant (qkv/mlp/experts/lm_head; o_proj bf16)</label>
+    <select id="wq"><option value="bf16">bf16 (none)</option><option value="per_tensor">fp8 per-tensor</option><option value="per_channel">fp8 per-channel</option><option value="block">fp8 block-wise</option></select></div>
+  <div class="ctl"><label>block size (block-wise only)</label>
+    <select id="blk"><option value="128">128</option><option value="256">256</option><option value="512">512</option></select></div>
+  <div class="ctl"><label>activation</label>
+    <select id="aq"><option value="bf16">bf16 (W·A16)</option><option value="fp8">fp8 (W·A8)</option></select></div>
   <div class="ctl"><label>tp_size = devices = mesh total</label><select id="tp"></select></div>
   <div class="ctl"><label>dp_size — tensor axis t = tp/dp = <span class="v" id="tv"></span></label><select id="dp"></select></div>
   <div class="ctl"><label>decode batch (tokens) <span class="v" id="batchv"></span></label>
@@ -156,7 +153,9 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <div id="summary"></div>
  </div>
  <div id="right">
+  <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button></div>
   <canvas id="cv"></canvas>
+  <div id="df"></div>
   <div class="legend" id="legend"></div>
   <table id="tbl"><thead><tr><th class="l">op category</th><th>cnt</th><th>GFLOP</th><th>HBM MB</th><th>ICI MB</th><th>OI</th><th>ideal ms</th><th>%step</th><th>bound</th></tr></thead><tbody></tbody></table>
  </div>
@@ -169,17 +168,31 @@ const P = D.peaks;
 const flops_per_s = k => (k==="fp8"?P.fp8_tflops:P.bf16_tflops)*1e12;
 const HBMBW = P.hbm_gbps*1e9, ICIBW = P.ici_gbps*1e9;
 
+// ---- quantization model (parametric) ----
+let Q={wq:"bf16", blk:128, aq:"bf16"};            // weight scheme, block size, activation
+const WROLES={qkv:1,mlp:1,experts:1,lm_head:1};   // o_proj kept bf16
+function wbytes(k,n){ if(Q.wq==="bf16") return 2*k*n;
+  let sc; if(Q.wq==="per_tensor") sc=4; else if(Q.wq==="per_channel") sc=4*n;
+  else sc=4*Math.ceil(k/Q.blk)*Math.ceil(n/Q.blk);     // one fp32 scale per BxB block
+  return k*n + sc; }                                   // fp8 weight = 1 byte/elem + scale
+function abytes(m,k){ return (Q.aq==="fp8"?1:2)*m*k; }
+// fp8 MXU rate (2x) needs per-tensor/per-channel weights AND fp8 acts; block-wise
+// is forced to bf16 rate by the right-matrix tile constraint; W8A16 -> bf16 rate.
+function wpeak(){ return (Q.wq!=="bf16" && Q.wq!=="block" && Q.aq==="fp8") ? "fp8" : "bf16"; }
+
 // ---- cost primitives (mirror ops.py / descriptors.py) ----
-function gemm(m,k,n,role){const q=D.quant[role]; return {flops:2*m*k*n, hbm:(q.wbpe+q.wspe)*k*n+(q.abpe+q.aspe)*m*k+2*m*n, ici:0, peak:q.peak};}
+function gemm(m,k,n,role){const q=WROLES[role]&&Q.wq!=="bf16";
+  const wb=q?wbytes(k,n):2*k*n, ab=q?abytes(m,k):2*m*k;
+  return {flops:2*m*k*n, hbm:wb+ab+2*m*n, ici:0, peak:q?wpeak():"bf16"};}
 function attention(nq,nkv,hd,vhd,qtok,inter){const f=4*nq*hd*inter; const bq=32;
   const hbm=qtok*nq*hd*2 + qtok*nq*vhd*2 + Math.floor(inter/bq)*nkv*2*hd*2 + qtok*nkv*2*hd*2; return {flops:f,hbm:hbm,ici:0,peak:"bf16"};}
-function moe(tpd,le,d,f,role){const q=D.quant[role]; const perw=2*((q.wbpe+q.wspe)*d*f)+(q.wbpe+q.wspe)*f*d; const act=2*tpd*d*2;
-  return {flops:2*tpd*3*d*f, hbm:le*perw+act, ici:0, peak:q.peak};}
+function moe(tpd,le,d,f,role){const q=WROLES[role]&&Q.wq!=="bf16";
+  const wbf=q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d); const act=(q?abytes(tpd,d):2*tpd*d)+2*tpd*d;
+  return {flops:2*tpd*3*d*f, hbm:le*wbf+act, ici:0, peak:q?wpeak():"bf16"};}
 function rope(m,qs,ks){return {flops:6*(qs+ks)*m, hbm:2*(qs+ks)*m*2, ici:0, peak:"bf16"};}
 function rms(m,h){return {flops:4*m*h, hbm:2*m*h*2+h*2, ici:0, peak:"bf16"};}
 function elt(m,h,ninp){return {flops:m*h, hbm:(ninp+1)*m*h*2, ici:0, peak:"bf16"};}
 function router(m,h,ne){return {flops:2*m*h*ne, hbm:m*h*2+h*ne*4+m*ne*4*5, ici:0, peak:"bf16"};} // approx; never the bound
-
 function allreduce(msg,p){return p<=1?0:2*(p-1)/p*msg;}
 function reducescatter(msg,p){return p<=1?0:(p-1)/p*msg;}
 function resolve(s){const tp=s.tp, dp=s.dp, devices=tp; const t=Math.max(1,Math.floor(tp/dp)); return {t, ep:devices, devices, dp};}
@@ -196,32 +209,32 @@ function compute(s){
   const ctx = decode? s.seq_len : s.chunk;
   const t=L.t, ep=L.ep;
   const cat={};
-  const add=(c,o,cnt,shard,peak)=>{cnt=cnt||1;shard=shard||1; const e=cat[c]||(cat[c]={flops:0,hbm:0,ici:0,cnt:0,peak:peak||o.peak});
-    e.flops+=o.flops*cnt/shard; e.hbm+=o.hbm*cnt/shard; e.ici+=o.ici*cnt/shard; e.cnt+=cnt; if(peak)e.peak=peak;};
+  const add=(c,o,cnt,shard)=>{cnt=cnt||1;shard=shard||1; const e=cat[c]||(cat[c]={flops:0,hbm:0,ici:0,cnt:0,peak:o.peak});
+    e.flops+=o.flops*cnt/shard; e.hbm+=o.hbm*cnt/shard; e.ici+=o.ici*cnt/shard; e.cnt+=cnt; if(o.peak==="fp8")e.peak="fp8";};
   function attn(d,count){ if(count<=0)return;
     const qs=d.nh*d.hd, ks=d.nkv*d.hd, vs=d.nkv*d.vhd, ao=d.nh*d.vhd;
     const effctx = d.window? Math.min(ctx,d.window):ctx;
     const inter = tokens*(decode? effctx : effctx/2);
     add("linear", gemm(tokens,D.H,qs+ks+vs,"qkv"), count, t);
     add("rope", rope(tokens,qs,ks), count, t);
-    add("attention", attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter), count, 1, "bf16");
-    add("linear", gemm(tokens,ao,D.H,"o_proj"), count, t, D.quant.o_proj.peak);
+    add("attention", attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter), count, 1);
+    add("linear", gemm(tokens,ao,D.H,"o_proj"), count, t);
     cat.linear.ici += rowReduce(tokens,D.H,L)*count;
     add("norm", rms(tokens,D.H), 2*count); add("other", elt(tokens,D.H,2), 2*count);
   }
   attn(D.full, D.n_full); attn(D.swa, D.n_swa);
   if(D.n_moe>0){ add("router", router(tokens,D.H,D.NEXP), D.n_moe);
-    const moe_tokens=tokens*L.dp;  // global tokens into MoE = per-DP tokens * dp groups
+    const moe_tokens=tokens*L.dp;
     const tpd=Math.max(1,Math.floor(moe_tokens*D.TOPK/ep)); const remote=ep>1?(ep-1)/ep:0;
-    const a2a=2*(moe_tokens*D.TOPK/ep)*D.H*2*remote + rowReduce(tokens,D.H,L);
-    let e=moe(tpd, D.NEXP/ep, D.H, D.MOEF, "experts"); e.ici=a2a; add("moe", e, D.n_moe, 1, D.quant.experts.peak);
+    let e=moe(tpd, D.NEXP/ep, D.H, D.MOEF, "experts"); e.ici=2*(moe_tokens*D.TOPK/ep)*D.H*2*remote + rowReduce(tokens,D.H,L);
+    add("moe", e, D.n_moe, 1);
   }
-  if(D.n_dense>0){ add("linear", gemm(tokens,D.H,2*D.DENSE_F,"mlp"), D.n_dense, t, D.quant.mlp.peak);
-    add("linear", gemm(tokens,D.DENSE_F,D.H,"mlp"), D.n_dense, t, D.quant.mlp.peak);
+  if(D.n_dense>0){ add("linear", gemm(tokens,D.H,2*D.DENSE_F,"mlp"), D.n_dense, t);
+    add("linear", gemm(tokens,D.DENSE_F,D.H,"mlp"), D.n_dense, t);
     add("other", elt(tokens,D.DENSE_F,1), D.n_dense); }
   add("embedding", elt(tokens,D.H,0), 1);
   add("norm", rms(tokens,D.H), 1);
-  add("lm_head", gemm(s.batch,D.H,D.VOCAB,"lm_head"), 1, t, D.quant.lm_head.peak);
+  add("lm_head", gemm(s.batch,D.H,D.VOCAB,"lm_head"), 1, t);
 
   const rows=[]; let thbm=0,tici=0;
   for(const c in cat){const e=cat[c];
@@ -236,17 +249,43 @@ function compute(s){
   return {rows, L, tot, tbound, Tc, Th, Ti, decode, tokens};
 }
 
-// ---------- rendering (high-DPI canvas, light theme) ----------
+// ---- per-op dataflow chain of one representative layer ----
+function buildChain(s){
+  const L=resolve(s); L.sp=s.enable_sp; const decode=s.phase==="decode";
+  const tokens=decode?s.batch:s.chunk, ctx=decode?s.seq_len:s.chunk, t=L.t, ep=L.ep;
+  const d=D.full, qs=d.nh*d.hd, ks=d.nkv*d.hd, vs=d.nkv*d.vhd, ao=d.nh*d.vhd;
+  const inter=tokens*(decode?ctx:ctx/2); const ch=[];
+  const msof=(o,shard)=>{shard=shard||1; const cms=o.flops/shard/flops_per_s(o.peak)*1e3, hms=o.hbm/shard/HBMBW*1e3, ims=(o.ici||0)/ICIBW*1e3;
+    const m=Math.max(cms,hms,ims); return {ms:m, bound:(m===ims&&ims>0)?"ICI":(m===cms?"compute":"HBM")};};
+  const add=(name,cat,o,shard)=>{const r=msof(o,shard); ch.push({name,cat,ms:r.ms,bound:r.bound});};
+  add("input_layernorm","norm",rms(tokens,D.H));
+  add("qkv_proj","linear",gemm(tokens,D.H,qs+ks+vs,"qkv"),t);
+  add("rope","rope",rope(tokens,qs,ks),t);
+  add("attention","attention",attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter));
+  {let o=gemm(tokens,ao,D.H,"o_proj"); o.ici=rowReduce(tokens,D.H,L); add("o_proj +reduce","linear",o,t);}
+  add("+ residual","other",elt(tokens,D.H,2));
+  add("post_attn_layernorm","norm",rms(tokens,D.H));
+  if(D.n_moe>0){ add("router_gate","router",router(tokens,D.H,D.NEXP));
+    const mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep)), remote=ep>1?(ep-1)/ep:0;
+    let e=moe(tpd,D.NEXP/ep,D.H,D.MOEF,"experts"); e.ici=2*(mt*D.TOPK/ep)*D.H*2*remote+rowReduce(tokens,D.H,L);
+    add("experts +a2a","moe",e); add("+ residual","other",elt(tokens,D.H,2));
+  } else { add("gate_up_proj","linear",gemm(tokens,D.H,2*D.DENSE_F,"mlp"),t); add("silu","other",elt(tokens,D.DENSE_F,1));
+    add("down_proj","linear",gemm(tokens,D.DENSE_F,D.H,"mlp"),t); add("+ residual","other",elt(tokens,D.H,2)); }
+  return ch;
+}
+
+// ---------- roofline canvas (high-DPI, light, generous top margin) ----------
 const cv=document.getElementById("cv"), cx=cv.getContext("2d"); let LAST=null; const CW=1040, CH=650;
 function setupCanvas(){const dpr=window.devicePixelRatio||1; cv.style.width=CW+"px"; cv.style.height=CH+"px";
   cv.width=Math.round(CW*dpr); cv.height=Math.round(CH*dpr); cx.setTransform(dpr,0,0,dpr,0,0);}
-function draw(R){LAST=R; const W=CW,Hh=CH, ml=66,mr=18,mt=22,mb=48;
+function tlabel(txt,x,y,col){const w=cx.measureText(txt).width; cx.fillStyle="rgba(255,255,255,0.88)"; cx.fillRect(x-2,y-10,w+4,13); cx.fillStyle=col||"#64748b"; cx.fillText(txt,x,y);}
+function draw(R){LAST=R; const W=CW,Hh=CH, ml=66,mr=18,mt=52,mb=48;
   cx.clearRect(0,0,W,Hh);
   const rows=R.rows.filter(r=>r.flops>0&&r.hbm>0);
   const ceil=(rows.some(r=>r.peak==="fp8")?P.fp8_tflops:P.bf16_tflops);
   const oiv=rows.map(r=>r.oi), perfs=rows.map(r=>r.flops/(r.ideal/1e3)/1e12);
   let xmin=Math.min(...oiv)/3, xmax=Math.max(...oiv)*3; if(!(xmin>0))xmin=0.01;
-  let ymax=ceil*1.5, ymin=Math.min(...perfs.filter(p=>p>0),ceil)/80; if(!isFinite(ymin)||ymin<=0)ymin=ceil/1000;
+  let ymax=ceil*2.2, ymin=Math.min(...perfs.filter(p=>p>0),ceil)/80; if(!isFinite(ymin)||ymin<=0)ymin=ceil/1000;
   const lx=v=>ml+(Math.log10(v)-Math.log10(xmin))/(Math.log10(xmax)-Math.log10(xmin))*(W-ml-mr);
   const ly=v=>mt+(Math.log10(ymax)-Math.log10(v))/(Math.log10(ymax)-Math.log10(ymin))*(Hh-mt-mb);
   cx.strokeStyle="#eef1f5";cx.fillStyle="#889";cx.font="11px sans-serif";cx.lineWidth=1;
@@ -254,30 +293,44 @@ function draw(R){LAST=R; const W=CW,Hh=CH, ml=66,mr=18,mt=22,mb=48;
   for(let e=-3;e<=4;e++){const y=Math.pow(10,e); if(y<ymin||y>ymax)continue; cx.beginPath();cx.moveTo(ml,ly(y));cx.lineTo(W-mr,ly(y));cx.stroke(); cx.fillText("1e"+e,6,ly(y)+3);}
   cx.fillStyle="#445";cx.font="12px sans-serif";cx.fillText("operational intensity (FLOP / HBM-byte)",W/2-110,Hh-8);
   cx.save();cx.translate(16,Hh/2+80);cx.rotate(-Math.PI/2);cx.fillText("attainable TFLOP/s",0,0);cx.restore();
-  // roof: HBM diagonal capped by compute ceiling
   cx.strokeStyle="#334155";cx.lineWidth=2.5;cx.beginPath();let first=true;
   for(let i=0;i<=160;i++){const x=xmin*Math.pow(xmax/xmin,i/160); const y=Math.min(x*HBMBW/1e12,ceil); const px=lx(x),py=ly(y); if(first){cx.moveTo(px,py);first=false;}else cx.lineTo(px,py);} cx.stroke();
-  cx.setLineDash([6,4]);cx.strokeStyle="#94a3b8";cx.lineWidth=1.2;cx.beginPath();cx.moveTo(ml,ly(P.bf16_tflops));cx.lineTo(W-mr,ly(P.bf16_tflops));cx.stroke();
-  cx.fillStyle="#64748b";cx.fillText("bf16 "+P.bf16_tflops.toFixed(0)+" TF/s",W-mr-118,ly(P.bf16_tflops)-4);
-  if(rows.some(r=>r.peak==="fp8")){cx.beginPath();cx.moveTo(ml,ly(P.fp8_tflops));cx.lineTo(W-mr,ly(P.fp8_tflops));cx.stroke();cx.fillText("fp8 "+P.fp8_tflops.toFixed(0)+" TF/s",W-mr-118,ly(P.fp8_tflops)-4);}
-  cx.setLineDash([]);
-  const ridge=ceil/(HBMBW/1e12); if(ridge>xmin&&ridge<xmax){cx.strokeStyle="#cbd5e1";cx.lineWidth=1;cx.beginPath();cx.moveTo(lx(ridge),mt);cx.lineTo(lx(ridge),Hh-mb);cx.stroke();cx.fillStyle="#94a3b8";cx.fillText("ridge OI="+ridge.toFixed(0),lx(ridge)+4,mt+12);}
+  cx.setLineDash([6,4]);cx.strokeStyle="#94a3b8";cx.lineWidth=1.2;
+  cx.beginPath();cx.moveTo(ml,ly(P.bf16_tflops));cx.lineTo(W-mr,ly(P.bf16_tflops));cx.stroke();
+  cx.beginPath();cx.moveTo(ml,ly(P.fp8_tflops));cx.lineTo(W-mr,ly(P.fp8_tflops));cx.stroke();
+  cx.setLineDash([]); cx.font="11px sans-serif";
+  tlabel("bf16 "+P.bf16_tflops.toFixed(0)+" TF/s", W-mr-118, ly(P.bf16_tflops)-4);
+  tlabel("fp8 "+P.fp8_tflops.toFixed(0)+" TF/s", W-mr-118, ly(P.fp8_tflops)-4);
+  const ridge=ceil/(HBMBW/1e12); if(ridge>xmin&&ridge<xmax){cx.strokeStyle="#cbd5e1";cx.lineWidth=1;cx.beginPath();cx.moveTo(lx(ridge),mt);cx.lineTo(lx(ridge),Hh-mb);cx.stroke(); tlabel("ridge OI="+ridge.toFixed(0), lx(ridge)+4, mt-6, "#94a3b8");}
   const smax=Math.max(...rows.map(r=>r.ideal))||1; R._pts=[];
   for(const r of rows){const x=r.oi, y=r.flops/(r.ideal/1e3)/1e12; const px=lx(x),py=ly(y); const rad=6+15*(r.ideal/smax);
     cx.fillStyle=CAT[r.cat]||"#888";
     if(r.bound==="ICI"){cx.save();cx.translate(px,py);cx.rotate(Math.PI/4);cx.lineWidth=3.5;cx.strokeStyle=CAT[r.cat]||"#888";cx.beginPath();cx.moveTo(-rad,0);cx.lineTo(rad,0);cx.moveTo(0,-rad);cx.lineTo(0,rad);cx.stroke();cx.restore();}
     else{cx.strokeStyle="#fff";cx.lineWidth=1.5;cx.beginPath();cx.arc(px,py,rad,0,7);cx.fill();cx.stroke();}
     R._pts.push({px,py,rad,r});
-    if(r.ideal>0.03*smax){cx.fillStyle="#1c2330";cx.font="11px sans-serif";cx.fillText(r.cat,px+rad+3,py+4);}
+    if(r.ideal>0.03*smax){cx.fillStyle="#1c2330";cx.font="11px sans-serif";cx.fillText(r.cat,px+rad+4,py-rad-2);}
   }
 }
 function fmt(x,d){d=d===undefined?1:d; return Math.abs(x)>=1000?(x/1000).toFixed(d)+"k":x.toFixed(d);}
-function render(){const s=state(); const R=compute(s); draw(R);
+function renderDataflow(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
+  const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
+  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one "+(D.n_moe>0?"full-attn + MoE":"dense")+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
+  for(let i=0;i<ch.length;i++){const o=ch[i];
+    h+="<div class='dfrow'><div class='nm'><span style='color:"+(CAT[o.cat]||'#888')+"'>●</span> "+o.name+"</div>"
+      +"<div class='barwrap'><div class='bar' style='width:"+Math.max(1.5,o.ms/mx*100)+"%;background:"+(BCOL[o.bound]||'#999')+"'></div></div>"
+      +"<div class='ms'>"+o.ms.toFixed(4)+" ms <span class='tag b-"+o.bound+"'>"+o.bound+"</span></div></div>";
+    if(i<ch.length-1) h+="<div class='dfarrow'>↓</div>";
+  }
+  const tot=ch.reduce((a,o)=>a+o.ms,0);
+  h+="<div style='margin-top:8px;font-size:12px;color:#334'><b>layer Σ ideal ≈ "+tot.toFixed(3)+" ms</b> (serial; cross-op overlap not modelled)</div>";
+  document.getElementById("df").innerHTML=h;
+}
+function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s);
   let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e9)+"</td><td>"+fmt(r.hbm/1e6)+"</td><td>"+fmt(r.ici/1e6)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
   document.querySelector("#tbl tbody").innerHTML=tb;
-  const L=R.L; const s2=state();
+  const L=R.L; const qstr = Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16"));
   document.getElementById("summary").innerHTML =
-   "<b>mesh</b> data="+L.dp+" × tensor="+L.t+" = "+L.devices+" devices &nbsp; <b>EP</b>="+L.ep+(s2.enable_sp?" &nbsp;<span class='pill'>+SP</span>":"")
+   "<b>mesh</b> data="+L.dp+" × tensor="+L.t+" = "+L.devices+" devices &nbsp; <b>EP</b>="+L.ep+(s.enable_sp?" &nbsp;<span class='pill'>+SP</span>":"")+" &nbsp;<span class='pill'>"+qstr+"</span>"
    +"<br><b>"+(R.decode?"decode":"prefill")+"</b> · tokens/DP="+R.tokens+" · MoE global="+(R.tokens*L.dp)
    +"<br><b>bound: <span class='tag b-"+R.tbound+"'>"+R.tbound+"</span></b> &nbsp; step ≈ "+R.tot.toFixed(2)+" ms"
    +"<div style='margin-top:6px'><span class='pill'>compute "+R.Tc.toFixed(2)+"ms</span><span class='pill'>HBM "+R.Th.toFixed(2)+"ms</span><span class='pill'>ICI "+R.Ti.toFixed(2)+"ms</span></div>";
@@ -291,23 +344,27 @@ function state(){return {tp:+g("tp").value, dp:+g("dp").value, batch:+g("batch")
 function fillDp(){const tp=+g("tp").value; const cur=+g("dp").value; const opts=validDp(tp);
   g("dp").innerHTML=opts.map(d=>"<option value='"+d+"'>"+d+"</option>").join("");
   g("dp").value = opts.includes(cur)? cur : opts[opts.length-1];}
+function syncQuant(){Q.wq=g("wq").value; Q.blk=+g("blk").value; Q.aq=g("aq").value; g("blk").disabled=(Q.wq!=="block");}
 function syncLabels(){g("tv").textContent="t="+Math.max(1,Math.floor(g("tp").value/g("dp").value));
   g("batchv").textContent=g("batch").value; g("seqv").textContent=g("seq_len").value; g("chunkv").textContent=g("chunk").value;}
+function setTab(df){g("tab-rf").className=df?"":"on"; g("tab-df").className=df?"on":""; cv.style.display=df?"none":"block"; g("df").style.display=df?"block":"none";}
 function init(){
   g("arch").textContent=D.arch; setupCanvas();
   const d=D.defaults;
-  // tp options = mesh totals the fused MoE allows (EP=tp must divide n_experts) with a valid dp
   const tpopts=divisors(D.NEXP).filter(x=>x<=1024 && validDp(x).length>0);
   g("tp").innerHTML=tpopts.map(x=>"<option value='"+x+"'>"+x+"</option>").join("");
   g("tp").value = tpopts.includes(d.tp)? d.tp : tpopts[tpopts.length-1];
   fillDp(); if(validDp(+g("tp").value).includes(d.dp)) g("dp").value=d.dp;
   g("batch").value=d.batch; g("seq_len").value=d.seq_len; g("chunk").value=d.chunk; g("sp").checked=d.enable_sp;
+  syncQuant();
   g("tp").addEventListener("change",()=>{fillDp();syncLabels();render();});
   g("dp").addEventListener("change",()=>{syncLabels();render();});
+  ["wq","blk","aq"].forEach(id=>g(id).addEventListener("change",()=>{syncQuant();render();}));
   ["batch","seq_len","chunk"].forEach(id=>g(id).addEventListener("input",()=>{syncLabels();render();}));
   g("sp").addEventListener("change",render);
   g("ph-decode").onclick=()=>{PHASE="decode";g("ph-decode").className="on";g("ph-prefill").className="";render();};
   g("ph-prefill").onclick=()=>{PHASE="prefill";g("ph-prefill").className="on";g("ph-decode").className="";render();};
+  g("tab-rf").onclick=()=>setTab(false); g("tab-df").onclick=()=>setTab(true); setTab(false);
   g("legend").innerHTML=Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)";
   cv.addEventListener("mousemove",e=>{const rect=cv.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;
     let hit=null; if(LAST&&LAST._pts)for(const p of LAST._pts){if((mx-p.px)**2+(my-p.py)**2<(p.rad+5)**2){hit=p;break;}}
