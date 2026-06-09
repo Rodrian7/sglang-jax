@@ -221,7 +221,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
  </div>
  <div id="right">
   <div class="scennav" id="scennav">
-   <button data-sc="overview" class="on">总览</button><button data-sc="overlap">Overlap</button><button data-sc="kernel">Kernel 优化</button><button data-sc="fusion">Fusion</button><button data-sc="trace">Trace 细节</button>
+   <button data-sc="overview" class="on">Overview</button><button data-sc="overlap">Overlap</button><button data-sc="kernel">Kernel</button><button data-sc="fusion">Fusion</button><button data-sc="trace">Trace</button>
   </div>
   <div id="scenhelp" class="scenhelp"></div>
   <div id="body"></div>
