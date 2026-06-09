@@ -328,7 +328,7 @@ function renderDataflow(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o
 function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s);
   let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e9)+"</td><td>"+fmt(r.hbm/1e6)+"</td><td>"+fmt(r.ici/1e6)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
   document.querySelector("#tbl tbody").innerHTML=tb;
-  const L=R.L; const qstr = Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16"));
+  const L=R.L; const qstr = (Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16"))) + (Q.wq!=="bf16"?(" → "+wpeak()+" MXU"+(Q.wq==="block"?" (block-wise capped)":"")):"");
   document.getElementById("summary").innerHTML =
    "<b>mesh</b> data="+L.dp+" × tensor="+L.t+" = "+L.devices+" devices &nbsp; <b>EP</b>="+L.ep+(s.enable_sp?" &nbsp;<span class='pill'>+SP</span>":"")+" &nbsp;<span class='pill'>"+qstr+"</span>"
    +"<br><b>"+(R.decode?"decode":"prefill")+"</b> · tokens/DP="+R.tokens+" · MoE global="+(R.tokens*L.dp)
