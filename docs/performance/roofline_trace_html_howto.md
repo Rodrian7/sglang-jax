@@ -72,6 +72,30 @@ CLI 会在 import jax **之前**自动设好 `JAX_PLATFORMS=cpu` 和 `--xla_forc
 - **Code path** ⭐ —— **来自真实 trace**:每个算子角色 → 它实际的 `models/*.py` 调用链(如 `qkv ← mimo_v2_flash.py:310`、`o_proj ← :355`)。不是手写的描述符
 - **Kernels** ⭐ —— **真实 Pallas kernel 清单**:RPAd/RPAm(full + SWA)、fused-moe-v2,带 per-device avals + shard_map 调用点
 
+报告还按**专家任务分场景**(顶部导航 Overview / Overlap / Kernel / Fusion / Trace):每个场景给排好序的「专家结论」(该攻哪个 kernel、该砍字节还是提算力、哪些融合省 step、通信能否藏住)。
+
+### Overlap 场景的「编译器实测数据」(可选,需 TPU 编译一次)
+
+Overlap 默认是**理论 pipeline 模型**(每个 collective 分「可流水(藏在 experts compute 后)」vs「barrier(TP all-reduce,暴露)」)。要加上**XLA 实际调度的证据**,先 dump 真实 optimized HLO(TPU 上 compile,不跑/不加载权重):
+
+```bash
+# 多机(4-pod tp=32):每节点同命令、不同 --node-rank;rank 0(协调器决定,未必 node 0)写出 HLO
+RL_KV_PAGES=512 PYTHONPATH=python python tools/dump_forward_hlo.py \
+    --model-path /models/MiMo-V2-Pro-Private --tp 32 --dp 8 --phase prefill \
+    --layers 2 --nnodes 4 --node-rank $R --dist-init-addr <rank0_ip>:30605 \
+    --out /tmp/fwd_prefill.hlo
+```
+
+注意:`--layers 2`(全 70 层编译会撑爆 XLA 的 memory-space-assignment;几层即携带同样的 per-layer + 跨层 collective 结构);`RL_KV_PAGES=512`(KV 池太小会让 SWA kernel 的 fused-KV buffer 被错放进 VMEM 而崩)。然后喂给报告:
+
+```bash
+PYTHONPATH=python python tools/trace_roofline.py --model-path … --tp 32 --dp 8 \
+    --hlo /tmp/fwd_prefill.hlo --html roofline.html
+```
+
+Overlap 场景会多出 **"Compiler ground truth (optimized HLO)"** 段:XLA 实发的网络 collective(带 `replica_groups` + sync/async)、MoE a2a 是否在 Pallas kernel 内、async HBM 预取数,以及「真正的 overlap 杠杆在哪」。`hlo_overlap.py` 也可单独 `python python/sgl_jax/srt/utils/roofline/hlo_overlap.py fwd.hlo` 出 JSON。MiMo-V2-Pro tp32 实测结论:网络 collective 只有 4 个 **SYNC** TP all-reduce(tensor 轴 [8,4],暴露的 barrier),**MoE a2a 不是 XLA collective**(在融合 kernel 内,SparseCore 跑,需 device trace 才知是否藏住),另有 37 个 async HBM 预取(贴 HBM roofline 的原因)。
+
+
 **分享**:HTML 完全自包含(数据/CSS/JS 全部 inline,roofline 用 `<canvas>` 现画,无 CDN/图片/网络请求)。直接把这**一个 `.html` 文件**发出去,对方下载后用任意浏览器离线打开即可,不需要装任何东西。
 
 ---
