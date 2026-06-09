@@ -185,6 +185,12 @@ _TEMPLATE = r"""<!DOCTYPE html>
  .dfrow .nm{flex:0 0 168px;color:#334} .dfrow .barwrap{flex:1 1 auto;background:#f1f4f8;border-radius:4px;height:16px;margin:0 8px}
  .dfrow .bar{height:16px;border-radius:4px} .dfrow .ms{flex:0 0 130px;text-align:right;color:#556}
  .dfarrow{color:#cbd5e1;font-size:11px;margin-left:80px}
+ .lh{font-size:14px;font-weight:700;color:#1c2330;margin-bottom:4px}
+ .note{font-size:11px;color:#667;margin:4px 0 8px}
+ .verdict{margin-top:9px;padding:8px 11px;border-radius:7px;font-size:12px;line-height:1.5}
+ .v-warn{background:#fff7ed;border:1px solid #fdba74;color:#9a3412}
+ .v-go{background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46}
+ .mono{font-family:ui-monospace,Menlo,monospace;font-size:11px}
 </style></head><body>
 <div id="wrap">
  <div id="left">
@@ -210,6 +216,9 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <div id="summary"></div>
  </div>
  <div id="right">
+  <div class="seg" id="scenseg" style="margin-bottom:10px">
+    <button id="sc-overview" class="on">Overview</button><button id="sc-overlap">Overlap</button><button id="sc-kernel">Kernel 优化</button><button id="sc-fusion">Fusion</button></div>
+  <div id="lens" class="panel" style="margin-bottom:10px"></div>
   <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button><button id="tab-fus">Fusion</button><button id="tab-cp">Code path</button><button id="tab-kn">Kernels</button></div>
   <canvas id="cv"></canvas>
   <div id="df" class="panel"></div>
@@ -371,6 +380,52 @@ function draw(R){LAST=R; const W=CW,Hh=CH, ml=82,mr=20,mt=52,mb=50;
   }
 }
 function fmt(x){const a=Math.abs(x); if(a===0)return "0"; if(a>=100)return x.toFixed(0); if(a>=1)return x.toFixed(1); if(a>=0.01)return x.toFixed(2); if(a>=0.0001)return x.toFixed(4); return x.toExponential(1);}
+// ---------- scenario lenses (expert task-oriented views) ----------
+function rowMs(r){return {c:r.flops/flops_per_s(r.peak)*1e3, h:r.hbm/HBMBW*1e3, i:r.ici/ICIBW*1e3};}
+function ridgeOI(peak){return (peak==="fp8"?P.fp8_tflops:P.bf16_tflops)/(HBMBW/1e12);}
+function lensOverlap(R){
+  const serial=R.Tc+R.Th+R.Ti, perOp=R.rows.reduce((a,x)=>a+x.ideal,0), floor=R.tot, head=perOp-floor;
+  const bar=(lab,v,col)=>"<div class='dfrow'><div class='nm'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,v/serial*100)+"%;background:"+col+"'></div></div><div class='ms'>"+v.toFixed(2)+" ms</div></div>";
+  let h="<div class='lh'>Overlap — 跨算子/跨资源能藏多少</div>";
+  h+="<div class='note'>roofline 的 ideal 已假设<b>算子内</b>三资源完美 overlap;这里看<b>算子之间</b>能不能把 compute / HBM / ICI 叠起来。</div>";
+  h+=bar("全串行 (无 overlap)",serial,"#cbd5e1")+bar("逐算子 overlap，算子间串行",perOp,"#93c5fd")+bar("完美 overlap 下界 = max(ΣC,ΣH,ΣI)",floor,"#22c55e");
+  h+="<div class='note'>资源总量:<span class='pill'>ΣC "+R.Tc.toFixed(2)+"ms</span><span class='pill'>ΣH "+R.Th.toFixed(2)+"ms</span><span class='pill'>ΣI "+R.Ti.toFixed(2)+"ms</span> → 墙 = <b>"+R.tbound+"</b> ("+floor.toFixed(2)+"ms，overlap 也降不下去)</div>";
+  if(head/Math.max(floor,1e-9)<0.05) h+="<div class='verdict v-warn'>已贴近完美 overlap 下界(跨算子只剩 "+head.toFixed(2)+"ms)，<b>overlap 不是杠杆</b> —— 瓶颈是 "+R.tbound+"。要降 step 得砍这个资源的量(换 Kernel / Fusion 场景)。</div>";
+  else h+="<div class='verdict v-go'>跨算子 overlap 还有约 <b>"+head.toFixed(2)+" ms</b>(逐算子串行 "+perOp.toFixed(2)+" → 完美 "+floor.toFixed(2)+")。把下面的通信排到能被 compute/HBM 盖住的位置。</div>";
+  const ici=R.rows.filter(r=>r.ici>0).map(r=>({cat:r.cat,i:rowMs(r).i})).sort((a,b)=>b.i-a.i);
+  if(ici.length){h+="<div class='note' style='margin-top:8px'><b>通信(可被盖住的候选)</b> · 全局可用 compute "+R.Tc.toFixed(2)+"ms / HBM "+R.Th.toFixed(2)+"ms</div><table><thead><tr><th class='l'>算子</th><th>ICI ms</th></tr></thead><tbody>";
+    for(const o of ici) h+="<tr><td class='l'>"+o.cat+"</td><td>"+o.i.toFixed(3)+"</td></tr>"; h+="</tbody></table>";}
+  h+="<div class='note' style='margin-top:6px;color:#a55'>⚠ 静态理论只给 overlap 的<b>机会上界</b>;真发不发生要用 trace 核实。</div>";
+  return h;}
+function lensKernel(R){
+  let h="<div class='lh'>Kernel 优化 — 攻哪个、往哪使劲</div><div class='note'>按 ideal ms 排序找大头。bound 决定杠杆:HBM→砍字节,compute→提 MXU 率/减 flops,ICI→overlap/减通信。</div>";
+  h+="<table><thead><tr><th class='l'>算子</th><th>ideal ms</th><th>%step</th><th>bound</th><th>OI</th><th class='l'>杠杆</th></tr></thead><tbody>";
+  for(const r of R.rows){const m=rowMs(r); let lever;
+    if(r.bound==="HBM"){const rg=ridgeOI(r.peak); lever="↓字节:量化(试旋钮)/布局/少 materialize · compute "+m.c.toFixed(3)+"ms 空闲 · OI "+r.oi.toFixed(0)+"，需 ≥"+rg.toFixed(0)+" 才转 compute-bound";}
+    else if(r.bound==="compute") lever="↑MXU 率(non-block W8A8)或 ↓flops · 已在 ridge 右侧";
+    else lever="↓/overlap 通信(SP/拓扑) · 可藏 compute+HBM "+(m.c+m.h).toFixed(3)+"ms";
+    h+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==='fp8'?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td><td>"+r.oi.toFixed(1)+"</td><td class='l' style='font-size:11px'>"+lever+"</td></tr>";}
+  h+="</tbody></table>";
+  const top=R.rows[0], K=(D.codepath&&D.codepath.kernels)||[];
+  const km=K.filter(k=>(top.cat==="moe"&&k.kind==="moe")||(top.cat==="attention"&&k.kind==="attention"));
+  if(km.length) h+="<div class='verdict v-go'>最大头 <b>"+top.cat+"</b>("+top.pct.toFixed(0)+"% step, "+top.bound+"-bound)对应真实 kernel:"+km.map(k=>"<span class='mono'>"+k.name+"</span> ×"+k.count).join("、")+" —— 切到 Kernels tab 看 per-device shape/block 配置。</div>";
+  return h;}
+function lensFusion(s,R){
+  const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
+  const C=[["input_layernorm → qkv","RMSNorm→matmul prologue",H,attnN],["qkv → rope","RoPE→matmul epilogue",qsz,attnN],
+    ["rope → attention","RoPE 折进 attention kernel",qsz,attnN],["o_proj → residual","residual→matmul epilogue",H,attnN],
+    ["post_norm → "+(D.n_moe>0?"router":"gate_up"),"RMSNorm→matmul prologue",H,attnN]];
+  if(D.n_moe>0) C.push(["experts → residual","residual→MoE kernel epilogue",H,D.n_moe]);
+  else C.push(["gate_up → silu","SiLU→matmul epilogue",D.DENSE_F,D.n_dense],["silu → down","SiLU→matmul prologue",D.DENSE_F,D.n_dense]);
+  const rows=C.map(c=>{const gb=tokens*c[2]*2*c[3]/1e9; return {p:c[0],r:c[1],gb,ms:gb*1e9/HBMBW*1e3};}).sort((a,b)=>b.ms-a.ms);
+  let h="<div class='lh'>Fusion — 省的 HBM 往返折算成 step 时间</div><div class='note'>单生产者→消费者融合,去掉中间激活的 HBM 往返。模型 <b>"+R.tbound+"-bound</b>;HBM-bound 时省的字节≈直接省 step。</div>";
+  h+="<table><thead><tr><th class='l'>融合</th><th class='l'>方式</th><th>省 HBM GB</th><th>省 ms</th><th>%step</th></tr></thead><tbody>";
+  for(const r of rows) h+="<tr><td class='l'>"+r.p+"</td><td class='l' style='font-size:11px'>"+r.r+"</td><td>"+fmt(r.gb)+"</td><td>"+r.ms.toFixed(3)+"</td><td>"+(R.tot>0?(r.ms/R.tot*100).toFixed(1):0)+"%</td></tr>";
+  return h+"</tbody></table><div class='note' style='color:#a55'>⚠ XLA 是否已自动融合未知,要用 optimized HLO / trace 核实。</div>";}
+function renderLens(s,R){const el=g("lens");
+  if(SCEN==="overview"){el.style.display="none";return;}
+  el.style.display="block";
+  el.innerHTML = SCEN==="overlap"?lensOverlap(R) : SCEN==="kernel"?lensKernel(R) : lensFusion(s,R);}
 function renderDataflow(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
   let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one "+(D.n_moe>0?"full-attn + MoE":"dense")+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
@@ -412,7 +467,7 @@ function renderKernels(){const C=D.codepath; const el=g("kn"); if(!C){el.innerHT
     h+="<div style='margin:4px 0;padding:8px 10px;border:1px solid #e6e9ef;border-radius:8px'><div style='font-weight:600;color:#0f172a'><span style='color:"+col+"'>●</span> "+k.name+" <span class='pill'>×"+k.count+"</span> <span class='pill'>"+k.kind+"</span></div>"
       +"<div style='font-family:ui-monospace,Menlo,monospace;color:#667;font-size:11px;margin-top:3px'>in: "+av(k.in_avals)+"<br>out: "+av(k.out_avals)+"<br>@ "+(k.ctx||"")+"</div></div>";}
   el.innerHTML=h;}
-function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s); renderFusion(s);
+function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s); renderFusion(s); renderLens(s,R);
   let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e12)+"</td><td>"+fmt(r.hbm/1e9)+"</td><td>"+fmt(r.ici/1e9)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
   document.querySelector("#tbl tbody").innerHTML=tb;
   const L=R.L; const qstr=(Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16")))+(Q.wq!=="bf16"?(" → "+wpeak()+" MXU"+(Q.wq==="block"?" (block-wise capped)":"")):"");
@@ -426,7 +481,9 @@ function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s
 function divisors(n){const a=[];for(let i=1;i<=n;i++)if(n%i===0)a.push(i);return a;}
 function validDp(tp){return divisors(tp).filter(d=>D.full.nh%(Math.floor(tp/d))===0);}
 function g(id){return document.getElementById(id);}
-let PHASE="decode";
+let PHASE="decode"; let SCEN="overview";
+function setScen(name){SCEN=name; for(const k of ["overview","overlap","kernel","fusion"])g("sc-"+k).className=(k===name)?"on":"";
+  render(); const tab={overview:"rf",overlap:"rf",kernel:"kn",fusion:"fus"}[name]; setTab(tab);}
 function state(){return {tp:+g("tp").value, dp:+g("dp").value, batch:+g("batch").value, seq_len:+g("seq_len").value, chunk:+g("chunk").value, phase:PHASE, enable_sp:g("sp").checked};}
 function fillDp(){const tp=+g("tp").value; const cur=+g("dp").value; const opts=validDp(tp);
   g("dp").innerHTML=opts.map(d=>"<option value='"+d+"'>"+d+"</option>").join("");
@@ -455,6 +512,7 @@ function init(){
   g("ph-decode").onclick=()=>{PHASE="decode";g("ph-decode").className="on";g("ph-prefill").className="";syncPhaseCtl();render();};
   g("ph-prefill").onclick=()=>{PHASE="prefill";g("ph-prefill").className="on";g("ph-decode").className="";syncPhaseCtl();render();};
   for(const k in TABS) g("tab-"+k).onclick=()=>setTab(k);
+  for(const k of ["overview","overlap","kernel","fusion"]) g("sc-"+k).onclick=()=>setScen(k);
   g("legend").innerHTML=Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)";
   cv.addEventListener("mousemove",e=>{const rect=cv.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;
     let hit=null; if(LAST&&LAST._pts)for(const p of LAST._pts){if((mx-p.px)**2+(my-p.py)**2<(p.rad+5)**2){hit=p;break;}}
