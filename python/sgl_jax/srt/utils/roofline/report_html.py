@@ -34,6 +34,24 @@ def _cfg(config, *names, default=None):
     return default
 
 
+def _quant_default(config) -> dict:
+    """Derive the default quant-knob state from config.json's quantization_config.
+    fp8 + weight_block_size -> block-wise (block size from the config); fp8 without
+    a block -> per-tensor; activation_scheme present -> W8A8 else W8A16; no quant
+    config -> bf16."""
+    qc = config.get("quantization_config") or {}
+    qm = str(qc.get("quant_method") or "").lower()
+    if "fp8" not in qm:
+        return {"wq": "bf16", "blk": 128, "aq": "bf16"}
+    wbs = qc.get("weight_block_size")
+    if wbs:
+        wq, blk = "block", int(wbs[0])
+    else:
+        wq, blk = "per_tensor", 128
+    aq = "fp8" if qc.get("activation_scheme") in ("dynamic", "static") else "bf16"
+    return {"wq": wq, "blk": blk, "aq": aq}
+
+
 def _bake_jaxpr(arch, config) -> dict | None:
     """Trace one reference layer to a jaxpr; bake the primitive histogram + the
     source line that emits each (shortened). None if jax / reference unavailable."""
@@ -45,20 +63,22 @@ def _bake_jaxpr(arch, config) -> dict | None:
         if sv is None:
             return None
 
-        def short(s):
-            s = s.split(" (")[0]
+        def opname(s):
+            # source_info "file.py:line:col (a.b.<locals>.fn)" -> innermost fn name
+            if "(" in s:
+                return s.split("(", 1)[1].rstrip(")").split(".")[-1]
             return s.rsplit("/", 1)[-1] if "/" in s else s
 
         def top(d, n=24):
             return [[k, v] for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:n]]
 
-        bysrc: dict[str, int] = {}
+        byop: dict[str, int] = {}
         for k, v in sv["by_source"].items():
-            bysrc[short(k)] = bysrc.get(short(k), 0) + v
+            byop[opname(k)] = byop.get(opname(k), 0) + v
         return {
             "num_eqns": sv["num_eqns"],
             "by_primitive": top(sv["by_primitive"]),
-            "by_source": top(bysrc),
+            "by_source": top(byop),
         }
     except Exception:
         return None
@@ -121,6 +141,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
             "chunk": defaults.get("chunk", 16384),
             "enable_sp": bool(defaults.get("enable_sp", False)),
             "scatter_min": 128,
+            **_quant_default(config),
         },
     }
 
@@ -198,7 +219,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <div id="tip"></div>
 <script>
 const D = __DATA__;
-const CAT = {moe:"#dc2626",linear:"#2563eb",attention:"#16a34a",router:"#9333ea",lm_head:"#b45309",norm:"#db2777",rope:"#6b7280",other:"#a16207",embedding:"#0891b2"};
+const CAT = {moe:"#dc2626",linear:"#2563eb",o_proj:"#0d9488",attention:"#16a34a",router:"#9333ea",lm_head:"#b45309",norm:"#db2777",rope:"#6b7280",other:"#a16207",embedding:"#0891b2"};
 const P = D.peaks;
 const flops_per_s = k => (k==="fp8"?P.fp8_tflops:P.bf16_tflops)*1e12;
 const HBMBW = P.hbm_gbps*1e9, ICIBW = P.ici_gbps*1e9;
@@ -251,8 +272,8 @@ function compute(s){
     add("linear", gemm(tokens,D.H,qs+ks+vs,"qkv"), count, t);
     add("rope", rope(tokens,qs,ks), count, t);
     add("attention", attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter), count, 1);
-    add("linear", gemm(tokens,ao,D.H,"o_proj"), count, t);
-    cat.linear.ici += rowReduce(tokens,D.H,L)*count;
+    add("o_proj", gemm(tokens,ao,D.H,"o_proj"), count, t);
+    cat.o_proj.ici += rowReduce(tokens,D.H,L)*count;
     add("norm", rms(tokens,D.H), 2*count); add("other", elt(tokens,D.H,2), 2*count);
   }
   attn(D.full, D.n_full); attn(D.swa, D.n_swa);
@@ -294,7 +315,7 @@ function buildChain(s){
   add("qkv_proj","linear",gemm(tokens,D.H,qs+ks+vs,"qkv"),t);
   add("rope","rope",rope(tokens,qs,ks),t);
   add("attention","attention",attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter));
-  {let o=gemm(tokens,ao,D.H,"o_proj"); o.ici=rowReduce(tokens,D.H,L); add("o_proj +reduce","linear",o,t);}
+  {let o=gemm(tokens,ao,D.H,"o_proj"); o.ici=rowReduce(tokens,D.H,L); add("o_proj +reduce","o_proj",o,t);}
   add("+ residual","other",elt(tokens,D.H,2));
   add("post_attn_layernorm","norm",rms(tokens,D.H));
   if(D.n_moe>0){ add("router_gate","router",router(tokens,D.H,D.NEXP));
@@ -375,10 +396,10 @@ function renderFusion(s){const decode=s.phase==="decode"; const tokens=decode?s.
   g("fus").innerHTML=h+"</tbody></table>";
 }
 function renderJaxpr(){const J=D.jaxpr; if(!J){g("jax").innerHTML="<div style='color:#a55'>jaxpr structure unavailable (report built without jax).</div>";return;}
-  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one reference layer traced to a jaxpr ("+J.num_eqns+" equations). Primitive histogram + the source line that emits each — from the descriptor's reference forward (a faithful stand-in, not the production module's exact lines). Static (does not depend on the knobs).</div>";
+  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one reference layer traced to a jaxpr ("+J.num_eqns+" equations). Left: how many of each <b>primitive</b> the layer lowers to. Right: how many primitives each <b>logical op</b> emits — keyed by the reference forward's function name (rms_norm / linear / _pallas_id / layer), since the trace runs the descriptor's stand-in, not the production module (so these are op names, not real-module line numbers). Static.</div>";
   h+="<div style='display:flex;gap:28px;flex-wrap:wrap'>";
   h+="<div style='flex:0 0 auto'><b>by primitive</b><table style='width:auto'><tbody>"+J.by_primitive.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
-  h+="<div style='flex:1 1 320px'><b>by source line</b><table style='width:auto'><tbody>"+J.by_source.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
+  h+="<div style='flex:0 0 auto'><b>by logical op (reference fn)</b><table style='width:auto'><tbody>"+J.by_source.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
   g("jax").innerHTML=h+"</div>";
 }
 function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s); renderFusion(s);
@@ -414,6 +435,7 @@ function init(){
   g("tp").value = tpopts.includes(d.tp)? d.tp : tpopts[tpopts.length-1];
   fillDp(); if(validDp(+g("tp").value).includes(d.dp)) g("dp").value=d.dp;
   g("batch").value=d.batch; g("seq_len").value=d.seq_len; g("chunk").value=d.chunk; g("sp").checked=d.enable_sp;
+  if(d.wq)g("wq").value=d.wq; if(d.blk)g("blk").value=d.blk; if(d.aq)g("aq").value=d.aq;
   syncQuant();
   g("tp").addEventListener("change",()=>{fillDp();syncLabels();render();});
   g("dp").addEventListener("change",()=>{syncLabels();render();});

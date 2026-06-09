@@ -22,6 +22,7 @@ from .report import HardwarePeaks, ModelRoofline
 _CAT_COLORS = {
     "moe": "#d62728",
     "linear": "#1f77b4",
+    "o_proj": "#0d9488",
     "attention": "#2ca02c",
     "router": "#9467bd",
     "lm_head": "#8c564b",

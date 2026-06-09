@@ -223,7 +223,7 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
     oc = references.gemm_cost(m=tokens, k=ao, n=H, qspec=qs["o_proj"])
     E(
         f"o_proj[{qs['o_proj'].tag()}]",
-        "linear",
+        "o_proj",
         [attn],
         t2,
         oc,

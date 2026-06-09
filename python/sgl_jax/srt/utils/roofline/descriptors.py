@@ -200,7 +200,7 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
         o = _op(
             rr,
             f"{tag}.o_proj[{op_q.tag()}]",
-            "linear",
+            "o_proj",
             layers=count,
             shard=tp,
             peak_kind=op_q.peak_kind(),
