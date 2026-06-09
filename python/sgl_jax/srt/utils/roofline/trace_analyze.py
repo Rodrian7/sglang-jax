@@ -195,11 +195,17 @@ def analyze_trace(
     from collections import defaultdict
 
     gemm_groups = defaultdict(lambda: {"count": 0, "src": "", "m": 0, "k": 0, "n": 0})
+    router_count = 0
+    router_src = "gate.py"
     for e in gemms:
         r = _gemm_role(e, dims)
         if r is None:
             continue
         role, category, qrole, m, k, n = r
+        if role == "router":
+            router_count += 1
+            router_src = _last_model_frame(e.get("source_stack", [])) or e.get("source", "")
+            continue
         g = gemm_groups[(role, k, n)]
         g["count"] += 1
         g["m"], g["k"], g["n"] = m, k, n
@@ -213,17 +219,27 @@ def analyze_trace(
         ici = 0
         if role in row_parallel_roles:
             ici = parallelism.row_parallel_reduce_bytes(tokens_pd, H, layout)
-        # lm_head/router are sharded over tensor too (t); router is tiny
-        shard = t
+        # lm_head + projections are sharded over the tensor axis t
         add(
             rr,
             f"{role}[{qspec.tag()}]x{g['count']}",
             g["category"],
             count=g["count"],
-            shard=shard,
+            shard=t,
             peak_kind=qspec.peak_kind(),
             source=g["src"],
             ici=ici,
+        )
+
+    # router gate (matmul + softmax + top_k); replicated (not tensor-sharded)
+    if router_count:
+        add(
+            ops.router_gate(tokens_pd, H, NEXP, TOPK),
+            f"routerx{router_count}",
+            "router",
+            count=router_count,
+            shard=1,
+            source=router_src,
         )
 
     # ---- Pallas: attention (full/SWA) + MoE experts, by kernel-name registry
@@ -290,8 +306,8 @@ def analyze_trace(
                 category="attention",
                 source=attn_src,
                 count=count,
-                flops=int(rr["flops"]),
-                hbm_bytes=int(rr["hbm_bytes"]),
+                flops=int(rr["flops"]) * count,
+                hbm_bytes=int(rr["hbm_bytes"]) * count,
                 ici_bytes=0,
                 peak_kind="bf16",
             )
@@ -357,17 +373,13 @@ def analyze_trace(
         rows[-1].hbm_bytes *= n_norm
     n_rope = sum(1 for e in top if e["prim"] == "cos" and "embeddings" in (e.get("source") or ""))
     if n_rope:
-        rows.append(
-            ops.to_op(
-                ops.rope(tokens_pd, dims["q_size"], dims["k_size"]),
-                f"ropex{n_rope}",
-                "rope",
-                source="embeddings.py",
-            )
-        )
-        rows[-1].count = n_rope
-        rows[-1].flops *= n_rope
-        rows[-1].hbm_bytes *= n_rope
+        # rope acts on head-sharded q/k -> per-device work is /t
+        rr_rope = ops.rope(tokens_pd, dims["q_size"], dims["k_size"])
+        op = ops.to_op(rr_rope, f"ropex{n_rope}", "rope", source="embeddings.py")
+        op.count = n_rope
+        op.flops = int(op.flops * n_rope / t)
+        op.hbm_bytes = int(op.hbm_bytes * n_rope / t)
+        rows.append(op)
 
     meta = dict(
         arch=arch,
