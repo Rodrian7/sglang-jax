@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import references
+from . import parallelism, references
 from .report import OpRoofline
 
 
@@ -74,7 +74,13 @@ def _cfg(c, *names, default=None):
 def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGraph:
     """Dataflow graph for ONE decoder layer (per-device costs)."""
     H = _cfg(config, "hidden_size")
-    tp, ep = par["tp"], par["ep"]
+    lp, _warns = parallelism.resolve(
+        config,
+        par,
+        moe_backend=par.get("moe_backend", "fused_v2"),
+        enable_sp=par.get("enable_sp", False),
+    )
+    tp, ep = lp.t, lp.ep  # tensor-parallel degree (tp//dp) and fused-MoE EP (=devices)
     tokens = par["batch"] if phase == "decode" else par["chunk"]
     bf = 2  # bf16 activation bytes
     from . import quant as _q
@@ -83,8 +89,16 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
 
     if swa:
         nh, nkv, hd = (
-            _cfg(config, "swa_num_attention_heads", default=_cfg(config, "num_attention_heads")),
-            _cfg(config, "swa_num_key_value_heads", default=_cfg(config, "num_key_value_heads")),
+            _cfg(
+                config,
+                "swa_num_attention_heads",
+                default=_cfg(config, "num_attention_heads"),
+            ),
+            _cfg(
+                config,
+                "swa_num_key_value_heads",
+                default=_cfg(config, "num_key_value_heads"),
+            ),
             _cfg(config, "swa_head_dim", default=_cfg(config, "head_dim")),
         )
         vhd = _cfg(config, "swa_v_head_dim", default=_cfg(config, "v_head_dim", default=hd))
@@ -187,7 +201,7 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
     attn = T("attn_out", tokens * ao * bf)
     acost = references.attention_cost(
         num_q_heads=max(1, nh // tp),
-        num_kv_heads=max(1, nkv // tp),
+        num_kv_heads=parallelism.kv_heads_per_device(nkv, tp),
         head_dim=hd,
         v_head_dim=vhd,
         q_tokens=tokens,
@@ -203,11 +217,10 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
         fusable="pallas",
         source="ragged_paged_attention_v3",
     )
-    # o_proj (row-parallel -> all-reduce)
+    # o_proj (row-parallel reduce: all-reduce over tensor axis t, or SP reduce-
+    # scatter + residual all-gather over the full mesh above the scatter threshold)
     t2 = T("attn_proj", act)
     oc = references.gemm_cost(m=tokens, k=ao, n=H, qspec=qs["o_proj"])
-    from .descriptors import _ring_bytes
-
     E(
         f"o_proj[{qs['o_proj'].tag()}]",
         "linear",
@@ -217,7 +230,7 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
         fusable="matmul",
         source="mimo_v2_flash.py:515 o_proj",
         shard=tp,
-        ici=_ring_bytes(tokens * H * bf, tp),
+        ici=parallelism.row_parallel_reduce_bytes(tokens, H, lp),
     )
     # residual + post-attn norm
     t3 = T("resid1", act)
@@ -256,11 +269,18 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
             source="gate.py:50 gate",
         )
         tpd = max(1, tokens * TOPK // ep)
+        # fused-MoE EP group = full mesh = devices (ep = lp.ep). (ep-1)/ep remote;
+        # plus a MoE-output reshard (same SP/DP reduce rule as o_proj).
         remote = (ep - 1) / ep if ep > 1 else 0.0
         a2a = int(2 * (tokens * TOPK / ep) * H * bf * remote)
+        a2a += parallelism.row_parallel_reduce_bytes(tokens, H, lp)
         eo = T("expert_out", act)
         ec = references.moe_experts_cost(
-            tokens_per_device=tpd, local_experts=NEXP / ep, d=H, f=MOEF, qspec=qs["experts"]
+            tokens_per_device=tpd,
+            local_experts=NEXP / ep,
+            d=H,
+            f=MOEF,
+            qspec=qs["experts"],
         )
         E(
             "experts[PALLAS]",

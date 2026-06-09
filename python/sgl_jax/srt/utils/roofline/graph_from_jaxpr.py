@@ -394,7 +394,13 @@ def analyze_reference(arch, config, phase, par, peaks) -> dict | None:
 
     af, ah, acm, ahm = _tot(fg)
     # hand-written reference (unsharded full+MoE layer) for cross-validation
-    hw = G.build_layer_graph(config, phase, {**par, "tp": 1, "ep": 1}, swa=False, moe=True)
+    hw = G.build_layer_graph(
+        config,
+        phase,
+        {**par, "tp": 1, "dp": 1, "ep": 1, "devices": 1},
+        swa=False,
+        moe=True,
+    )
     hf, hh, hcm, hhm = _tot(hw)
     return {
         "phase": phase,

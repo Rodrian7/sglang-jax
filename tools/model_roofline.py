@@ -3,19 +3,24 @@
 
 Given a checkpoint dir (``--model-path`` with ``config.json``), resolves the
 architecture through the framework model registry (``scan models/``), composes a
-per-device theoretical roofline for the requested phase(s), and prints three
-views:
+per-device theoretical roofline for the requested phase(s), and prints views:
 
   View A  structure   -- op histogram + source attribution (jax jaxpr_util)
   View B  cost         -- FLOPs / HBM / ICI / AI / bound by op category
   View C  fused        -- the same cost attributed back to source lines
+  View D/E graph        -- hand-written layer dataflow + critical path + fusion
+  View F  jaxpr graph   -- dataflow auto-derived from the traced reference jaxpr
 
-Pure theory (no profiling/trace): runs on CPU, no TPU init required.
+Parallelism mirrors the server flags: ``--tp`` is tp_size = mesh total = device
+count; the real tensor-parallel degree for attention/linears is ``tp//dp``; the
+fused MoE expert-parallel group is the full mesh (= devices). The layout is
+validated (``--devices`` must equal ``--tp``, ``tp % dp == 0``, heads/experts
+divisibility) before simulating. Pure theory (no profiling/trace): runs on CPU.
 
-Example:
-  python -m sgl_jax.tools.model_roofline --model-path /models/MiMo-V2-Flash \\
-      --phase both --batch 64 --seq-len 4096 --tp 8 --ep 32 --devices 32 \\
-      --peak-ici-gbps 40 --json-out roofline.json
+Example (the validated MiMo-V2-Pro EP layout):
+  python -m sgl_jax.tools.model_roofline --model-path /models/MiMo-V2-Pro \\
+      --phase both --batch 64 --seq-len 4096 --tp 32 --dp 8 --devices 32 \\
+      --enable-sp --peak-ici-gbps 40 --json-out roofline.json
 """
 
 from __future__ import annotations
@@ -67,10 +72,36 @@ def main() -> int:
     ap.add_argument("--seq-len", type=int, default=4096, help="decode KV context length")
     ap.add_argument("--chunk", type=int, default=16384, help="prefill chunk tokens")
     # parallelism
-    ap.add_argument("--tp", type=int, default=8, help="attention/linear tensor-parallel degree")
-    ap.add_argument("--ep", type=int, default=32, help="expert-parallel degree")
-    ap.add_argument("--devices", type=int, default=32)
-    ap.add_argument("--dp", type=int, default=None)
+    ap.add_argument(
+        "--tp",
+        type=int,
+        default=8,
+        help="tp_size = mesh total = device count (same as the server --tp-size). "
+        "The real tensor-parallel degree for attention/linears is tp//dp.",
+    )
+    ap.add_argument(
+        "--ep",
+        type=int,
+        default=None,
+        help="ep_size; fused MoE ignores it (EP=devices)",
+    )
+    ap.add_argument(
+        "--devices",
+        type=int,
+        default=None,
+        help="total devices; must equal tp (default = tp)",
+    )
+    ap.add_argument("--dp", type=int, default=1, help="data-parallel degree; tensor axis = tp//dp")
+    ap.add_argument(
+        "--enable-sp",
+        action="store_true",
+        help="model sequence parallelism (reduce-scatter + all-gather above the scatter threshold)",
+    )
+    ap.add_argument(
+        "--moe-backend",
+        default="fused_v2",
+        help="fused_v2|fused|... (affects EP semantics)",
+    )
     # peaks (per-device); defaults are v7x
     ap.add_argument("--peak-bf16-tflops", type=float, default=None)
     ap.add_argument("--peak-fp8-tflops", type=float, default=None)
@@ -120,15 +151,29 @@ def main() -> int:
         HardwarePeaks(**{**HardwarePeaks().__dict__, **overrides}) if overrides else HardwarePeaks()
     )
 
+    devices = args.devices if args.devices is not None else args.tp
     par = {
         "tp": args.tp,
-        "ep": args.ep,
-        "devices": args.devices,
-        "dp": args.dp if args.dp is not None else max(1, args.devices // args.tp),
+        "ep": args.ep if args.ep is not None else devices,
+        "devices": devices,
+        "dp": args.dp,
+        "enable_sp": args.enable_sp,
+        "moe_backend": args.moe_backend,
         "batch": args.batch,
         "seq_len": args.seq_len,
         "chunk": args.chunk,
     }
+    # Fail loudly on an impossible parallelism layout before simulating it.
+    from sgl_jax.srt.utils.roofline import parallelism as _para
+
+    try:
+        _lp, _warns = _para.resolve(
+            config, par, moe_backend=args.moe_backend, enable_sp=args.enable_sp
+        )
+    except ValueError as e:
+        ap.error(str(e))
+    for w in _warns:
+        print(f"[warn] {w}")
 
     phases = ["decode", "prefill"] if args.phase == "both" else [args.phase]
     out_json: dict = {"arch": arch, "model_path": args.model_path, "phases": {}}

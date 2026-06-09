@@ -121,7 +121,11 @@ def _merge(rows: list[OpRoofline], key) -> dict[str, OpRoofline]:
         k = key(r)
         if k not in out:
             out[k] = OpRoofline(
-                label=k, category=r.category, source=r.source, peak_kind=r.peak_kind, count=0
+                label=k,
+                category=r.category,
+                source=r.source,
+                peak_kind=r.peak_kind,
+                count=0,
             )
         acc = out[k]
         acc.count += r.count
@@ -262,7 +266,10 @@ def render_cost_views(model: ModelRoofline) -> str:
     header = (
         f"# {model.arch}  phase={model.phase}  "
         f"(per-device; batch={m.get('batch')} seq_len={m.get('seq_len')} "
-        f"layers={m.get('num_layers')} tp={m.get('tp')} ep={m.get('ep')} devices={m.get('devices')})"
+        f"layers={m.get('num_layers')} devices={m.get('devices')} "
+        f"mesh[data={m.get('dp')} x tensor={m.get('attention_tp')}] "
+        f"attn_tp={m.get('attention_tp')} ep={m.get('ep_effective')}"
+        f"{' +SP' if m.get('enable_sp') else ''})"
     )
     if m.get("quant"):
         header += f"\n# quant: {m['quant']}"

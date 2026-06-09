@@ -18,7 +18,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from . import ops, quant
+from . import ops, parallelism, quant
 from .report import HardwarePeaks, ModelRoofline, OpRoofline
 
 DESCRIPTORS = {}  # arch_name -> build(config, phase, par) -> ModelRoofline
@@ -77,13 +77,6 @@ def _op(rr, label, category, *, layers=1, shard=1, peak_kind="bf16", source=""):
     return op
 
 
-def _ring_bytes(msg_bytes: float, p: int) -> int:
-    """Ring collective traffic per device: 2*(p-1)/p * message_size."""
-    if p <= 1:
-        return 0
-    return int(2.0 * (p - 1) / p * msg_bytes)
-
-
 # ==========================================================================
 # MiMo-V2 family (Flash / Pro) -- same forward structure, config-driven dims
 # ==========================================================================
@@ -119,8 +112,17 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
     hlp = _cfg(config, "hybrid_layer_pattern", default=[0] * L)
     mlf = _cfg(config, "moe_layer_freq", default=[1] * L)
 
-    tp = par["tp"]
-    ep = par["ep"]
+    # Resolve + validate the parallelism against the runtime 2D mesh
+    # [data=dp, tensor=tp//dp]: tensor-parallel degree for attention/linears is
+    # t = tp//dp (NOT tp), and the fused-MoE EP group is the full mesh = devices.
+    lp, _warns = parallelism.resolve(
+        config,
+        par,
+        moe_backend=par.get("moe_backend", "fused_v2"),
+        enable_sp=par.get("enable_sp", False),
+    )
+    tp = lp.t  # tensor-parallel degree (= tp_size // dp_size)
+    ep = lp.ep  # effective expert-parallel group (= full mesh = devices)
     qs = quant.quant_specs_from_config(config)  # role -> QuantSpec (from quantization_config)
 
     # phase -> token counts and attention interaction counts
@@ -138,7 +140,11 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
     def attn_block(d, count, tag):
         if count <= 0:
             return
-        q_size, k_size, v_size = d["nh"] * d["hd"], d["nkv"] * d["hd"], d["nkv"] * d["vhd"]
+        q_size, k_size, v_size = (
+            d["nh"] * d["hd"],
+            d["nkv"] * d["hd"],
+            d["nkv"] * d["vhd"],
+        )
         ao = d["nh"] * d["vhd"]
         eff_ctx = min(ctx_full, d["window"]) if d["window"] else ctx_full
         inter = tokens * (eff_ctx / 2 if phase != "decode" else eff_ctx)
@@ -166,10 +172,11 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
                 source="embeddings.py rotary",
             )
         )
-        # attention (per-device heads = nh/tp)
+        # attention (per-device q heads = nh/t; kv heads replicated to 1/device
+        # when t > num_kv_heads -- not divided below 1)
         rr = ops.attention(
             num_q_heads=max(1, d["nh"] // tp),
-            num_kv_heads=max(1, d["nkv"] // tp),
+            num_kv_heads=parallelism.kv_heads_per_device(d["nkv"], tp),
             head_dim=d["hd"],
             v_head_dim=d["vhd"],
             q_tokens=tokens,
@@ -184,7 +191,10 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
                 source="ragged_paged_attention_v3",
             )
         )
-        # o_proj (row-parallel -> all-reduce over tp); quant per config (often bf16/ignored)
+        # o_proj (row-parallel reduce); quant per config (often bf16/ignored).
+        # Reduce is over the tensor axis t (all-reduce), or full-mesh reduce-
+        # scatter + residual all-gather under sequence parallelism above the
+        # scatter threshold.
         op_q = qs["o_proj"]
         rr = ops.gemm(tokens, ao, H, op_q)
         o = _op(
@@ -196,7 +206,7 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
             peak_kind=op_q.peak_kind(),
             source="mimo_v2_flash.py:515 o_proj",
         )
-        o.ici_bytes += _ring_bytes(tokens * H * 2, tp) * count
+        o.ici_bytes += parallelism.row_parallel_reduce_bytes(tokens, H, lp) * count
         rows.append(o)
         # 2 norms + residual adds
         rows.append(
@@ -231,8 +241,10 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
             )
         )
         tokens_per_dev = max(1, tokens * TOPK // ep)
-        # EP all-to-all per device (dispatch + combine), balanced routing:
-        # each device exchanges ~ tokens*topk/ep token-rows of H, (ep-1)/ep going remote.
+        # EP all-to-all per device (dispatch + combine), balanced routing. The
+        # fused MoE EP group is the FULL mesh = devices (ep here = lp.ep =
+        # devices); --ep-size is ignored by the kernel. (ep-1)/ep goes remote.
+        # Balanced theoretical floor; real a2a is imbalance-bound.
         remote = (ep - 1) / ep if ep > 1 else 0.0
         a2a = int(2 * (tokens * TOPK / ep) * H * 2 * remote)
         exp_q = qs["experts"]
@@ -244,16 +256,17 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
             qspec=exp_q,
             ici_bytes=a2a,
         )
-        rows.append(
-            _op(
-                rr,
-                f"{tag}.experts[PALLAS,{exp_q.tag()}]",
-                "moe",
-                peak_kind=exp_q.peak_kind(),
-                layers=count,
-                source="fused_ep_moe_v2",
-            )
+        eo = _op(
+            rr,
+            f"{tag}.experts[PALLAS,{exp_q.tag()}]",
+            "moe",
+            peak_kind=exp_q.peak_kind(),
+            layers=count,
+            source="fused_ep_moe_v2",
         )
+        # MoE output reshard back to the reduce sharding (same SP/DP rule as o_proj)
+        eo.ici_bytes += parallelism.row_parallel_reduce_bytes(tokens, H, lp) * count
+        rows.append(eo)
 
     def dense_block(count, tag):
         if count <= 0:
@@ -342,9 +355,12 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
         seq_len=par.get("seq_len"),
         chunk=par.get("chunk"),
         num_layers=L,
-        tp=tp,
-        ep=ep,
-        devices=par.get("devices"),
+        tp_total=lp.tp_total,
+        dp=lp.dp,
+        attention_tp=lp.t,
+        ep_effective=lp.ep,
+        devices=lp.devices,
+        enable_sp=lp.enable_sp,
         quant={r: qs[r].tag() for r in qs},
         n_full=combo[(False, True)] + combo[(False, False)],
         n_swa=combo[(True, True)] + combo[(True, False)],
