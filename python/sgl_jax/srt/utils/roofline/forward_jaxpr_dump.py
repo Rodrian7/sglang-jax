@@ -37,6 +37,35 @@ def _aval_obj(v):
         return None
 
 
+def _source_stack(source_info, max_frames=6):
+    """User-code call stack (innermost first) for an eqn: the list of
+    ``sgl_jax/...py:line`` frames, skipping jax/flax/site-packages internals.
+
+    ``si.summarize`` only returns the innermost user frame (e.g. every GEMM ->
+    ``linear.py:99 (LinearBase.__call__)``); the *caller* frame is what tells
+    qkv from o_proj from down_proj (same LinearBase, different call site). The
+    full stack is also the real per-op code-path index."""
+    tb = getattr(source_info, "traceback", None)
+    if tb is None:
+        return []
+    out = []
+    try:
+        frames = list(tb.frames)
+    except Exception:
+        return []
+    for fr in frames:
+        s = str(fr)
+        loc = s.split(";")[-1]  # "kind;/path/file.py:line" -> "/path/file.py:line"
+        if "/sgl_jax/" not in loc:
+            continue
+        short = loc.split("/sgl_jax/")[-1]  # "srt/layers/linear.py:99"
+        if short not in out:
+            out.append(short)
+        if len(out) >= max_frames:
+            break
+    return out
+
+
 def _subjaxprs(eqn):
     """Yield (label, jaxpr) for every sub-jaxpr referenced by an eqn's params.
 
@@ -92,6 +121,7 @@ def extract_jaxpr_records(jaxpr) -> dict:
             rec = {
                 "prim": name,
                 "source": src,
+                "source_stack": _source_stack(e.source_info),
                 "depth": depth,
                 "out": [_aval_str(v) for v in e.outvars][:2],
                 "ins": [_aval_str(v) for v in e.invars if hasattr(v, "aval")][:6],
