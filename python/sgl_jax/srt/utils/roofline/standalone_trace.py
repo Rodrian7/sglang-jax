@@ -172,7 +172,11 @@ def _build_kv_pool(mc, mesh, attention_tp, dp, page_size):
     head_num = mc.get_total_num_kv_heads_with_replication(attention_tp)
     head_dim = (mc.head_dim + 127) // 128 * 128
     dtype = jax.numpy.bfloat16
-    size = 4 * page_size * dp  # tiny; trace needs only valid shapes
+    # Tracing only needs valid shapes (tiny is fine + fast). But a real TPU
+    # *compile* runs memory-space assignment, which can wrongly place a too-small
+    # fused-KV buffer in VMEM and crash; a realistic pool keeps it in HBM.
+    pages = int(os.environ.get("RL_KV_PAGES", "16"))
+    size = pages * page_size * dp
     swa_ids = list(getattr(mc, "swa_attention_layer_ids", []) or [])
     full_ids = list(getattr(mc, "full_attention_layer_ids", []) or [])
     if not (swa_ids or full_ids):
