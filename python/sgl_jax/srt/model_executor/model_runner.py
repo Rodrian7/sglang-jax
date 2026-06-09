@@ -248,6 +248,24 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return compute_logprobs(mesh, logits, next_tokens)
 
         def run_model_wrapper(forward_batch, logits_metadata):
+            import os
+
+            _p = os.environ.get("SGLJAX_DUMP_FORWARD_JAXPR")
+            if _p and not getattr(self, "_fwd_jaxpr_dumped", False):
+                self._fwd_jaxpr_dumped = True
+                try:
+                    from sgl_jax.srt.utils.roofline.forward_jaxpr_dump import (
+                        dump_forward_jaxpr,
+                    )
+
+                    def _fwd(fb, lm):
+                        ms = jax.tree_util.tree_unflatten(model_state_def, self.model_state_leaves)
+                        return nnx.merge(model_def, ms)(fb, self.memory_pools, lm)
+
+                    dump_forward_jaxpr(_fwd, (forward_batch, logits_metadata), _p)
+                    logger.info("[forward-jaxpr] dumped real forward jaxpr -> %s", _p)
+                except Exception as e:
+                    logger.warning("[forward-jaxpr] dump failed: %r", e)
             return jitted_run_model(
                 model_def,
                 model_state_def,
