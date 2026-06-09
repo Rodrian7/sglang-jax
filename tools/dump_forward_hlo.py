@@ -25,6 +25,13 @@ def main():
     ap.add_argument("--phase", choices=["extend", "decode", "prefill"], default="prefill")
     ap.add_argument("--tokens", type=int, default=512)
     ap.add_argument("--moe-backend", default="fused_v2")
+    ap.add_argument(
+        "--layers",
+        type=int,
+        default=4,
+        help="truncate num_hidden_layers (full 70-layer compile overflows XLA MSA; "
+        "a few layers carry the same collective overlap structure)",
+    )
     ap.add_argument("--nnodes", type=int, default=1)
     ap.add_argument("--node-rank", type=int, default=0)
     ap.add_argument("--dist-init-addr", default=None)
@@ -55,6 +62,7 @@ def main():
         phase=phase,
         num_tokens=args.tokens,
         moe_backend=args.moe_backend,
+        layers=args.layers,
     )
     if jax.process_index() == 0:
         with open(args.out, "w") as f:

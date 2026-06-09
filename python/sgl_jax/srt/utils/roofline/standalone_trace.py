@@ -148,10 +148,12 @@ def _make_dummy_batch(bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_s
     )
 
 
-def _build_model_config(model_path, attention_tp, ep, moe_backend, dtype):
+def _build_model_config(model_path, attention_tp, ep, moe_backend, dtype, layers=None):
     from sgl_jax.srt.configs.model_config import ModelConfig
 
-    mc = ModelConfig(model_path=model_path, trust_remote_code=True, dtype=dtype)
+    mc = ModelConfig(
+        model_path=model_path, trust_remote_code=True, dtype=dtype, model_layer_nums=layers
+    )
     # mirror ModelRunner.load_model's hf_config injection (without loading weights)
     mc.configure_for_tensor_parallel(attention_tp)
     hf = mc.hf_config
@@ -242,7 +244,9 @@ def trace_model_forward(
     )
 
 
-def _build_forward(model_path, tp, dp, *, phase, num_tokens, moe_backend, dtype, page_size):
+def _build_forward(
+    model_path, tp, dp, *, phase, num_tokens, moe_backend, dtype, page_size, layers=None
+):
     """Build the abstract model + dummy batch; return the forward closure, its
     (abstract-weights, fb, mp, lm) args, the mesh, and meta. Shared by the jaxpr
     tracer and the HLO compiler."""
@@ -258,7 +262,7 @@ def _build_forward(model_path, tp, dp, *, phase, num_tokens, moe_backend, dtype,
     attention_tp = tp // dp
     ep = tp
     mesh = create_device_mesh(ici_parallelism=[dp, attention_tp], dcn_parallelism=[1, 1])
-    mc = _build_model_config(model_path, attention_tp, ep, moe_backend, dtype)
+    mc = _build_model_config(model_path, attention_tp, ep, moe_backend, dtype, layers=layers)
     model_class, arch = get_model_architecture(mc)
 
     with jax.set_mesh(mesh):
@@ -305,11 +309,15 @@ def compile_forward_hlo(
     moe_backend="fused_v2",
     dtype="bfloat16",
     page_size=256,
+    layers=None,
 ) -> str:
     """Lower + compile the real forward for the (real-device) mesh and return the
     optimized, scheduled HLO text. Run on a TPU host/cluster with
     ``jax.distributed`` initialized (so ``jax.devices()`` spans all chips) -- the
-    async-collective schedule is target-specific, so CPU HLO is not representative."""
+    async-collective schedule is target-specific, so CPU HLO is not representative.
+    ``layers`` truncates num_hidden_layers (full 70-layer compile overflows XLA's
+    memory-space assignment with the SWA kernel; a few layers carry the same
+    per-layer + cross-layer collective overlap structure)."""
     fwd, args, mesh, mc, arch, attention_tp, ep, tokens_global = _build_forward(
         model_path,
         tp,
@@ -317,6 +325,7 @@ def compile_forward_hlo(
         phase=phase,
         num_tokens=num_tokens,
         moe_backend=moe_backend,
+        layers=layers,
         dtype=dtype,
         page_size=page_size,
     )
