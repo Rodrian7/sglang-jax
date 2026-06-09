@@ -1,19 +1,22 @@
 """Parse optimized, scheduled XLA HLO for the Overlap analysis.
 
-Given the HLO text of the compiled forward (from ``compile_forward_hlo`` /
-``tools/dump_forward_hlo.py``), extract what the COMPILER actually did about
-communication overlap -- not a theoretical envelope:
+From the HLO text of the compiled forward (``tools/dump_forward_hlo.py``), report
+what the COMPILER actually did about overlap -- ground truth, not a theoretical
+envelope. The key, non-obvious findings this surfaces for MiMo-class MoE models:
 
-  * which collectives (all-reduce / all-to-all / reduce-scatter / all-gather /
-    collective-permute) were emitted, and how many bytes,
-  * which are ASYNC (split into ``*-start`` / ``*-done`` -- i.e. XLA intends to
-    overlap them), vs synchronous, and
-  * for each async collective, the COMPUTE scheduled in its shadow (the fusion /
-    dot / Pallas custom-call instructions between its ``-start`` and ``-done`` in
-    schedule order) -- the real overlap window.
+  * Network collectives that ARE XLA ops: the tensor-parallel ``all-reduce`` /
+    ``reduce-scatter`` / ``all-gather`` -- with their ``replica_groups`` (which
+    mesh axis) and whether XLA made them async (``-start``/``-done``) or left
+    them SYNC (an exposed barrier).
+  * The MoE all-to-all is usually NOT an XLA collective -- it is fused inside the
+    MoE Pallas kernel (``tpu_custom_call``), so XLA-level overlap does not apply;
+    its dispatch/combine run as SparseCore async ops, and whether they actually
+    hide behind TensorCore compute is a kernel/device-trace question.
+  * XLA issues many async HBM<->VMEM prefetch copies (latency hiding) -- distinct
+    from network comm.
 
-This is pure-Python text parsing (no jax). Schedule order = textual order of the
-entry computation in a compiled (scheduled) HLO module.
+Pure-Python text parsing (no jax). Schedule order = textual order of the ENTRY
+computation in a compiled (scheduled) HLO module.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ _DT = {
     "s64": 8,
     "u64": 8,
 }
-_COLLECTIVES = (
+_NET = (
     "all-reduce",
     "all-gather",
     "reduce-scatter",
@@ -47,68 +50,48 @@ _COLLECTIVES = (
 )
 _SHAPE = re.compile(r"\b(" + "|".join(_DT) + r")\[([\d,]*)\]")
 _INSTR = re.compile(r"^\s*(%[\w.\-]+)\s*=\s*(.*)$")
+_REPL = re.compile(r"replica_groups=(?:\[[\d,]*\])?(\[[\d,]*\]|\{[^}]*\})")
 
 
 def _first_shape_bytes(rhs: str) -> int:
-    """Bytes of the first array shape on the RHS (the instruction's result)."""
-    total = 0
     for m in _SHAPE.finditer(rhs):
-        dt, dims = m.group(1), m.group(2)
         n = 1
-        for d in dims.split(","):
+        for d in m.group(2).split(","):
             if d.strip():
                 n *= int(d)
-        total = n * _DT[dt]
-        break
-    return total
+        return n * _DT[m.group(1)]
+    return 0
 
 
-def _opcode(rhs: str) -> str | None:
-    """The HLO opcode = the identifier immediately before the operand '('.
-    Robust to tuple shapes by scanning for known opcodes as call heads."""
-    # async/collective heads first (longest match), then compute
-    for kw in (
-        "all-reduce-start",
-        "all-reduce-done",
-        "all-gather-start",
-        "all-gather-done",
-        "reduce-scatter",
-        "collective-permute-start",
-        "collective-permute-done",
-        "all-to-all",
-        "ragged-all-to-all",
-        "all-reduce",
-        "all-gather",
-        "async-start",
-        "async-done",
-        "async-update",
-        "fusion",
-        "convolution",
-        "custom-call",
-        "dot",
-    ):
-        if re.search(r"(^|[^\w-])" + re.escape(kw) + r"\(", rhs):
-            return kw
+def _net_opcode(rhs: str):
+    """Return (collective_type, is_start, is_done) if the instr is a network
+    collective, else None."""
+    for c in _NET:
+        for suf, st, dn in (
+            (c + "-start", True, False),
+            (c + "-done", False, True),
+            (c, False, False),
+        ):
+            if re.search(r"(^|[^\w-])" + re.escape(suf) + r"\(", rhs):
+                return c, st, dn
     return None
 
 
-def _coll_type(opcode: str) -> str | None:
-    for c in _COLLECTIVES:
-        if opcode.startswith(c):
-            return c
-    return None
+def _is_compute(rhs: str) -> bool:
+    for kw in ("fusion(", "dot(", "convolution("):
+        if kw in rhs:
+            return True
+    return "custom-call(" in rhs and "tpu_custom_call" in rhs
 
 
 def _entry_body(text: str) -> list[str]:
-    """Lines of the ENTRY computation body, in schedule order."""
     lines = text.splitlines()
-    start = None
-    for i, ln in enumerate(lines):
-        if ln.lstrip().startswith("ENTRY ") or " ENTRY " in ln:
-            start = i
-            break
+    start = next(
+        (i for i, ln in enumerate(lines) if ln.lstrip().startswith("ENTRY ") or " ENTRY " in ln),
+        None,
+    )
     if start is None:
-        return lines  # fall back to whole module
+        return lines
     depth, body, began = 0, [], False
     for ln in lines[start:]:
         depth += ln.count("{") - ln.count("}")
@@ -124,82 +107,83 @@ def _entry_body(text: str) -> list[str]:
 
 def parse_hlo_overlap(text: str) -> dict:
     body = _entry_body(text)
-    instrs = []  # (name, opcode, bytes, is_compute, coll)
+    # classify entry instrs in schedule order
+    instrs = []
     for ln in body:
         m = _INSTR.match(ln)
         if not m:
             continue
-        name, rhs = m.group(1), m.group(2)
-        op = _opcode(rhs)
-        if op is None:
-            continue
-        # a Pallas/Mosaic kernel is a custom-call but NOT a collective custom-call
-        is_compute = op in ("fusion", "dot", "convolution") or (
-            op == "custom-call" and "all-" not in rhs and "collective" not in rhs
-        )
+        rhs = m.group(2)
+        net = _net_opcode(rhs)
+        kind = None
+        if net:
+            kind = "net"
+        elif 'async_execution_thread="sparsecore"' in rhs or "sparsecore" in rhs:
+            kind = "sc" if ("-start(" in rhs or "-done(" in rhs or "async-" in rhs) else None
+        elif re.search(r"(copy-start|copy-done|slice-start|slice-done)\(", rhs):
+            kind = "copy"
         instrs.append(
             dict(
-                name=name,
-                op=op,
-                bytes=_first_shape_bytes(rhs),
-                compute=is_compute,
-                coll=_coll_type(op),
-                line=ln.strip(),
+                rhs=rhs, net=net, kind=kind, bytes=_first_shape_bytes(rhs), compute=_is_compute(rhs)
             )
         )
 
-    # match async start->done windows; collect shadow compute between them
-    starts = {}  # base-name -> index
-    asyncs = []
-    by_type = {}
-    n_sync = 0
+    # network collectives
+    net_by = {}
+    n_net_sync = n_net_async = 0
     for idx, it in enumerate(instrs):
-        op = it["op"]
-        if op.endswith("-start") or op == "async-start":
-            starts[idx] = it
-        elif (op.endswith("-done") or op == "async-done") and starts:
-            # match the nearest open start before this done
-            sidx = max(starts)
-            sit = starts.pop(sidx)
-            # shadow = compute instrs strictly between sidx and idx
-            shadow = [instrs[j] for j in range(sidx + 1, idx) if instrs[j]["compute"]]
-            ct = sit["coll"] or "async"
-            rec = dict(
-                type=ct,
-                bytes=sit["bytes"],
-                shadow_ops=len(shadow),
-                shadow_bytes=sum(s["bytes"] for s in shadow),
-                window=idx - sidx - 1,
-            )
-            asyncs.append(rec)
-            t = by_type.setdefault(
-                ct, dict(count=0, async_=0, bytes=0, shadow_ops=0, with_shadow=0)
-            )
-            t["count"] += 1
-            t["async_"] += 1
-            t["bytes"] += sit["bytes"]
-            t["shadow_ops"] += len(shadow)
-            t["with_shadow"] += 1 if shadow else 0
-    # sync collectives (no start/done)
-    for it in instrs:
-        ct = it["coll"]
-        if ct and not (it["op"].endswith("-start") or it["op"].endswith("-done")):
-            n_sync += 1
-            t = by_type.setdefault(
-                ct, dict(count=0, async_=0, bytes=0, shadow_ops=0, with_shadow=0)
-            )
-            t["count"] += 1
-            t["bytes"] += it["bytes"]
+        if not it["net"]:
+            continue
+        c, st, dn = it["net"]
+        rep = _REPL.search(it["rhs"])
+        d = net_by.setdefault(
+            c, dict(count=0, sync=0, async_=0, bytes=0, groups=rep.group(1) if rep else "")
+        )
+        if st:
+            d["async_"] += 1
+            d["count"] += 1
+            d["bytes"] += it["bytes"]
+            n_net_async += 1
+        elif dn:
+            pass  # counted at start
+        else:
+            d["sync"] += 1
+            d["count"] += 1
+            d["bytes"] += it["bytes"]
+            n_net_sync += 1
+        if rep and not d["groups"]:
+            d["groups"] = rep.group(1)
 
-    n_async = len(asyncs)
-    n_overlapped = sum(1 for a in asyncs if a["shadow_ops"] > 0)
+    # sparsecore async (MoE dispatch/combine) + their TC shadow
+    sc_starts = []
+    sc = dict(count=0, with_shadow=0, shadow_ops=0)
+    for idx, it in enumerate(instrs):
+        if it["kind"] != "sc":
+            continue
+        if "-start(" in it["rhs"] or "async-start(" in it["rhs"] or "call-start" in it["rhs"]:
+            sc_starts.append(idx)
+        elif (
+            "-done(" in it["rhs"] or "async-done(" in it["rhs"] or "call-done" in it["rhs"]
+        ) and sc_starts:
+            sidx = sc_starts.pop()
+            shadow = [j for j in range(sidx + 1, idx) if instrs[j]["compute"]]
+            sc["count"] += 1
+            sc["shadow_ops"] += len(shadow)
+            sc["with_shadow"] += 1 if shadow else 0
+
+    n_copy = sum(1 for it in instrs if it["kind"] == "copy" and "-start(" in it["rhs"])
+    n_pallas = sum(1 for it in instrs if it["compute"] and "tpu_custom_call" in it["rhs"])
+
     return {
         "n_entry_instrs": len(instrs),
-        "by_type": by_type,
-        "n_async": n_async,
-        "n_overlapped": n_overlapped,  # async collectives with compute in their shadow
-        "n_sync_collectives": n_sync,
-        "async_detail": sorted(asyncs, key=lambda a: -a["bytes"])[:40],
+        "network": {
+            "by_type": net_by,
+            "n_sync_barrier": n_net_sync,
+            "n_async": n_net_async,
+        },
+        "sparsecore_async": sc,  # MoE dispatch/combine on SparseCore
+        "memory_prefetch_async": n_copy,  # HBM<->VMEM async copies (latency hiding)
+        "pallas_kernels": n_pallas,  # tpu_custom_call (attention + fused MoE; a2a is in here)
     }
 
 
@@ -208,5 +192,4 @@ if __name__ == "__main__":
     import sys
 
     with open(sys.argv[1]) as f:
-        out = parse_hlo_overlap(f.read())
-    print(json.dumps(out, indent=2))
+        print(json.dumps(parse_hlo_overlap(f.read()), indent=2))
