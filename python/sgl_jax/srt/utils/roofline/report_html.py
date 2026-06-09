@@ -191,6 +191,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
  .v-warn{background:#fff7ed;border:1px solid #fdba74;color:#9a3412}
  .v-go{background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46}
  .mono{font-family:ui-monospace,Menlo,monospace;font-size:11px}
+ .scennav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+ .scennav button{flex:1 1 auto;padding:9px 8px;border:1px solid #cbd5e1;background:#fff;border-radius:8px;cursor:pointer;font-size:13px;color:#445;font-weight:600}
+ .scennav button.on{background:#2563eb;color:#fff;border-color:#2563eb}
+ .scenhelp{font-size:12px;color:#667;margin:0 0 12px}
 </style></head><body>
 <div id="wrap">
  <div id="left">
@@ -216,17 +220,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <div id="summary"></div>
  </div>
  <div id="right">
-  <div class="seg" id="scenseg" style="margin-bottom:10px">
-    <button id="sc-overview" class="on">Overview</button><button id="sc-overlap">Overlap</button><button id="sc-kernel">Kernel 优化</button><button id="sc-fusion">Fusion</button></div>
-  <div id="lens" class="panel" style="margin-bottom:10px"></div>
-  <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button><button id="tab-fus">Fusion</button><button id="tab-cp">Code path</button><button id="tab-kn">Kernels</button></div>
-  <canvas id="cv"></canvas>
-  <div id="df" class="panel"></div>
-  <div id="fus" class="panel"></div>
-  <div id="cp" class="panel"></div>
-  <div id="kn" class="panel"></div>
-  <div class="legend" id="legend"></div>
-  <table id="tbl"><thead><tr><th class="l">op category</th><th>cnt</th><th>TFLOP</th><th>HBM GB</th><th>ICI GB</th><th>OI</th><th>ideal ms</th><th>%step</th><th>bound</th></tr></thead><tbody></tbody></table>
+  <div class="scennav" id="scennav">
+   <button data-sc="overview" class="on">总览</button><button data-sc="overlap">Overlap</button><button data-sc="kernel">Kernel 优化</button><button data-sc="fusion">Fusion</button><button data-sc="trace">Trace 细节</button>
+  </div>
+  <div id="scenhelp" class="scenhelp"></div>
+  <div id="body"></div>
  </div>
 </div>
 <div id="tip"></div>
@@ -341,11 +339,12 @@ function buildChain(s){
 }
 
 // ---------- roofline canvas (high-DPI, responsive, light) ----------
-const cv=document.getElementById("cv"), cx=cv.getContext("2d"); let LAST=null; let CW=1040; const CH=640;
-function setupCanvas(){const dpr=window.devicePixelRatio||1; CW=Math.max(560, g("right").clientWidth);
-  cv.style.width=CW+"px"; cv.style.height=CH+"px"; cv.width=Math.round(CW*dpr); cv.height=Math.round(CH*dpr); cx.setTransform(dpr,0,0,dpr,0,0);}
-function tlabel(txt,x,y,col){const w=cx.measureText(txt).width; cx.fillStyle="rgba(255,255,255,0.9)"; cx.fillRect(x-2,y-10,w+4,13); cx.fillStyle=col||"#64748b"; cx.fillText(txt,x,y);}
-function draw(R){LAST=R; const W=CW,Hh=CH, ml=82,mr=20,mt=52,mb=50;
+let LAST=null; const CH=520;
+function draw(R){const cv=g("cv"); if(!cv)return; const cx=cv.getContext("2d");
+  const dpr=window.devicePixelRatio||1, W=Math.max(480,(g("body").clientWidth||700));
+  cv.style.width=W+"px"; cv.style.height=CH+"px"; cv.width=Math.round(W*dpr); cv.height=Math.round(CH*dpr); cx.setTransform(dpr,0,0,dpr,0,0);
+  LAST=R; const Hh=CH, ml=82,mr=20,mt=52,mb=50;
+  const tlabel=(txt,x,y,col)=>{const w=cx.measureText(txt).width; cx.fillStyle="rgba(255,255,255,0.9)"; cx.fillRect(x-2,y-10,w+4,13); cx.fillStyle=col||"#64748b"; cx.fillText(txt,x,y);};
   cx.clearRect(0,0,W,Hh);
   const rows=R.rows.filter(r=>r.flops>0&&r.hbm>0);
   const ceil=(rows.some(r=>r.peak==="fp8")?P.fp8_tflops:P.bf16_tflops);
@@ -384,95 +383,112 @@ function fmt(x){const a=Math.abs(x); if(a===0)return "0"; if(a>=100)return x.toF
 function rowMs(r){return {c:r.flops/flops_per_s(r.peak)*1e3, h:r.hbm/HBMBW*1e3, i:r.ici/ICIBW*1e3};}
 function ridgeOI(peak){return (peak==="fp8"?P.fp8_tflops:P.bf16_tflops)/(HBMBW/1e12);}
 function lensOverlap(R){
-  const serial=R.Tc+R.Th+R.Ti, perOp=R.rows.reduce((a,x)=>a+x.ideal,0), floor=R.tot, head=perOp-floor;
-  const bar=(lab,v,col)=>"<div class='dfrow'><div class='nm'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,v/serial*100)+"%;background:"+col+"'></div></div><div class='ms'>"+v.toFixed(2)+" ms</div></div>";
-  let h="<div class='lh'>Overlap — 跨算子/跨资源能藏多少</div>";
-  h+="<div class='note'>roofline 的 ideal 已假设<b>算子内</b>三资源完美 overlap;这里看<b>算子之间</b>能不能把 compute / HBM / ICI 叠起来。</div>";
-  h+=bar("全串行 (无 overlap)",serial,"#cbd5e1")+bar("逐算子 overlap，算子间串行",perOp,"#93c5fd")+bar("完美 overlap 下界 = max(ΣC,ΣH,ΣI)",floor,"#22c55e");
-  h+="<div class='note'>资源总量:<span class='pill'>ΣC "+R.Tc.toFixed(2)+"ms</span><span class='pill'>ΣH "+R.Th.toFixed(2)+"ms</span><span class='pill'>ΣI "+R.Ti.toFixed(2)+"ms</span> → 墙 = <b>"+R.tbound+"</b> ("+floor.toFixed(2)+"ms，overlap 也降不下去)</div>";
-  if(head/Math.max(floor,1e-9)<0.05) h+="<div class='verdict v-warn'>已贴近完美 overlap 下界(跨算子只剩 "+head.toFixed(2)+"ms)，<b>overlap 不是杠杆</b> —— 瓶颈是 "+R.tbound+"。要降 step 得砍这个资源的量(换 Kernel / Fusion 场景)。</div>";
-  else h+="<div class='verdict v-go'>跨算子 overlap 还有约 <b>"+head.toFixed(2)+" ms</b>(逐算子串行 "+perOp.toFixed(2)+" → 完美 "+floor.toFixed(2)+")。把下面的通信排到能被 compute/HBM 盖住的位置。</div>";
-  const ici=R.rows.filter(r=>r.ici>0).map(r=>({cat:r.cat,i:rowMs(r).i})).sort((a,b)=>b.i-a.i);
-  if(ici.length){h+="<div class='note' style='margin-top:8px'><b>通信(可被盖住的候选)</b> · 全局可用 compute "+R.Tc.toFixed(2)+"ms / HBM "+R.Th.toFixed(2)+"ms</div><table><thead><tr><th class='l'>算子</th><th>ICI ms</th></tr></thead><tbody>";
-    for(const o of ici) h+="<tr><td class='l'>"+o.cat+"</td><td>"+o.i.toFixed(3)+"</td></tr>"; h+="</tbody></table>";}
-  h+="<div class='note' style='margin-top:6px;color:#a55'>⚠ 静态理论只给 overlap 的<b>机会上界</b>;真发不发生要用 trace 核实。</div>";
+  const C=R.Tc, Hb=R.Th, I=R.Ti, nonComm=Math.max(C,Hb), floor=Math.max(C,Hb,I), mx=Math.max(C,Hb,I,1e-9);
+  const bar=(lab,v,col)=>"<div class='dfrow'><div class='nm'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,v/mx*100)+"%;background:"+col+"'></div></div><div class='ms'>"+v.toFixed(3)+" ms</div></div>";
+  let h="<div class='lh'>Overlap — can comm (ICI) hide behind compute / HBM?</div>";
+  h+="<div class='note'>Collectives (ICI) run concurrently with other ops' compute/HBM; compute &amp; HBM already overlap on the roofline. Perfect-overlap floor = <b>max(ΣC, ΣH, ΣI)</b>.</div>";
+  h+=bar("ΣC compute",C,"#22c55e")+bar("ΣH HBM",Hb,"#3b82f6")+bar("ΣI comm (ICI)",I,"#ec4899");
+  h+="<div class='note'>non-comm wall = max(ΣC, ΣH) = <b>"+nonComm.toFixed(2)+" ms</b> &nbsp;·&nbsp; ΣICI = <b>"+I.toFixed(3)+" ms</b></div>";
+  if(I<=nonComm) h+="<div class='verdict v-go'>ΣICI ("+I.toFixed(3)+" ms) ≤ wall ("+nonComm.toFixed(2)+" ms) → comm <b>fully hideable</b>. step floor = "+nonComm.toFixed(2)+" ms ("+R.tbound+"-bound). Overlap is <b>not</b> the lever here — cut "+(Hb>=C?"HBM bytes":"flops")+" (Kernel / Fusion).</div>";
+  else h+="<div class='verdict v-warn'>ΣICI ("+I.toFixed(2)+" ms) &gt; wall ("+nonComm.toFixed(2)+" ms) → ~<b>"+(I-nonComm).toFixed(2)+" ms</b> comm <b>exposed</b> → ICI-bound. Lever: cut comm (SP / topology / EP locality) or schedule it under compute/HBM.</div>";
+  const ic=R.rows.filter(r=>r.ici>0).map(r=>({cat:r.cat,i:rowMs(r).i})).sort((a,b)=>b.i-a.i);
+  if(ic.length){h+="<table style='margin-top:10px'><thead><tr><th class='l'>op</th><th>ICI ms</th><th class='l'>source</th></tr></thead><tbody>";
+    for(const o of ic){const why=o.cat==="moe"?"all-to-all (dispatch + combine)":(o.cat==="o_proj"?"all-reduce / reduce-scatter":"collective");
+      h+="<tr><td class='l'><span style='color:"+(CAT[o.cat]||'#888')+"'>●</span> "+o.cat+"</td><td>"+o.i.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+why+"</td></tr>";}
+    h+="</tbody></table><div class='note'>↑ prefill chunk / tp grows a2a — watch ΣICI cross the wall.</div>";}
+  else h+="<div class='note'>No comm at this layout (single device, or no parallel reduce).</div>";
+  h+="<div class='note' style='color:#a55'>⚠ upper bound only — real overlap depends on scheduling; verify with a trace.</div>";
   return h;}
 function lensKernel(R){
-  let h="<div class='lh'>Kernel 优化 — 攻哪个、往哪使劲</div><div class='note'>按 ideal ms 排序找大头。bound 决定杠杆:HBM→砍字节,compute→提 MXU 率/减 flops,ICI→overlap/减通信。</div>";
-  h+="<table><thead><tr><th class='l'>算子</th><th>ideal ms</th><th>%step</th><th>bound</th><th>OI</th><th class='l'>杠杆</th></tr></thead><tbody>";
+  let h="<div class='lh'>Kernel — which to attack, and how</div><div class='note'>Ranked by ideal ms. Bound → lever: HBM → ↓ bytes; compute → ↑ MXU rate / ↓ flops; ICI → overlap / ↓ comm.</div>";
+  h+="<table><thead><tr><th class='l'>op</th><th>ideal ms</th><th>%step</th><th>bound</th><th>OI</th><th class='l'>lever</th></tr></thead><tbody>";
   for(const r of R.rows){const m=rowMs(r); let lever;
-    if(r.bound==="HBM"){const rg=ridgeOI(r.peak); lever="↓字节:量化(试旋钮)/布局/少 materialize · compute "+m.c.toFixed(3)+"ms 空闲 · OI "+r.oi.toFixed(0)+"，需 ≥"+rg.toFixed(0)+" 才转 compute-bound";}
-    else if(r.bound==="compute") lever="↑MXU 率(non-block W8A8)或 ↓flops · 已在 ridge 右侧";
-    else lever="↓/overlap 通信(SP/拓扑) · 可藏 compute+HBM "+(m.c+m.h).toFixed(3)+"ms";
+    if(r.bound==="HBM"){const rg=ridgeOI(r.peak); lever="↓ bytes: quantize (knobs) / layout / fewer materializations · compute "+m.c.toFixed(3)+" ms idle · OI "+r.oi.toFixed(0)+", need ≥ "+rg.toFixed(0)+" to flip compute-bound";}
+    else if(r.bound==="compute") lever="↑ MXU rate (non-block W8A8) or ↓ flops · right of ridge";
+    else lever="↓ / overlap comm (SP / topology) · "+(m.c+m.h).toFixed(3)+" ms could hide it";
     h+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==='fp8'?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td><td>"+r.oi.toFixed(1)+"</td><td class='l' style='font-size:11px'>"+lever+"</td></tr>";}
   h+="</tbody></table>";
   const top=R.rows[0], K=(D.codepath&&D.codepath.kernels)||[];
   const km=K.filter(k=>(top.cat==="moe"&&k.kind==="moe")||(top.cat==="attention"&&k.kind==="attention"));
-  if(km.length) h+="<div class='verdict v-go'>最大头 <b>"+top.cat+"</b>("+top.pct.toFixed(0)+"% step, "+top.bound+"-bound)对应真实 kernel:"+km.map(k=>"<span class='mono'>"+k.name+"</span> ×"+k.count).join("、")+" —— 切到 Kernels tab 看 per-device shape/block 配置。</div>";
+  if(km.length) h+="<div class='verdict v-go'>Top: <b>"+top.cat+"</b> ("+top.pct.toFixed(0)+"% step, "+top.bound+"-bound) → real kernel "+km.map(k=>"<span class='mono'>"+k.name+"</span> ×"+k.count).join(", ")+" — see <b>Trace</b> for shapes / block config.</div>";
   return h;}
 function lensFusion(s,R){
   const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
-  const C=[["input_layernorm → qkv","RMSNorm→matmul prologue",H,attnN],["qkv → rope","RoPE→matmul epilogue",qsz,attnN],
-    ["rope → attention","RoPE 折进 attention kernel",qsz,attnN],["o_proj → residual","residual→matmul epilogue",H,attnN],
-    ["post_norm → "+(D.n_moe>0?"router":"gate_up"),"RMSNorm→matmul prologue",H,attnN]];
-  if(D.n_moe>0) C.push(["experts → residual","residual→MoE kernel epilogue",H,D.n_moe]);
-  else C.push(["gate_up → silu","SiLU→matmul epilogue",D.DENSE_F,D.n_dense],["silu → down","SiLU→matmul prologue",D.DENSE_F,D.n_dense]);
-  const rows=C.map(c=>{const gb=tokens*c[2]*2*c[3]/1e9; return {p:c[0],r:c[1],gb,ms:gb*1e9/HBMBW*1e3};}).sort((a,b)=>b.ms-a.ms);
-  let h="<div class='lh'>Fusion — 省的 HBM 往返折算成 step 时间</div><div class='note'>单生产者→消费者融合,去掉中间激活的 HBM 往返。模型 <b>"+R.tbound+"-bound</b>;HBM-bound 时省的字节≈直接省 step。</div>";
-  h+="<table><thead><tr><th class='l'>融合</th><th class='l'>方式</th><th>省 HBM GB</th><th>省 ms</th><th>%step</th></tr></thead><tbody>";
-  for(const r of rows) h+="<tr><td class='l'>"+r.p+"</td><td class='l' style='font-size:11px'>"+r.r+"</td><td>"+fmt(r.gb)+"</td><td>"+r.ms.toFixed(3)+"</td><td>"+(R.tot>0?(r.ms/R.tot*100).toFixed(1):0)+"%</td></tr>";
-  return h+"</tbody></table><div class='note' style='color:#a55'>⚠ XLA 是否已自动融合未知,要用 optimized HLO / trace 核实。</div>";}
-function renderLens(s,R){const el=g("lens");
-  if(SCEN==="overview"){el.style.display="none";return;}
-  el.style.display="block";
-  el.innerHTML = SCEN==="overlap"?lensOverlap(R) : SCEN==="kernel"?lensKernel(R) : lensFusion(s,R);}
-function renderDataflow(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
+  const C=[["input_norm → qkv","RMSNorm → matmul prologue",H,attnN],["qkv → rope","RoPE → matmul epilogue",qsz,attnN],
+    ["rope → attention","RoPE folded into attention kernel",qsz,attnN],["o_proj → residual","residual → matmul epilogue",H,attnN],
+    ["post_norm → "+(D.n_moe>0?"router":"gate_up"),"RMSNorm → matmul prologue",H,attnN]];
+  if(D.n_moe>0) C.push(["experts → residual","residual → MoE kernel epilogue",H,D.n_moe]);
+  else C.push(["gate_up → silu","SiLU → matmul epilogue",D.DENSE_F,D.n_dense],["silu → down","SiLU → matmul prologue",D.DENSE_F,D.n_dense]);
+  const rows=C.map(c=>{const gb=tokens*c[2]*2*c[3]/1e9; return {name:c[0],why:c[1],gb,ms:gb*1e9/HBMBW*1e3};}).sort((a,b)=>b.ms-a.ms);
+  const totGB=rows.reduce((a,r)=>a+r.gb,0), totMs=rows.reduce((a,r)=>a+r.ms,0), HgB=R.Th*HBMBW/1e3/1e9;
+  let h="<div class='lh'>Fusion — which intermediate HBM round-trips to remove</div>";
+  h+="<div class='note'>Fold single producer→consumer activations into the neighbouring matmul/kernel, dropping the intermediate's HBM round-trip. Model is <b>"+R.tbound+"-bound</b>"+(R.tbound==="HBM"?" → bytes saved ≈ step saved.":" → saving HBM may not cut step.")+"</div>";
+  h+="<div class='verdict v-go'>Fusable intermediates ≈ <b>"+fmt(totGB)+" GB</b> ≈ <b>"+(R.tot>0?(totMs/R.tot*100).toFixed(0):0)+"% of step</b> ("+(HgB>0?(totGB/HgB*100).toFixed(0):0)+"% of ΣH HBM traffic). Ranked by step saved:</div>";
+  const mx=Math.max(...rows.map(r=>r.ms),1e-9);
+  for(const r of rows) h+="<div class='dfrow'><div class='nm' style='flex-basis:190px'>"+r.name+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,r.ms/mx*100)+"%;background:#0d9488'></div></div><div class='ms'>"+r.ms.toFixed(3)+" ms · "+fmt(r.gb)+" GB</div></div>";
+  h+="<div class='note' style='margin-top:6px'>"+rows.slice(0,3).map(r=>"<b>"+r.name+"</b>: "+r.why).join(" &nbsp;·&nbsp; ")+"</div>";
+  h+="<div class='note' style='color:#a55'>⚠ XLA may already fuse some — this is the upper bound; verify with optimized HLO / trace.</div>";
+  return h;}
+function dataflowHTML(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
-  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one "+(D.n_moe>0?"full-attn + MoE":"dense")+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
+  let h="<div class='note'>one "+(D.n_moe>0?"full-attn + MoE":"dense")+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
   for(let i=0;i<ch.length;i++){const o=ch[i];
     h+="<div class='dfrow'><div class='nm'><span style='color:"+(CAT[o.cat]||'#888')+"'>●</span> "+o.name+"</div>"
       +"<div class='barwrap'><div class='bar' style='width:"+Math.max(1.5,o.ms/mx*100)+"%;background:"+(BCOL[o.bound]||'#999')+"'></div></div>"
-      +"<div class='ms'>"+o.ms.toFixed(4)+" ms <span class='tag b-"+o.bound+"'>"+o.bound+"</span></div></div>";
-    if(i<ch.length-1) h+="<div class='dfarrow'>↓</div>";
-  }
+      +"<div class='ms'>"+o.ms.toFixed(4)+" ms <span class='tag b-"+o.bound+"'>"+o.bound+"</span></div></div>";}
   const tot=ch.reduce((a,o)=>a+o.ms,0);
-  h+="<div style='margin-top:8px;font-size:12px;color:#334'><b>layer Σ ideal ≈ "+tot.toFixed(3)+" ms</b> (serial; cross-op overlap not modelled)</div>";
-  g("df").innerHTML=h;
-}
-function renderFusion(s){const decode=s.phase==="decode"; const tokens=decode?s.batch:s.chunk;
-  const H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
-  const C=[["input_layernorm","qkv_proj","RMSNorm → matmul prologue",H,attnN],
-    ["qkv_proj","rope","RoPE → matmul epilogue",qsz,attnN],
-    ["rope","attention","RoPE → fold into attention-kernel prologue",qsz,attnN],
-    ["o_proj","attn_residual_add","residual add → matmul epilogue",H,attnN],
-    ["post_attn_layernorm",(D.n_moe>0?"router_gate":"gate_up_proj"),"RMSNorm → matmul prologue",H,attnN]];
-  if(D.n_moe>0) C.push(["experts","moe_residual_add","residual add → fold into MoE-kernel epilogue",H,D.n_moe]);
-  else C.push(["gate_up_proj","silu","SiLU → matmul epilogue",D.DENSE_F,D.n_dense],["silu","down_proj","SiLU → matmul prologue",D.DENSE_F,D.n_dense]);
-  const rows=C.map(c=>({p:c[0],q:c[1],r:c[2],saved:tokens*c[3]*2*c[4]})).sort((a,b)=>b.saved-a.saved);
-  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>structural single-producer→consumer fusions · HBM saved = the intermediate activation round-trip removed (per device, this phase, summed over layers). Whether XLA already fused is unknown — verify with a trace.</div>";
-  h+="<table style='margin-top:0'><thead><tr><th class='l'>producer → consumer</th><th class='l'>fusion</th><th>HBM saved (GB)</th></tr></thead><tbody>";
-  for(const r of rows) h+="<tr><td class='l'>"+r.p+" → "+r.q+"</td><td class='l'>"+r.r+"</td><td>"+fmt(r.saved/1e9)+"</td></tr>";
-  g("fus").innerHTML=h+"</tbody></table>";
-}
-function renderCodepath(){const C=D.codepath; const el=g("cp"); if(!C){el.innerHTML="<div style='color:#a55'>code-path index unavailable (HTML built without a trace).</div>";return;}
-  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>The REAL forward, traced ("+(C.num_eqns_all||0).toLocaleString()+" jaxpr equations, "+(C.num_eqns_top||0).toLocaleString()+" top-level). Each op group → its actual <b>models/*.py</b> call chain (innermost frame = op kind, outer = role). Layer counts are emergent from the trace, not a hand-written pattern.</div>";
+  return h+"<div style='margin-top:8px;font-size:12px;color:#334'><b>layer Σ ideal ≈ "+tot.toFixed(3)+" ms</b> (serial; cross-op overlap not modelled)</div>";}
+function legendHTML(){return "<div class='legend'>"+Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)</div>";}
+function costTableHTML(R){let h="<table style='margin-top:0'><thead><tr><th class='l'>op category</th><th>cnt</th><th>TFLOP</th><th>HBM GB</th><th>ICI GB</th><th>OI</th><th>ideal ms</th><th>%step</th><th>bound</th></tr></thead><tbody>";
+  for(const r of R.rows) h+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e12)+"</td><td>"+fmt(r.hbm/1e9)+"</td><td>"+fmt(r.ici/1e9)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";
+  return h+"</tbody></table>";}
+function codepathHTML(){const C=D.codepath; if(!C)return "<div style='color:#a55'>code-path index unavailable (built without a trace).</div>";
+  let h="<div class='lh'>Code path — real forward, traced</div><div class='note'>"+(C.num_eqns_all||0).toLocaleString()+" jaxpr equations ("+(C.num_eqns_top||0).toLocaleString()+" top-level). Each op group → its actual <b>models/*.py</b> call chain (innermost = op kind, outer = role). Layer counts are emergent from the trace.</div>";
   h+="<table><thead><tr><th class='l'>role</th><th class='l'>category</th><th>count</th><th class='l'>code path (innermost ← caller)</th></tr></thead><tbody>";
   for(const r of (C.gemms||[])){const chain=(r.stack||[]).slice(0,5).map((f,i)=>i===0?("<b>"+f+"</b>"):f).join(" <span style='color:#94a3b8'>←</span> ");
-    h+="<tr><td class='l'>"+r.role+"</td><td class='l'><span style='color:"+(CAT[r.category]||'#888')+"'>●</span> "+r.category+"</td><td>"+r.count+"</td><td class='l' style='font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#475569'>"+chain+"</td></tr>";}
-  el.innerHTML=h+"</tbody></table>";}
-function renderKernels(){const C=D.codepath; const el=g("kn"); if(!C){el.innerHTML="";return;}
-  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>Pallas kernels found in the traced forward — real kernel names + per-device input/output avals + the shard_map call site. RPA-v3 / fused-MoE-v2 declare no cost_estimate, so the roofline prices them from their reference math.</div>";
+    h+="<tr><td class='l'>"+r.role+"</td><td class='l'><span style='color:"+(CAT[r.category]||'#888')+"'>●</span> "+r.category+"</td><td>"+r.count+"</td><td class='l mono' style='color:#475569'>"+chain+"</td></tr>";}
+  return h+"</tbody></table>";}
+function kernelsHTML(){const C=D.codepath; if(!C)return "";
+  let h="<div class='lh'>Pallas kernels</div><div class='note'>Real kernel names + per-device in/out avals + the shard_map call site. RPA-v3 / fused-MoE-v2 declare no cost_estimate, so the roofline prices them from their reference math.</div>";
   for(const k of (C.kernels||[])){const av=a=>(a||[]).map(x=>x.dtype+"["+x.shape.join(",")+"]").join(", ");
     const col=k.kind==="attention"?CAT.attention:(k.kind==="moe"?CAT.moe:"#888");
     h+="<div style='margin:4px 0;padding:8px 10px;border:1px solid #e6e9ef;border-radius:8px'><div style='font-weight:600;color:#0f172a'><span style='color:"+col+"'>●</span> "+k.name+" <span class='pill'>×"+k.count+"</span> <span class='pill'>"+k.kind+"</span></div>"
-      +"<div style='font-family:ui-monospace,Menlo,monospace;color:#667;font-size:11px;margin-top:3px'>in: "+av(k.in_avals)+"<br>out: "+av(k.out_avals)+"<br>@ "+(k.ctx||"")+"</div></div>";}
-  el.innerHTML=h;}
-function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s); renderFusion(s); renderLens(s,R);
-  let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e12)+"</td><td>"+fmt(r.hbm/1e9)+"</td><td>"+fmt(r.ici/1e9)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
-  document.querySelector("#tbl tbody").innerHTML=tb;
-  const L=R.L; const qstr=(Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16")))+(Q.wq!=="bf16"?(" → "+wpeak()+" MXU"+(Q.wq==="block"?" (block-wise capped)":"")):"");
+      +"<div class='mono' style='color:#667;margin-top:3px'>in: "+av(k.in_avals)+"<br>out: "+av(k.out_avals)+"<br>@ "+(k.ctx||"")+"</div></div>";}
+  return h;}
+const HELP={
+  overview:"Overall roofline · per-category cost · one-layer dataflow.",
+  overlap:"Can comm (ICI) hide behind compute/HBM — drag tp / tokens to see when it gets exposed.",
+  kernel:"Ops ranked by cost; each tells you whether to cut bytes or raise compute.",
+  fusion:"Which intermediate-activation HBM round-trips to fold away, ranked by step saved.",
+  trace:"This model's real forward: code-path + Pallas kernels (from the trace)."};
+function card(inner){return "<div class='panel' style='margin-bottom:12px'>"+inner+"</div>";}
+function chartHTML(){return "<canvas id='cv' style='margin-bottom:12px'></canvas>";}
+function render(){const s=state(); const R=compute(s);
+  g("scenhelp").innerHTML=HELP[SCEN]||"";
+  let html="";
+  if(SCEN==="overview") html=chartHTML()+card(legendHTML()+costTableHTML(R))+card(dataflowHTML(s));
+  else if(SCEN==="overlap") html=chartHTML()+card(lensOverlap(R));
+  else if(SCEN==="kernel") html=chartHTML()+card(lensKernel(R));
+  else if(SCEN==="fusion") html=card(lensFusion(s,R));
+  else if(SCEN==="trace") html=card(codepathHTML())+card(kernelsHTML());
+  g("body").innerHTML=html;
+  if(g("cv")){draw(R); attachTip();}
+  updateSummary(s,R);
+}
+function attachTip(){const cv=g("cv"); if(!cv)return; const tip=g("tip");
+  cv.onmousemove=e=>{const rect=cv.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    let hit=null; if(LAST&&LAST._pts)for(const p of LAST._pts){if((mx-p.px)**2+(my-p.py)**2<(p.rad+5)**2){hit=p;break;}}
+    if(hit){const r=hit.r,ts=r.ideal/1e3,aTF=r.flops/ts/1e12,aBW=r.hbm/ts/1e9,aICI=r.ici/ts/1e9,cpk=(r.peak==="fp8"?P.fp8_tflops:P.bf16_tflops);
+      tip.style.display="block";tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY+8)+"px";
+      tip.innerHTML="<b>"+r.cat+"</b> (×"+r.cnt+") · <b>"+r.bound+"-bound</b><br>"+fmt(r.flops/1e12)+" TFLOP · "+fmt(r.hbm/1e9)+" GB HBM · "+fmt(r.ici/1e9)+" GB ICI · OI="+r.oi.toFixed(1)
+        +"<br>ideal "+r.ideal.toFixed(3)+" ms → achieved:<br>&nbsp;&nbsp;"+aTF.toFixed(0)+" TFLOP/s ("+(aTF/cpk*100).toFixed(0)+"% compute)<br>&nbsp;&nbsp;"+aBW.toFixed(0)+" GB/s ("+(aBW/P.hbm_gbps*100).toFixed(0)+"% HBM)"
+        +(aICI>0?("<br>&nbsp;&nbsp;"+aICI.toFixed(0)+" GB/s ("+(aICI/P.ici_gbps*100).toFixed(0)+"% ICI)"):"");}
+    else tip.style.display="none";};
+  cv.onmouseleave=()=>tip.style.display="none";}
+function updateSummary(s,R){const L=R.L;
+  const qstr=(Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16")))+(Q.wq!=="bf16"?(" → "+wpeak()+" MXU"+(Q.wq==="block"?" (capped)":"")):"");
   g("summary").innerHTML =
-   "<b>mesh</b> data="+L.dp+" × tensor="+L.t+" = "+L.devices+" devices &nbsp; <b>EP</b>="+L.ep+(s.enable_sp?" &nbsp;<span class='pill'>+SP</span>":"")+" &nbsp;<span class='pill'>"+qstr+"</span>"
+   "<b>mesh</b> data="+L.dp+" × tensor="+L.t+" = "+L.devices+" dev &nbsp; <b>EP</b>="+L.ep+(s.enable_sp?" &nbsp;<span class='pill'>+SP</span>":"")+" &nbsp;<span class='pill'>"+qstr+"</span>"
    +"<br><b>"+(R.decode?"decode":"prefill")+"</b> · tokens/DP="+R.tokens+" · MoE global="+(R.tokens*L.dp)
    +"<br><b>bound: <span class='tag b-"+R.tbound+"'>"+R.tbound+"</span></b> &nbsp; step ≈ "+R.tot.toFixed(2)+" ms"
    +"<div style='margin-top:6px'><span class='pill'>compute "+R.Tc.toFixed(2)+"ms</span><span class='pill'>HBM "+R.Th.toFixed(2)+"ms</span><span class='pill'>ICI "+R.Ti.toFixed(2)+"ms</span></div>";
@@ -482,8 +498,7 @@ function divisors(n){const a=[];for(let i=1;i<=n;i++)if(n%i===0)a.push(i);return
 function validDp(tp){return divisors(tp).filter(d=>D.full.nh%(Math.floor(tp/d))===0);}
 function g(id){return document.getElementById(id);}
 let PHASE="decode"; let SCEN="overview";
-function setScen(name){SCEN=name; for(const k of ["overview","overlap","kernel","fusion"])g("sc-"+k).className=(k===name)?"on":"";
-  render(); const tab={overview:"rf",overlap:"rf",kernel:"kn",fusion:"fus"}[name]; setTab(tab);}
+function setScen(name){SCEN=name; document.querySelectorAll("#scennav button").forEach(b=>b.classList.toggle("on",b.dataset.sc===name)); render();}
 function state(){return {tp:+g("tp").value, dp:+g("dp").value, batch:+g("batch").value, seq_len:+g("seq_len").value, chunk:+g("chunk").value, phase:PHASE, enable_sp:g("sp").checked};}
 function fillDp(){const tp=+g("tp").value; const cur=+g("dp").value; const opts=validDp(tp);
   g("dp").innerHTML=opts.map(d=>"<option value='"+d+"'>"+d+"</option>").join("");
@@ -492,8 +507,6 @@ function syncQuant(){Q.wq=g("wq").value; Q.blk=+g("blk").value; Q.aq=g("aq").val
 function syncLabels(){g("tv").textContent="t="+Math.max(1,Math.floor(g("tp").value/g("dp").value));
   g("batchv").textContent=g("batch").value; g("seqv").textContent=g("seq_len").value; g("chunkv").textContent=g("chunk").value;}
 function syncPhaseCtl(){const dec=PHASE==="decode"; g("ctl-batch").style.display=dec?"block":"none"; g("ctl-seq").style.display=dec?"block":"none"; g("ctl-chunk").style.display=dec?"none":"block";}
-const TABS={rf:"cv",df:"df",fus:"fus",cp:"cp",kn:"kn"};
-function setTab(name){for(const k in TABS){g("tab-"+k).className=(k===name)?"on":""; g(TABS[k]).style.display=(k===name)?"block":"none";} if(name==="rf"&&LAST)draw(LAST);}
 function init(){
   g("arch").textContent=D.arch;
   const d=D.defaults;
@@ -511,22 +524,9 @@ function init(){
   g("sp").addEventListener("change",render);
   g("ph-decode").onclick=()=>{PHASE="decode";g("ph-decode").className="on";g("ph-prefill").className="";syncPhaseCtl();render();};
   g("ph-prefill").onclick=()=>{PHASE="prefill";g("ph-prefill").className="on";g("ph-decode").className="";syncPhaseCtl();render();};
-  for(const k in TABS) g("tab-"+k).onclick=()=>setTab(k);
-  for(const k of ["overview","overlap","kernel","fusion"]) g("sc-"+k).onclick=()=>setScen(k);
-  g("legend").innerHTML=Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)";
-  cv.addEventListener("mousemove",e=>{const rect=cv.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;
-    let hit=null; if(LAST&&LAST._pts)for(const p of LAST._pts){if((mx-p.px)**2+(my-p.py)**2<(p.rad+5)**2){hit=p;break;}}
-    const tip=g("tip"); if(hit){const r=hit.r; const ts=r.ideal/1e3; const aTF=r.flops/ts/1e12, aBW=r.hbm/ts/1e9, aICI=r.ici/ts/1e9; const cpk=(r.peak==="fp8"?P.fp8_tflops:P.bf16_tflops);
-      tip.style.display="block";tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY+8)+"px";
-      tip.innerHTML="<b>"+r.cat+"</b> (×"+r.cnt+") · <b>"+r.bound+"-bound</b><br>"+fmt(r.flops/1e12)+" TFLOP · "+fmt(r.hbm/1e9)+" GB HBM · "+fmt(r.ici/1e9)+" GB ICI · OI="+r.oi.toFixed(1)
-        +"<br>ideal "+r.ideal.toFixed(3)+" ms → achieved:"
-        +"<br>&nbsp;&nbsp;"+aTF.toFixed(0)+" TFLOP/s ("+(aTF/cpk*100).toFixed(0)+"% compute)"
-        +"<br>&nbsp;&nbsp;"+aBW.toFixed(0)+" GB/s ("+(aBW/P.hbm_gbps*100).toFixed(0)+"% HBM)"
-        +(aICI>0?("<br>&nbsp;&nbsp;"+aICI.toFixed(0)+" GB/s ("+(aICI/P.ici_gbps*100).toFixed(0)+"% ICI)"):"");}
-    else tip.style.display="none";});
-  cv.addEventListener("mouseleave",()=>g("tip").style.display="none");
-  window.addEventListener("resize",()=>{setupCanvas(); if(LAST)draw(LAST);});
-  setupCanvas(); renderCodepath(); renderKernels(); syncLabels(); syncPhaseCtl(); render(); setTab("rf");
+  document.querySelectorAll("#scennav button").forEach(b=>b.onclick=()=>setScen(b.dataset.sc));
+  window.addEventListener("resize",()=>{if(g("cv"))draw(LAST);});
+  syncLabels(); syncPhaseCtl(); render();
 }
 init();
 </script></body></html>"""
