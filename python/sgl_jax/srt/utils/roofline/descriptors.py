@@ -240,13 +240,17 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
                 source="gate.py:50 gate",
             )
         )
-        tokens_per_dev = max(1, tokens * TOPK // ep)
-        # EP all-to-all per device (dispatch + combine), balanced routing. The
-        # fused MoE EP group is the FULL mesh = devices (ep here = lp.ep =
-        # devices); --ep-size is ignored by the kernel. (ep-1)/ep goes remote.
-        # Balanced theoretical floor; real a2a is imbalance-bound.
+        # Tokens entering the MoE = per-DP-group tokens * dp groups: the fused MoE
+        # is expert-parallel over the FULL mesh (data*tensor=devices), so all dp
+        # groups' tokens are pooled across the experts. Per-device load then =
+        # moe_tokens*topk/devices = tokens*topk/t.
+        moe_tokens = tokens * lp.dp
+        tokens_per_dev = max(1, moe_tokens * TOPK // ep)
+        # EP all-to-all per device (dispatch + combine), balanced routing. ep here
+        # = lp.ep = devices (--ep-size is ignored by the fused kernel). (ep-1)/ep
+        # goes remote. Balanced theoretical floor; real a2a is imbalance-bound.
         remote = (ep - 1) / ep if ep > 1 else 0.0
-        a2a = int(2 * (tokens * TOPK / ep) * H * 2 * remote)
+        a2a = int(2 * (moe_tokens * TOPK / ep) * H * 2 * remote)
         exp_q = qs["experts"]
         rr = ops.moe_experts(
             tokens_per_device=tokens_per_dev,

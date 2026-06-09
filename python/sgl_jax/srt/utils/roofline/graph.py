@@ -268,11 +268,13 @@ def build_layer_graph(config, phase, par, *, swa: bool, moe: bool) -> DataflowGr
             fusable="matmul",
             source="gate.py:50 gate",
         )
-        tpd = max(1, tokens * TOPK // ep)
+        # tokens entering MoE = per-DP-group tokens * dp (full-mesh expert parallel)
+        moe_tokens = tokens * lp.dp
+        tpd = max(1, moe_tokens * TOPK // ep)
         # fused-MoE EP group = full mesh = devices (ep = lp.ep). (ep-1)/ep remote;
         # plus a MoE-output reshard (same SP/DP reduce rule as o_proj).
         remote = (ep - 1) / ep if ep > 1 else 0.0
-        a2a = int(2 * (tokens * TOPK / ep) * H * bf * remote)
+        a2a = int(2 * (moe_tokens * TOPK / ep) * H * bf * remote)
         a2a += parallelism.row_parallel_reduce_bytes(tokens, H, lp)
         eo = T("expert_out", act)
         ec = references.moe_experts_cost(
