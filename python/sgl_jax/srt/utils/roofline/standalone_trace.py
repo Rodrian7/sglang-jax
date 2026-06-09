@@ -120,7 +120,7 @@ def _make_dummy_batch(bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_s
         req_pool_indices=np.arange(bs, dtype=np.int32),
         seq_lens=np.array([1] * bs, dtype=np.int32),
         out_cache_loc=np.concat(
-            [np.arange(1, bs + 1, np.int32), np.array([-1] * (num_tokens - bs), np.int32)]
+            [np.arange(1, bs + 1, dtype=np.int32), np.array([-1] * (num_tokens - bs), np.int32)]
         ),
         return_logprob=False,
         return_output_logprob_only=True,
