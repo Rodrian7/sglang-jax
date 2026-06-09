@@ -120,6 +120,83 @@ def _kernel_kind(name):
     return "other"
 
 
+def code_path_index(records: dict, config: dict) -> dict:
+    """Real per-op code-path index from the trace, for reporting. Groups GEMMs by
+    role with a representative source_stack (the actual models/*.py call chain),
+    plus the Pallas kernels (real names + ctx + per-device avals) and the
+    primitive histogram. No costs -- pure attribution."""
+    H = _cfg(config, "hidden_size")
+    nh, nkv = _cfg(config, "num_attention_heads"), _cfg(config, "num_key_value_heads")
+    hd = _cfg(config, "head_dim")
+    vhd = _cfg(config, "v_head_dim", default=hd)
+    dims = dict(
+        H=H,
+        vocab=_cfg(config, "vocab_size"),
+        q_size=nh * hd,
+        k_size=nkv * hd,
+        v_size=nkv * vhd,
+        attn_out=nh * vhd,
+        dense_inter=_cfg(config, "intermediate_size"),
+    )
+    top = records["top_eqns"]
+    gemms = [e for e in top if e["prim"] == "dot_general"]
+    attn_frames, mlp_frames = set(), set()
+    for e in gemms:
+        _, od = _parse(e["out"][0]) if e["out"] else (None, [])
+        ins = [_parse(s) for s in e.get("ins", [])]
+        if len(od) < 2 or not ins or len(ins[0][1]) < 2:
+            continue
+        n, k = od[1], ins[0][1][-1]
+        fr = set(_model_frames(e.get("source_stack", [])))
+        if k == H and n in {dims["q_size"], dims["k_size"], dims["v_size"]}:
+            attn_frames |= fr
+        elif k == H and n == dims["dense_inter"]:
+            mlp_frames |= fr
+    attn_only, mlp_only = attn_frames - mlp_frames, mlp_frames - attn_frames
+
+    roles = {}
+    for e in gemms:
+        r = _gemm_role(e, dims, attn_only, mlp_only)
+        if not r:
+            continue
+        role, category, _, m, k, n = r
+        d = roles.setdefault(
+            role,
+            {
+                "role": role,
+                "category": category,
+                "count": 0,
+                "shape": f"[m,{k}]x[{k},{n}]",
+                "stack": e.get("source_stack", []),
+            },
+        )
+        d["count"] += 1
+    # Pallas kernels grouped by name
+    kern = {}
+    for p in records["pallas"]:
+        name = p.get("kernel_name", "?")
+        d = kern.setdefault(
+            name,
+            {
+                "name": name,
+                "kind": _kernel_kind(name),
+                "count": 0,
+                "ctx": p.get("ctx", ""),
+                "src": p.get("source", ""),
+                "in_avals": [a for a in p.get("in_avals", []) if a][:4],
+                "out_avals": [a for a in p.get("out_avals", []) if a][:2],
+            },
+        )
+        d["count"] += 1
+    return {
+        "gemms": sorted(roles.values(), key=lambda x: -x["count"]),
+        "kernels": sorted(kern.values(), key=lambda x: (x["kind"], -x["count"])),
+        "primitives": records.get("by_primitive_all", [])[:30],
+        "num_eqns_top": records.get("num_eqns_top"),
+        "num_eqns_all": records.get("num_eqns_all"),
+    }
+
+
 def analyze_trace(
     records: dict,
     config: dict,
