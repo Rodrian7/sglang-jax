@@ -177,11 +177,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
     <select id="aq"><option value="bf16">bf16 (W·A16)</option><option value="fp8">fp8 (W·A8)</option></select></div>
   <div class="ctl"><label>tp_size = devices = mesh total</label><select id="tp"></select></div>
   <div class="ctl"><label>dp_size — tensor axis t = tp/dp = <span class="v" id="tv"></span></label><select id="dp"></select></div>
-  <div class="ctl"><label>decode batch (tokens) <span class="v" id="batchv"></span></label>
+  <div class="ctl" id="ctl-batch"><label>decode batch (tokens) <span class="v" id="batchv"></span></label>
     <input type="range" id="batch" min="1" max="2048" step="1"></div>
-  <div class="ctl"><label>decode KV context <span class="v" id="seqv"></span></label>
+  <div class="ctl" id="ctl-seq"><label>decode KV context <span class="v" id="seqv"></span></label>
     <input type="range" id="seq_len" min="256" max="262144" step="256"></div>
-  <div class="ctl"><label>prefill chunk tokens <span class="v" id="chunkv"></span></label>
+  <div class="ctl" id="ctl-chunk"><label>prefill chunk tokens <span class="v" id="chunkv"></span></label>
     <input type="range" id="chunk" min="256" max="32768" step="256"></div>
   <div id="summary"></div>
  </div>
@@ -403,6 +403,7 @@ function fillDp(){const tp=+g("tp").value; const cur=+g("dp").value; const opts=
 function syncQuant(){Q.wq=g("wq").value; Q.blk=+g("blk").value; Q.aq=g("aq").value; g("blk").disabled=(Q.wq!=="block");}
 function syncLabels(){g("tv").textContent="t="+Math.max(1,Math.floor(g("tp").value/g("dp").value));
   g("batchv").textContent=g("batch").value; g("seqv").textContent=g("seq_len").value; g("chunkv").textContent=g("chunk").value;}
+function syncPhaseCtl(){const dec=PHASE==="decode"; g("ctl-batch").style.display=dec?"block":"none"; g("ctl-seq").style.display=dec?"block":"none"; g("ctl-chunk").style.display=dec?"none":"block";}
 const TABS={rf:"cv",df:"df",fus:"fus",jax:"jax"};
 function setTab(name){for(const k in TABS){g("tab-"+k).className=(k===name)?"on":""; g(TABS[k]).style.display=(k===name)?"block":"none";} if(name==="rf"&&LAST)draw(LAST);}
 function init(){
@@ -419,8 +420,8 @@ function init(){
   ["wq","blk","aq"].forEach(id=>g(id).addEventListener("change",()=>{syncQuant();render();}));
   ["batch","seq_len","chunk"].forEach(id=>g(id).addEventListener("input",()=>{syncLabels();render();}));
   g("sp").addEventListener("change",render);
-  g("ph-decode").onclick=()=>{PHASE="decode";g("ph-decode").className="on";g("ph-prefill").className="";render();};
-  g("ph-prefill").onclick=()=>{PHASE="prefill";g("ph-prefill").className="on";g("ph-decode").className="";render();};
+  g("ph-decode").onclick=()=>{PHASE="decode";g("ph-decode").className="on";g("ph-prefill").className="";syncPhaseCtl();render();};
+  g("ph-prefill").onclick=()=>{PHASE="prefill";g("ph-prefill").className="on";g("ph-decode").className="";syncPhaseCtl();render();};
   for(const k in TABS) g("tab-"+k).onclick=()=>setTab(k);
   g("legend").innerHTML=Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)";
   cv.addEventListener("mousemove",e=>{const rect=cv.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;
@@ -430,7 +431,7 @@ function init(){
     else tip.style.display="none";});
   cv.addEventListener("mouseleave",()=>g("tip").style.display="none");
   window.addEventListener("resize",()=>{setupCanvas(); if(LAST)draw(LAST);});
-  setupCanvas(); renderJaxpr(); syncLabels(); render(); setTab("rf");
+  setupCanvas(); renderJaxpr(); syncLabels(); syncPhaseCtl(); render(); setTab("rf");
 }
 init();
 </script></body></html>"""
