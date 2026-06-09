@@ -70,16 +70,12 @@ def _subjaxprs(eqn):
                     yield f"{k}[{i}]", j
 
 
-def dump_forward_jaxpr(make_jaxpr_fn, args, out_path: str) -> str:
-    """make_jaxpr_fn(*args) -> a ClosedJaxpr/Jaxpr; extract + write JSON.
-
-    Recursively walks sub-jaxprs so nested Pallas/custom-call kernels (attention,
-    fused MoE) are captured with their cost_estimate and avals.
-    """
-    import jax
+def extract_jaxpr_records(jaxpr) -> dict:
+    """Recursively walk a (Closed)Jaxpr -> the dump dict (top_eqns + nested Pallas
+    with cost_estimate/avals/ctx + by_primitive_all). Shared by the on-device hook
+    and the standalone CPU tracer."""
     from jax._src import source_info_util as si
 
-    jaxpr = jax.make_jaxpr(make_jaxpr_fn)(*args)
     jp = getattr(jaxpr, "jaxpr", jaxpr)
 
     top_eqns: list[dict] = []  # depth-0 eqns (structure + comm at the outer level)
@@ -128,13 +124,28 @@ def dump_forward_jaxpr(make_jaxpr_fn, args, out_path: str) -> str:
 
     walk(jp.eqns, 0, "<root>")
 
-    out = {
+    return {
         "num_eqns_top": len(top_eqns),
         "num_eqns_all": sum(by_prim_all.values()),
         "by_primitive_all": by_prim_all.most_common(),
         "pallas": pallas,  # nested kernels with cost_estimate / avals / ctx
         "top_eqns": top_eqns,
     }
+
+
+def dump_closed_jaxpr(jaxpr, out_path: str) -> str:
+    """Extract records from an already-traced (Closed)Jaxpr and write JSON."""
     with open(out_path, "w") as f:
-        json.dump(out, f, indent=2)
+        json.dump(extract_jaxpr_records(jaxpr), f, indent=2)
     return out_path
+
+
+def dump_forward_jaxpr(make_jaxpr_fn, args, out_path: str) -> str:
+    """make_jaxpr_fn(*args) -> a ClosedJaxpr/Jaxpr; extract + write JSON.
+
+    Recursively walks sub-jaxprs so nested Pallas/custom-call kernels (attention,
+    fused MoE) are captured with their cost_estimate and avals.
+    """
+    import jax
+
+    return dump_closed_jaxpr(jax.make_jaxpr(make_jaxpr_fn)(*args), out_path)
