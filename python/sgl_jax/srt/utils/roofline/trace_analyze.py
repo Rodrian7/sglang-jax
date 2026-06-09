@@ -63,13 +63,19 @@ def _last_model_frame(stack):
 # ---------------------------------------------------------------------------
 # GEMM role classification (innermost-file kind + shape + caller frame)
 # ---------------------------------------------------------------------------
-def _gemm_role(e, dims):
-    """Classify a top-level dot_general into a (role, category, quant_role).
+def _model_frames(stack):
+    return [f for f in (stack or []) if "/models/" in f or f.startswith("srt/models/")]
 
-    role drives the quant spec; category is the roofline bucket. Uses the
-    innermost source file (gate.py->router, logits_processor->lm_head) plus the
-    shape relative to config dims, plus the model-file caller frame to split
-    o_proj (attention block) from down_proj (MLP block)."""
+
+def _gemm_role(e, dims, attn_only=frozenset(), mlp_only=frozenset()):
+    """Classify a top-level dot_general into (role, category, quant_role, m, k, n).
+
+    Innermost source file gives the kind (gate.py->router, logits_processor->
+    lm_head); shape vs config dims gives qkv / gate_up / lm_head; for the
+    ambiguous n==H projections (o_proj and dense down share k when attn_out ==
+    dense_inter) the model-file call frame disambiguates: o_proj's stack carries
+    the attention-block frame, down's the MLP-block frame (both derived from the
+    qkv / gate_up stacks, no hard-coded line numbers)."""
     stack = e.get("source_stack", []) or []
     inner = stack[0] if stack else (e.get("source", "") or "")
     _, od = _parse(e["out"][0]) if e["out"] else (None, [])
@@ -83,42 +89,23 @@ def _gemm_role(e, dims):
         return ("router", "router", "router", m, k, n)
     if "logits_processor" in inner or n == dims["vocab"]:
         return ("lm_head", "lm_head", "lm_head", m, k, n)
-    # everything else routed through LinearBase -> a projection GEMM
-    caller = _last_model_frame(stack)
-    # attention-block GEMMs: qkv (k==H, n in {q,k,v}) or o_proj (n==H, follows attn)
     qkv_sizes = {dims["q_size"], dims["k_size"], dims["v_size"]}
     if k == H and n in qkv_sizes:
         return ("qkv", "linear", "qkv", m, k, n)
     if k == H and n == dims.get("dense_inter"):
         return ("gate_up", "linear", "mlp", m, k, n)
     if n == H:
-        # o_proj (k == attn_out, inside attention) vs dense down (k == inter, MLP)
         if k == dims.get("attn_out") and k != dims.get("dense_inter"):
             return ("o_proj", "o_proj", "o_proj", m, k, n)
         if k == dims.get("dense_inter") and k != dims.get("attn_out"):
             return ("down", "linear", "mlp", m, k, n)
-        # ambiguous shape (attn_out == dense_inter): split by caller frame.
-        role = "o_proj" if _frame_line(caller) and _is_attn_frame(caller, dims) else "down"
-        cat = "o_proj" if role == "o_proj" else "linear"
-        qr = "o_proj" if role == "o_proj" else "mlp"
-        return (role, cat, qr, m, k, n)
+        # ambiguous (attn_out == dense_inter): split by which block frame the
+        # call stack carries.
+        frames = set(_model_frames(stack))
+        if frames & mlp_only and not (frames & attn_only):
+            return ("down", "linear", "mlp", m, k, n)
+        return ("o_proj", "o_proj", "o_proj", m, k, n)
     return ("linear", "linear", "mlp", m, k, n)
-
-
-def _frame_line(fr):
-    mm = re.search(r":(\d+)$", fr or "")
-    return int(mm.group(1)) if mm else None
-
-
-def _is_attn_frame(caller, dims):
-    """Heuristic: the model-file caller line of an o_proj is the attention
-    block's call site, recorded in dims['attn_caller_lines'] when known. Without
-    it, fall back to True (treat ambiguous H-output as o_proj -- the dominant
-    case; a single dense down is negligible)."""
-    lines = dims.get("attn_caller_lines")
-    if not lines:
-        return True
-    return _frame_line(caller) in lines
 
 
 # ---------------------------------------------------------------------------
@@ -194,11 +181,30 @@ def analyze_trace(
     # ---- GEMMs grouped by (role, shape) -> one row per role with summed count
     from collections import defaultdict
 
+    # pre-pass: block-frame sets to disambiguate o_proj (attention block) from
+    # dense down (MLP block) when attn_out == dense_inter. Derived from the
+    # unambiguous qkv (attention) and gate_up (MLP) call stacks -- no hard-coded
+    # lines, so it generalises to any model.
+    attn_frames, mlp_frames = set(), set()
+    for e in gemms:
+        _, od = _parse(e["out"][0]) if e["out"] else (None, [])
+        ins = [_parse(s) for s in e.get("ins", [])]
+        if len(od) < 2 or not ins or len(ins[0][1]) < 2:
+            continue
+        n, k = od[1], ins[0][1][-1]
+        fr = set(_model_frames(e.get("source_stack", [])))
+        if k == H and n in {dims["q_size"], dims["k_size"], dims["v_size"]}:
+            attn_frames |= fr
+        elif k == H and n == dims["dense_inter"]:
+            mlp_frames |= fr
+    attn_only = attn_frames - mlp_frames
+    mlp_only = mlp_frames - attn_frames
+
     gemm_groups = defaultdict(lambda: {"count": 0, "src": "", "m": 0, "k": 0, "n": 0})
     router_count = 0
     router_src = "gate.py"
     for e in gemms:
-        r = _gemm_role(e, dims)
+        r = _gemm_role(e, dims, attn_only, mlp_only)
         if r is None:
             continue
         role, category, qrole, m, k, n = r
