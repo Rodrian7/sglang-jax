@@ -36,6 +36,12 @@ def main():
     ap.add_argument("--phases", default="prefill,decode", help="comma list: prefill,decode")
     ap.add_argument("--html", default=None, help="write self-contained HTML report")
     ap.add_argument("--dump", default=None, help="also write the raw jaxpr JSON (prefill)")
+    ap.add_argument(
+        "--hlo",
+        default=None,
+        help="optimized-HLO text (from tools/dump_forward_hlo.py) to add the "
+        "compiler-ground-truth overlap section to the report",
+    )
     args = ap.parse_args()
 
     devices = args.devices or args.tp
@@ -100,6 +106,12 @@ def main():
     if args.html:
         records = records_by.get("prefill") or next(iter(records_by.values()))
         codepath = trace_analyze.code_path_index(records, config)
+        hlo = None
+        if args.hlo:
+            from sgl_jax.srt.utils.roofline.hlo_overlap import parse_hlo_overlap
+
+            with open(args.hlo) as f:
+                hlo = parse_hlo_overlap(f.read())
         # interactive report (live knobs + Dataflow + Fusion) grounded in the real
         # trace's code-path + kernel tabs; defaults seed the knobs at this layout.
         defaults = dict(
@@ -111,7 +123,9 @@ def main():
             enable_sp=args.enable_sp,
         )
         os.makedirs(os.path.dirname(os.path.abspath(args.html)), exist_ok=True)
-        report_html.build_html_report(arch, config, peaks, defaults, args.html, codepath=codepath)
+        report_html.build_html_report(
+            arch, config, peaks, defaults, args.html, codepath=codepath, hlo=hlo
+        )
         print(f"\nHTML report -> {args.html}")
 
 
