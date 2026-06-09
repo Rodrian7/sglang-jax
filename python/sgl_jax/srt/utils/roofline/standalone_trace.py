@@ -215,9 +215,37 @@ def trace_model_forward(
     dtype: str = "bfloat16",
     page_size: int = 256,
 ) -> TraceResult:
-    """Trace the REAL forward of a registered model abstractly on the current
-    (CPU) backend and return the ClosedJaxpr + resolved layout. Call
-    ``patch_for_cpu()`` first when running on CPU."""
+    """Trace the REAL forward of a registered model abstractly and return the
+    ClosedJaxpr + resolved layout. Call ``patch_for_cpu()`` first on CPU."""
+    fwd, args, mesh, mc, arch, attention_tp, ep, tokens_global = _build_forward(
+        model_path,
+        tp,
+        dp,
+        phase=phase,
+        num_tokens=num_tokens,
+        moe_backend=moe_backend,
+        dtype=dtype,
+        page_size=page_size,
+    )
+    with jax.set_mesh(mesh):
+        jaxpr = jax.make_jaxpr(fwd)(*args)
+    return TraceResult(
+        jaxpr=jaxpr,
+        model_config=mc,
+        arch=arch,
+        tp=tp,
+        dp=dp,
+        attention_tp=attention_tp,
+        ep=ep,
+        phase=phase,
+        tokens_global=tokens_global,
+    )
+
+
+def _build_forward(model_path, tp, dp, *, phase, num_tokens, moe_backend, dtype, page_size):
+    """Build the abstract model + dummy batch; return the forward closure, its
+    (abstract-weights, fb, mp, lm) args, the mesh, and meta. Shared by the jaxpr
+    tracer and the HLO compiler."""
     from sgl_jax.srt.layers.logits_processor import LogitsMetadata
     from sgl_jax.srt.managers.schedule_batch import ForwardMode
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -263,19 +291,38 @@ def trace_model_forward(
             st = jax.tree_util.tree_unflatten(treedef, state_leaves)
             return nnx.merge(gd, st)(forward_batch, memory_pools, logits_metadata)
 
-        jaxpr = jax.make_jaxpr(fwd)(leaves, fb, mp, lm)
+    tokens_global = ntok if mode == ForwardMode.EXTEND else bs
+    return fwd, (leaves, fb, mp, lm), mesh, mc, arch, attention_tp, ep, tokens_global
 
-    return TraceResult(
-        jaxpr=jaxpr,
-        model_config=mc,
-        arch=arch,
-        tp=tp,
-        dp=dp,
-        attention_tp=attention_tp,
-        ep=ep,
+
+def compile_forward_hlo(
+    model_path,
+    tp,
+    dp,
+    *,
+    phase="extend",
+    num_tokens=512,
+    moe_backend="fused_v2",
+    dtype="bfloat16",
+    page_size=256,
+) -> str:
+    """Lower + compile the real forward for the (real-device) mesh and return the
+    optimized, scheduled HLO text. Run on a TPU host/cluster with
+    ``jax.distributed`` initialized (so ``jax.devices()`` spans all chips) -- the
+    async-collective schedule is target-specific, so CPU HLO is not representative."""
+    fwd, args, mesh, mc, arch, attention_tp, ep, tokens_global = _build_forward(
+        model_path,
+        tp,
+        dp,
         phase=phase,
-        tokens_global=ntok if mode == ForwardMode.EXTEND else bs,
+        num_tokens=num_tokens,
+        moe_backend=moe_backend,
+        dtype=dtype,
+        page_size=page_size,
     )
+    with jax.set_mesh(mesh):
+        compiled = jax.jit(fwd).lower(*args).compile()
+    return compiled.as_text()
 
 
 def _main():

@@ -382,22 +382,43 @@ function fmt(x){const a=Math.abs(x); if(a===0)return "0"; if(a>=100)return x.toF
 // ---------- scenario lenses (expert task-oriented views) ----------
 function rowMs(r){return {c:r.flops/flops_per_s(r.peak)*1e3, h:r.hbm/HBMBW*1e3, i:r.ici/ICIBW*1e3};}
 function ridgeOI(peak){return (peak==="fp8"?P.fp8_tflops:P.bf16_tflops)/(HBMBW/1e12);}
-function lensOverlap(R){
-  const C=R.Tc, Hb=R.Th, I=R.Ti, nonComm=Math.max(C,Hb), floor=Math.max(C,Hb,I), mx=Math.max(C,Hb,I,1e-9);
-  const bar=(lab,v,col)=>"<div class='dfrow'><div class='nm'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,v/mx*100)+"%;background:"+col+"'></div></div><div class='ms'>"+v.toFixed(3)+" ms</div></div>";
-  let h="<div class='lh'>Overlap — can comm (ICI) hide behind compute / HBM?</div>";
-  h+="<div class='note'>Collectives (ICI) run concurrently with other ops' compute/HBM; compute &amp; HBM already overlap on the roofline. Perfect-overlap floor = <b>max(ΣC, ΣH, ΣI)</b>.</div>";
-  h+=bar("ΣC compute",C,"#22c55e")+bar("ΣH HBM",Hb,"#3b82f6")+bar("ΣI comm (ICI)",I,"#ec4899");
-  h+="<div class='note'>non-comm wall = max(ΣC, ΣH) = <b>"+nonComm.toFixed(2)+" ms</b> &nbsp;·&nbsp; ΣICI = <b>"+I.toFixed(3)+" ms</b></div>";
-  if(I<=nonComm) h+="<div class='verdict v-go'>ΣICI ("+I.toFixed(3)+" ms) ≤ wall ("+nonComm.toFixed(2)+" ms) → comm <b>fully hideable</b>. step floor = "+nonComm.toFixed(2)+" ms ("+R.tbound+"-bound). Overlap is <b>not</b> the lever here — cut "+(Hb>=C?"HBM bytes":"flops")+" (Kernel / Fusion).</div>";
-  else h+="<div class='verdict v-warn'>ΣICI ("+I.toFixed(2)+" ms) &gt; wall ("+nonComm.toFixed(2)+" ms) → ~<b>"+(I-nonComm).toFixed(2)+" ms</b> comm <b>exposed</b> → ICI-bound. Lever: cut comm (SP / topology / EP locality) or schedule it under compute/HBM.</div>";
-  const ic=R.rows.filter(r=>r.ici>0).map(r=>({cat:r.cat,i:rowMs(r).i})).sort((a,b)=>b.i-a.i);
-  if(ic.length){h+="<table style='margin-top:10px'><thead><tr><th class='l'>op</th><th>ICI ms</th><th class='l'>source</th></tr></thead><tbody>";
-    for(const o of ic){const why=o.cat==="moe"?"all-to-all (dispatch + combine)":(o.cat==="o_proj"?"all-reduce / reduce-scatter":"collective");
-      h+="<tr><td class='l'><span style='color:"+(CAT[o.cat]||'#888')+"'>●</span> "+o.cat+"</td><td>"+o.i.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+why+"</td></tr>";}
-    h+="</tbody></table><div class='note'>↑ prefill chunk / tp grows a2a — watch ΣICI cross the wall.</div>";}
-  else h+="<div class='note'>No comm at this layout (single device, or no parallel reduce).</div>";
-  h+="<div class='note' style='color:#a55'>⚠ upper bound only — real overlap depends on scheduling; verify with a trace.</div>";
+function lensOverlap(s,R){
+  const L=R.L, ep=L.ep, tokens=R.tokens, mt=tokens*L.dp, remote=ep>1?(ep-1)/ep:0, msi=b=>b/ICIBW*1e3;
+  const attnN=D.n_full+D.n_swa;
+  const items=[];
+  if(D.n_moe>0){
+    const a2aB=2*(mt*D.TOPK/ep)*D.H*2*remote, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep));
+    const e=moe(tpd,D.NEXP/ep,D.H,D.MOEF,"experts"), expMs=e.flops/flops_per_s(e.peak)/1e3*D.n_moe;
+    items.push({name:"MoE all-to-all (dispatch + combine)",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts compute "+expMs.toFixed(2)+" ms"});
+    items.push({name:"MoE output reshard (reduce)",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
+  }
+  if(attnN>0) items.push({name:"o_proj "+(L.sp?"reduce-scatter + all-gather":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
+  if(D.n_dense>0) items.push({name:"down_proj "+(L.sp?"reduce-scatter":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
+  let hidden=0,exposed=0,commTot=0;
+  for(const it of items){if(it.type==="pipelineable"){it.hidden=Math.min(it.ms,it.cap);it.exposed=it.ms-it.hidden;}else{it.hidden=0;it.exposed=it.ms;} hidden+=it.hidden;exposed+=it.exposed;commTot+=it.ms;}
+  const nonComm=Math.max(R.Tc,R.Th), pipeStep=nonComm+exposed, noOv=nonComm+commTot;
+  let h="<div class='lh'>Overlap — comm hidden behind compute, or exposed?</div>";
+  h+="<div class='note'>Each collective is classified by whether it can pipeline behind adjacent compute: MoE a2a can hide inside the fused-expert kernel; TP reduces are layer-boundary barriers. step ≈ max(ΣC,ΣH) + <b>exposed</b> comm.</div>";
+  // comm budget stacked bar
+  const cmx=Math.max(commTot,1e-9);
+  h+="<div class='dfrow'><div class='nm'>comm budget ΣICI</div><div class='barwrap' style='display:flex'>"
+    +"<div class='bar' style='width:"+(hidden/cmx*100)+"%;background:#22c55e' title='hidden'></div>"
+    +"<div class='bar' style='width:"+(exposed/cmx*100)+"%;background:#ec4899' title='exposed'></div></div>"
+    +"<div class='ms'>"+commTot.toFixed(3)+" ms</div></div>";
+  h+="<div class='note'><span style='color:#16a34a'>■</span> hidden "+hidden.toFixed(3)+" ms &nbsp; <span style='color:#db2777'>■</span> exposed "+exposed.toFixed(3)+" ms</div>";
+  // step band
+  const bmx=Math.max(noOv,1e-9), bar=(lab,v,col)=>"<div class='dfrow'><div class='nm'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,v/bmx*100)+"%;background:"+col+"'></div></div><div class='ms'>"+v.toFixed(2)+" ms</div></div>";
+  h+="<div class='note' style='margin-top:8px'><b>step estimate</b> (per-resource: ΣC "+R.Tc.toFixed(2)+" / ΣH "+R.Th.toFixed(2)+" / ΣI "+commTot.toFixed(2)+" ms)</div>";
+  h+=bar("no comm overlap",noOv,"#cbd5e1")+bar("pipeline model (a2a hidden, barriers exposed)",pipeStep,"#3b82f6")+bar("perfect overlap floor = max(ΣC,ΣH,ΣI)",R.tot,"#22c55e");
+  // verdict
+  if(exposed<0.02*Math.max(nonComm,1e-9)) h+="<div class='verdict v-go'>Exposed comm ≈ <b>"+exposed.toFixed(3)+" ms</b> (≪ "+nonComm.toFixed(2)+" ms compute/HBM) → comm is <b>not</b> the bottleneck; step stays "+R.tbound+"-bound. Overlap won't move the needle — cut "+(R.Th>=R.Tc?"HBM bytes":"flops")+".</div>";
+  else h+="<div class='verdict v-warn'>Exposed comm ≈ <b>"+exposed.toFixed(2)+" ms</b> on top of the "+nonComm.toFixed(2)+" ms compute/HBM floor ("+(exposed/pipeStep*100).toFixed(0)+"% of step). Lever: hide the a2a (kernel pipelining / async) or cut barriers (SP, topology, EP locality).</div>";
+  // per-collective table
+  h+="<table style='margin-top:10px'><thead><tr><th class='l'>collective</th><th>ICI ms</th><th class='l'>type</th><th>hidden</th><th>exposed</th><th class='l'>hides behind</th></tr></thead><tbody>";
+  for(const it of items.sort((a,b)=>b.ms-a.ms)) h+="<tr><td class='l'>"+it.name+"</td><td>"+it.ms.toFixed(3)+"</td><td class='l'><span class='tag "+(it.type==="pipelineable"?"b-compute":"b-ICI")+"'>"+it.type+"</span></td><td>"+it.hidden.toFixed(3)+"</td><td>"+it.exposed.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+it.behind+"</td></tr>";
+  if(!items.length) h+="<tr><td class='l' colspan=6>no collectives at this layout</td></tr>";
+  h+="</tbody></table>";
+  h+="<div class='verdict v-warn' style='background:#fffbeb'>⚠ <b>pipelineable ≠ actually overlapped.</b> On this hardware the MoE a2a has been measured <b>exposed</b> at the torus bandwidth floor (cross-host) / VMEM-blocked — XLA may not hide it. The <b>Trace</b>/HLO pass is what confirms which collectives are async and how much compute sits in their shadow.</div>";
   return h;}
 function lensKernel(R){
   let h="<div class='lh'>Kernel — which to attack, and how</div><div class='note'>Ranked by ideal ms. Bound → lever: HBM → ↓ bytes; compute → ↑ MXU rate / ↓ flops; ICI → overlap / ↓ comm.</div>";
@@ -467,7 +488,7 @@ function render(){const s=state(); const R=compute(s);
   g("scenhelp").innerHTML=HELP[SCEN]||"";
   let html="";
   if(SCEN==="overview") html=chartHTML()+card(legendHTML()+costTableHTML(R))+card(dataflowHTML(s));
-  else if(SCEN==="overlap") html=chartHTML()+card(lensOverlap(R));
+  else if(SCEN==="overlap") html=chartHTML()+card(lensOverlap(s,R));
   else if(SCEN==="kernel") html=chartHTML()+card(lensKernel(R));
   else if(SCEN==="fusion") html=card(lensFusion(s,R));
   else if(SCEN==="trace") html=card(codepathHTML())+card(kernelsHTML());
