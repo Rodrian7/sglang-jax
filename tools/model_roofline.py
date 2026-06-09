@@ -115,6 +115,11 @@ def main() -> int:
     # output
     ap.add_argument("--view", choices=["a", "b", "c", "d", "e", "f", "all"], default="all")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument(
+        "--chart-dir",
+        default=None,
+        help="write a roofline PNG per phase to this dir (needs matplotlib)",
+    )
     ap.add_argument("--pprof", default=None, help="write jaxpr_util pprof profile here (.pb.gz)")
     ap.add_argument("--list", action="store_true", help="list supported architectures and exit")
     args = ap.parse_args()
@@ -206,6 +211,15 @@ def main() -> int:
                     k: v for k, v in fa.items() if k != "path"
                 }
         out_json["phases"][phase] = model.to_dict()
+        if args.chart_dir:
+            import os as _os
+
+            from sgl_jax.srt.utils.roofline import chart as _chart
+
+            _os.makedirs(args.chart_dir, exist_ok=True)
+            p = _os.path.join(args.chart_dir, f"{arch}_{phase}_roofline.png")
+            _chart.roofline_chart(model, peaks, p)
+            print(f"[chart] wrote {p}")
 
     if args.json_out:
         with open(args.json_out, "w") as f:
