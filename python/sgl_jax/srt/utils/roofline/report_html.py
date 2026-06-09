@@ -426,8 +426,13 @@ function init(){
   g("legend").innerHTML=Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)";
   cv.addEventListener("mousemove",e=>{const rect=cv.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;
     let hit=null; if(LAST&&LAST._pts)for(const p of LAST._pts){if((mx-p.px)**2+(my-p.py)**2<(p.rad+5)**2){hit=p;break;}}
-    const tip=g("tip"); if(hit){const r=hit.r; tip.style.display="block";tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY+8)+"px";
-      tip.innerHTML="<b>"+r.cat+"</b> (×"+r.cnt+")<br>"+fmt(r.flops/1e12)+" TFLOP · "+fmt(r.hbm/1e9)+" GB HBM · "+fmt(r.ici/1e9)+" GB ICI<br>OI="+r.oi.toFixed(1)+" · ideal "+r.ideal.toFixed(3)+"ms · <b>"+r.bound+"</b>";}
+    const tip=g("tip"); if(hit){const r=hit.r; const ts=r.ideal/1e3; const aTF=r.flops/ts/1e12, aBW=r.hbm/ts/1e9, aICI=r.ici/ts/1e9; const cpk=(r.peak==="fp8"?P.fp8_tflops:P.bf16_tflops);
+      tip.style.display="block";tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY+8)+"px";
+      tip.innerHTML="<b>"+r.cat+"</b> (×"+r.cnt+") · <b>"+r.bound+"-bound</b><br>"+fmt(r.flops/1e12)+" TFLOP · "+fmt(r.hbm/1e9)+" GB HBM · "+fmt(r.ici/1e9)+" GB ICI · OI="+r.oi.toFixed(1)
+        +"<br>ideal "+r.ideal.toFixed(3)+" ms → achieved:"
+        +"<br>&nbsp;&nbsp;"+aTF.toFixed(0)+" TFLOP/s ("+(aTF/cpk*100).toFixed(0)+"% compute)"
+        +"<br>&nbsp;&nbsp;"+aBW.toFixed(0)+" GB/s ("+(aBW/P.hbm_gbps*100).toFixed(0)+"% HBM)"
+        +(aICI>0?("<br>&nbsp;&nbsp;"+aICI.toFixed(0)+" GB/s ("+(aICI/P.ici_gbps*100).toFixed(0)+"% ICI)"):"");}
     else tip.style.display="none";});
   cv.addEventListener("mouseleave",()=>g("tip").style.display="none");
   window.addEventListener("resize",()=>{setupCanvas(); if(LAST)draw(LAST);});
