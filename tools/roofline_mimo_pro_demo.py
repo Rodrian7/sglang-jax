@@ -62,3 +62,20 @@ for phase in ("decode", "prefill"):
     print(render_cost_views(model))
     print("\n" + render_graph_views(interp.graph_analysis(CFG, phase, PAR, PEAKS)))
     print("\n" + gjax.render_auto_graph(gjax.analyze_reference(ARCH, CFG, phase, PAR, PEAKS)))
+
+# also emit the static charts + the interactive HTML next to this run
+try:
+    import os
+
+    from sgl_jax.srt.utils.roofline import chart, report_html
+
+    outdir = os.environ.get("ROOFLINE_OUT", "/tmp")
+    for phase in ("decode", "prefill"):
+        m = descriptors.build(ARCH, CFG, phase, PAR, PEAKS)
+        chart.roofline_chart(m, PEAKS, os.path.join(outdir, f"roofline_{phase}.png"))
+    report_html.build_html_report(
+        ARCH, CFG, PEAKS, PAR, os.path.join(outdir, "roofline_interactive.html")
+    )
+    print(f"\n[artifacts] PNGs + roofline_interactive.html -> {outdir}")
+except ImportError as e:
+    print(f"\n[artifacts] skipped charts/html ({e})")

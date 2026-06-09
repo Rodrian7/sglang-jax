@@ -120,6 +120,11 @@ def main() -> int:
         default=None,
         help="write a roofline PNG per phase to this dir (needs matplotlib)",
     )
+    ap.add_argument(
+        "--html",
+        default=None,
+        help="write a self-contained INTERACTIVE roofline HTML here (live parallelism knobs)",
+    )
     ap.add_argument("--pprof", default=None, help="write jaxpr_util pprof profile here (.pb.gz)")
     ap.add_argument("--list", action="store_true", help="list supported architectures and exit")
     args = ap.parse_args()
@@ -225,6 +230,24 @@ def main() -> int:
         with open(args.json_out, "w") as f:
             json.dump(out_json, f, indent=2)
         print(f"\n[json] wrote {args.json_out}")
+    if args.html:
+        from sgl_jax.srt.utils.roofline import report_html
+
+        report_html.build_html_report(
+            arch,
+            config,
+            peaks,
+            {
+                "tp": args.tp,
+                "dp": args.dp,
+                "batch": args.batch,
+                "seq_len": args.seq_len,
+                "chunk": args.chunk,
+                "enable_sp": args.enable_sp,
+            },
+            args.html,
+        )
+        print(f"[html] wrote interactive report -> {args.html}")
     return 0
 
 

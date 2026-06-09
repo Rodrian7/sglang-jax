@@ -248,3 +248,7 @@ debug_outputs/
 .gemini/settings.json
 .gemini.md
 GEMINI.md
+
+# roofline generated artifacts
+roofline_mimo_pro_interactive.html
+roofline_mimo_pro_result.txt
