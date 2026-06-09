@@ -1,20 +1,22 @@
 """Interactive HTML roofline report.
 
-Bakes a model's config-derived constants + hardware peaks into a single
-self-contained HTML page that re-runs the (closed-form) cost model **in the
-browser**: pick the parallelism layout (tp/dp constrained to valid mesh combos),
-the quantization scheme (per-tensor / per-channel / block-wise + block size +
-W8A16/W8A8), and drag the workload knobs; the roofline, a per-op dataflow view,
-the per-category cost table and the bottleneck summary update live. No server,
-no external JS libs (vanilla + high-DPI canvas), works offline.
+Bakes a model's config-derived constants + hardware peaks (+ a one-layer jaxpr
+op/source index) into a single self-contained HTML page that re-runs the
+(closed-form) cost model **in the browser**: pick the parallelism layout (tp/dp
+constrained to valid mesh combos), the quantization scheme (per-tensor /
+per-channel / block-wise + block size + W8A16/W8A8), and drag the workload knobs;
+the roofline, a per-op dataflow view, fusion opportunities, the per-category cost
+table and the bottleneck summary update live. A jaxpr tab shows the traced op
+histogram + source lines. No server, no external JS libs (vanilla + high-DPI
+responsive canvas), works offline.
 
 The JS cost model mirrors ``descriptors._mimo_v2_family`` + ``parallelism`` +
 ``ops`` (tensor axis t = tp//dp, fused-MoE EP = devices, MoE global tokens =
 per-DP tokens * dp, SP reduce-scatter/all-gather gated on should_scatter).
-Quant model: fp8 weight = 1 byte + scale (per-tensor ~0 / per-channel 4/k /
-block 4/B^2 bytes per elem); block-wise stays bf16 MXU rate (HBM-only), while
-per-tensor/per-channel + fp8 activations reach the fp8 MXU rate. Closed-form
-roofline only (View B/C/D); jaxpr View F needs a real trace.
+Quant: fp8 weight = 1 byte + scale (per-tensor ~0 / per-channel 4/k / block
+4/B^2 per elem); block-wise stays bf16 MXU rate, per-tensor/per-channel + fp8
+acts reach the fp8 MXU rate. Closed-form roofline only; the jaxpr View F costs
+need a real trace and stay Python-side.
 """
 
 from __future__ import annotations
@@ -30,6 +32,36 @@ def _cfg(config, *names, default=None):
         if config.get(n) is not None:
             return config[n]
     return default
+
+
+def _bake_jaxpr(arch, config) -> dict | None:
+    """Trace one reference layer to a jaxpr; bake the primitive histogram + the
+    source line that emits each (shortened). None if jax / reference unavailable."""
+    try:
+        from . import descriptors, interp
+
+        ref = descriptors.reference_forward(arch, config, "decode", {"batch": 1, "chunk": 1})
+        sv = interp.structure_view(ref)
+        if sv is None:
+            return None
+
+        def short(s):
+            s = s.split(" (")[0]
+            return s.rsplit("/", 1)[-1] if "/" in s else s
+
+        def top(d, n=24):
+            return [[k, v] for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:n]]
+
+        bysrc: dict[str, int] = {}
+        for k, v in sv["by_source"].items():
+            bysrc[short(k)] = bysrc.get(short(k), 0) + v
+        return {
+            "num_eqns": sv["num_eqns"],
+            "by_primitive": top(sv["by_primitive"]),
+            "by_source": top(bysrc),
+        }
+    except Exception:
+        return None
 
 
 def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
@@ -74,6 +106,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "n_swa": combo[(True, True)] + combo[(True, False)],
         "n_moe": combo[(False, True)] + combo[(True, True)],
         "n_dense": combo[(False, False)] + combo[(True, False)],
+        "jaxpr": _bake_jaxpr(arch, config),
         "peaks": {
             "bf16_tflops": peaks.bf16_tflops,
             "fp8_tflops": peaks.fp8_tflops,
@@ -105,7 +138,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <style>
  body{font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f6f8fa;color:#1c2330}
  #wrap{display:flex;flex-wrap:wrap;gap:20px;padding:20px}
- #left{flex:0 0 300px} #right{flex:1 1 760px;min-width:680px}
+ #left{flex:0 0 300px} #right{flex:1 1 700px;min-width:560px}
  h1{font-size:17px;margin:0 0 2px} .sub{color:#667;font-size:11px;margin-bottom:14px}
  .ctl{margin:11px 0} .ctl label{display:block;color:#445;font-size:11px;margin-bottom:4px;font-weight:600}
  .ctl .v{color:#0a5;font-weight:700}
@@ -116,14 +149,14 @@ _TEMPLATE = r"""<!DOCTYPE html>
  .seg button.on{background:#2563eb;color:#fff}
  #summary{background:#fff;border:1px solid #dde;border-radius:8px;padding:12px;margin-top:10px;box-shadow:0 1px 3px #0001}
  #summary b{color:#0a5} .pill{display:inline-block;background:#eef;border-radius:5px;padding:2px 7px;margin:3px 4px 0 0;font-size:11px;color:#335}
- canvas{background:#fff;border:1px solid #dde;border-radius:8px;box-shadow:0 1px 4px #0001}
+ canvas{background:#fff;border:1px solid #dde;border-radius:8px;box-shadow:0 1px 4px #0001;display:block}
+ .panel{background:#fff;border:1px solid #dde;border-radius:8px;box-shadow:0 1px 4px #0001;padding:14px 16px;box-sizing:border-box}
  table{border-collapse:collapse;width:100%;margin-top:12px;font-size:12px;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px #0001}
  th,td{padding:4px 9px;text-align:right;border-bottom:1px solid #eef} th{color:#556;background:#f1f4f8} td.l,th.l{text-align:left}
  .tag{font-size:10px;padding:1px 5px;border-radius:4px}
  .b-HBM{background:#dbeafe;color:#1e40af} .b-ICI{background:#fce7f3;color:#9d174d} .b-compute{background:#dcfce7;color:#166534}
  #tip{position:fixed;pointer-events:none;background:#1c2330;color:#fff;border-radius:5px;padding:5px 8px;font-size:11px;display:none;z-index:9;box-shadow:0 2px 8px #0004}
  .legend{font-size:11px;color:#556;margin-top:6px}
- #df{background:#fff;border:1px solid #dde;border-radius:8px;box-shadow:0 1px 4px #0001;padding:14px 16px;width:1040px;box-sizing:border-box}
  .dfrow{display:flex;align-items:center;margin:3px 0;font-size:12px}
  .dfrow .nm{flex:0 0 168px;color:#334} .dfrow .barwrap{flex:1 1 auto;background:#f1f4f8;border-radius:4px;height:16px;margin:0 8px}
  .dfrow .bar{height:16px;border-radius:4px} .dfrow .ms{flex:0 0 130px;text-align:right;color:#556}
@@ -153,11 +186,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <div id="summary"></div>
  </div>
  <div id="right">
-  <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button></div>
+  <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button><button id="tab-fus">Fusion</button><button id="tab-jax">jaxpr ops</button></div>
   <canvas id="cv"></canvas>
-  <div id="df"></div>
+  <div id="df" class="panel"></div>
+  <div id="fus" class="panel"></div>
+  <div id="jax" class="panel"></div>
   <div class="legend" id="legend"></div>
-  <table id="tbl"><thead><tr><th class="l">op category</th><th>cnt</th><th>GFLOP</th><th>HBM MB</th><th>ICI MB</th><th>OI</th><th>ideal ms</th><th>%step</th><th>bound</th></tr></thead><tbody></tbody></table>
+  <table id="tbl"><thead><tr><th class="l">op category</th><th>cnt</th><th>TFLOP</th><th>HBM GB</th><th>ICI GB</th><th>OI</th><th>ideal ms</th><th>%step</th><th>bound</th></tr></thead><tbody></tbody></table>
  </div>
 </div>
 <div id="tip"></div>
@@ -169,15 +204,13 @@ const flops_per_s = k => (k==="fp8"?P.fp8_tflops:P.bf16_tflops)*1e12;
 const HBMBW = P.hbm_gbps*1e9, ICIBW = P.ici_gbps*1e9;
 
 // ---- quantization model (parametric) ----
-let Q={wq:"bf16", blk:128, aq:"bf16"};            // weight scheme, block size, activation
+let Q={wq:"bf16", blk:128, aq:"bf16"};
 const WROLES={qkv:1,mlp:1,experts:1,lm_head:1};   // o_proj kept bf16
 function wbytes(k,n){ if(Q.wq==="bf16") return 2*k*n;
   let sc; if(Q.wq==="per_tensor") sc=4; else if(Q.wq==="per_channel") sc=4*n;
-  else sc=4*Math.ceil(k/Q.blk)*Math.ceil(n/Q.blk);     // one fp32 scale per BxB block
-  return k*n + sc; }                                   // fp8 weight = 1 byte/elem + scale
+  else sc=4*Math.ceil(k/Q.blk)*Math.ceil(n/Q.blk);
+  return k*n + sc; }
 function abytes(m,k){ return (Q.aq==="fp8"?1:2)*m*k; }
-// fp8 MXU rate (2x) needs per-tensor/per-channel weights AND fp8 acts; block-wise
-// is forced to bf16 rate by the right-matrix tile constraint; W8A16 -> bf16 rate.
 function wpeak(){ return (Q.wq!=="bf16" && Q.wq!=="block" && Q.aq==="fp8") ? "fp8" : "bf16"; }
 
 // ---- cost primitives (mirror ops.py / descriptors.py) ----
@@ -192,7 +225,7 @@ function moe(tpd,le,d,f,role){const q=WROLES[role]&&Q.wq!=="bf16";
 function rope(m,qs,ks){return {flops:6*(qs+ks)*m, hbm:2*(qs+ks)*m*2, ici:0, peak:"bf16"};}
 function rms(m,h){return {flops:4*m*h, hbm:2*m*h*2+h*2, ici:0, peak:"bf16"};}
 function elt(m,h,ninp){return {flops:m*h, hbm:(ninp+1)*m*h*2, ici:0, peak:"bf16"};}
-function router(m,h,ne){return {flops:2*m*h*ne, hbm:m*h*2+h*ne*4+m*ne*4*5, ici:0, peak:"bf16"};} // approx; never the bound
+function router(m,h,ne){return {flops:2*m*h*ne, hbm:m*h*2+h*ne*4+m*ne*4*5, ici:0, peak:"bf16"};}
 function allreduce(msg,p){return p<=1?0:2*(p-1)/p*msg;}
 function reducescatter(msg,p){return p<=1?0:(p-1)/p*msg;}
 function resolve(s){const tp=s.tp, dp=s.dp, devices=tp; const t=Math.max(1,Math.floor(tp/dp)); return {t, ep:devices, devices, dp};}
@@ -249,7 +282,6 @@ function compute(s){
   return {rows, L, tot, tbound, Tc, Th, Ti, decode, tokens};
 }
 
-// ---- per-op dataflow chain of one representative layer ----
 function buildChain(s){
   const L=resolve(s); L.sp=s.enable_sp; const decode=s.phase==="decode";
   const tokens=decode?s.batch:s.chunk, ctx=decode?s.seq_len:s.chunk, t=L.t, ep=L.ep;
@@ -274,12 +306,12 @@ function buildChain(s){
   return ch;
 }
 
-// ---------- roofline canvas (high-DPI, light, generous top margin) ----------
-const cv=document.getElementById("cv"), cx=cv.getContext("2d"); let LAST=null; const CW=1040, CH=650;
-function setupCanvas(){const dpr=window.devicePixelRatio||1; cv.style.width=CW+"px"; cv.style.height=CH+"px";
-  cv.width=Math.round(CW*dpr); cv.height=Math.round(CH*dpr); cx.setTransform(dpr,0,0,dpr,0,0);}
-function tlabel(txt,x,y,col){const w=cx.measureText(txt).width; cx.fillStyle="rgba(255,255,255,0.88)"; cx.fillRect(x-2,y-10,w+4,13); cx.fillStyle=col||"#64748b"; cx.fillText(txt,x,y);}
-function draw(R){LAST=R; const W=CW,Hh=CH, ml=66,mr=18,mt=52,mb=48;
+// ---------- roofline canvas (high-DPI, responsive, light) ----------
+const cv=document.getElementById("cv"), cx=cv.getContext("2d"); let LAST=null; let CW=1040; const CH=640;
+function setupCanvas(){const dpr=window.devicePixelRatio||1; CW=Math.max(560, g("right").clientWidth);
+  cv.style.width=CW+"px"; cv.style.height=CH+"px"; cv.width=Math.round(CW*dpr); cv.height=Math.round(CH*dpr); cx.setTransform(dpr,0,0,dpr,0,0);}
+function tlabel(txt,x,y,col){const w=cx.measureText(txt).width; cx.fillStyle="rgba(255,255,255,0.9)"; cx.fillRect(x-2,y-10,w+4,13); cx.fillStyle=col||"#64748b"; cx.fillText(txt,x,y);}
+function draw(R){LAST=R; const W=CW,Hh=CH, ml=82,mr=20,mt=52,mb=50;
   cx.clearRect(0,0,W,Hh);
   const rows=R.rows.filter(r=>r.flops>0&&r.hbm>0);
   const ceil=(rows.some(r=>r.peak==="fp8")?P.fp8_tflops:P.bf16_tflops);
@@ -288,30 +320,32 @@ function draw(R){LAST=R; const W=CW,Hh=CH, ml=66,mr=18,mt=52,mb=48;
   let ymax=ceil*2.2, ymin=Math.min(...perfs.filter(p=>p>0),ceil)/80; if(!isFinite(ymin)||ymin<=0)ymin=ceil/1000;
   const lx=v=>ml+(Math.log10(v)-Math.log10(xmin))/(Math.log10(xmax)-Math.log10(xmin))*(W-ml-mr);
   const ly=v=>mt+(Math.log10(ymax)-Math.log10(v))/(Math.log10(ymax)-Math.log10(ymin))*(Hh-mt-mb);
-  cx.strokeStyle="#eef1f5";cx.fillStyle="#889";cx.font="11px sans-serif";cx.lineWidth=1;
-  for(let e=-3;e<=7;e++){const x=Math.pow(10,e); if(x<xmin||x>xmax)continue; cx.beginPath();cx.moveTo(lx(x),mt);cx.lineTo(lx(x),Hh-mb);cx.stroke(); cx.fillText("1e"+e,lx(x)-8,Hh-mb+14);}
-  for(let e=-3;e<=4;e++){const y=Math.pow(10,e); if(y<ymin||y>ymax)continue; cx.beginPath();cx.moveTo(ml,ly(y));cx.lineTo(W-mr,ly(y));cx.stroke(); cx.fillText("1e"+e,6,ly(y)+3);}
-  cx.fillStyle="#445";cx.font="12px sans-serif";cx.fillText("operational intensity (FLOP / HBM-byte)",W/2-110,Hh-8);
-  cx.save();cx.translate(16,Hh/2+80);cx.rotate(-Math.PI/2);cx.fillText("attainable TFLOP/s",0,0);cx.restore();
+  cx.strokeStyle="#eef1f5";cx.lineWidth=1;cx.font="11px sans-serif";
+  for(let e=-3;e<=7;e++){const x=Math.pow(10,e); if(x<xmin||x>xmax)continue; cx.beginPath();cx.moveTo(lx(x),mt);cx.lineTo(lx(x),Hh-mb);cx.stroke(); cx.fillStyle="#889";cx.textAlign="center";cx.fillText("1e"+e,lx(x),Hh-mb+15);}
+  cx.textAlign="right";
+  for(let e=-3;e<=4;e++){const y=Math.pow(10,e); if(y<ymin||y>ymax)continue; cx.beginPath();cx.moveTo(ml,ly(y));cx.lineTo(W-mr,ly(y));cx.stroke(); cx.fillStyle="#889";cx.fillText("1e"+e,ml-8,ly(y)+3);}
+  cx.textAlign="left";
+  cx.fillStyle="#445";cx.font="12px sans-serif";cx.textAlign="center";cx.fillText("operational intensity (FLOP / HBM-byte)",(ml+W-mr)/2,Hh-8);cx.textAlign="left";
+  cx.save();cx.translate(20,(mt+Hh-mb)/2);cx.rotate(-Math.PI/2);cx.textAlign="center";cx.fillText("attainable TFLOP/s",0,0);cx.restore();cx.textAlign="left";
   cx.strokeStyle="#334155";cx.lineWidth=2.5;cx.beginPath();let first=true;
   for(let i=0;i<=160;i++){const x=xmin*Math.pow(xmax/xmin,i/160); const y=Math.min(x*HBMBW/1e12,ceil); const px=lx(x),py=ly(y); if(first){cx.moveTo(px,py);first=false;}else cx.lineTo(px,py);} cx.stroke();
   cx.setLineDash([6,4]);cx.strokeStyle="#94a3b8";cx.lineWidth=1.2;
   cx.beginPath();cx.moveTo(ml,ly(P.bf16_tflops));cx.lineTo(W-mr,ly(P.bf16_tflops));cx.stroke();
   cx.beginPath();cx.moveTo(ml,ly(P.fp8_tflops));cx.lineTo(W-mr,ly(P.fp8_tflops));cx.stroke();
   cx.setLineDash([]); cx.font="11px sans-serif";
-  tlabel("bf16 "+P.bf16_tflops.toFixed(0)+" TF/s", W-mr-118, ly(P.bf16_tflops)-4);
-  tlabel("fp8 "+P.fp8_tflops.toFixed(0)+" TF/s", W-mr-118, ly(P.fp8_tflops)-4);
-  const ridge=ceil/(HBMBW/1e12); if(ridge>xmin&&ridge<xmax){cx.strokeStyle="#cbd5e1";cx.lineWidth=1;cx.beginPath();cx.moveTo(lx(ridge),mt);cx.lineTo(lx(ridge),Hh-mb);cx.stroke(); tlabel("ridge OI="+ridge.toFixed(0), lx(ridge)+4, mt-6, "#94a3b8");}
+  tlabel("bf16 "+P.bf16_tflops.toFixed(0)+" TF/s", ml+8, ly(P.bf16_tflops)-4);
+  tlabel("fp8 "+P.fp8_tflops.toFixed(0)+" TF/s", ml+8, ly(P.fp8_tflops)-4);
+  const ridge=ceil/(HBMBW/1e12); if(ridge>xmin&&ridge<xmax){cx.strokeStyle="#cbd5e1";cx.lineWidth=1;cx.beginPath();cx.moveTo(lx(ridge),mt);cx.lineTo(lx(ridge),Hh-mb);cx.stroke(); tlabel("ridge OI="+ridge.toFixed(0), Math.min(lx(ridge)+4, W-mr-86), mt-6, "#94a3b8");}
   const smax=Math.max(...rows.map(r=>r.ideal))||1; R._pts=[];
   for(const r of rows){const x=r.oi, y=r.flops/(r.ideal/1e3)/1e12; const px=lx(x),py=ly(y); const rad=6+15*(r.ideal/smax);
     cx.fillStyle=CAT[r.cat]||"#888";
     if(r.bound==="ICI"){cx.save();cx.translate(px,py);cx.rotate(Math.PI/4);cx.lineWidth=3.5;cx.strokeStyle=CAT[r.cat]||"#888";cx.beginPath();cx.moveTo(-rad,0);cx.lineTo(rad,0);cx.moveTo(0,-rad);cx.lineTo(0,rad);cx.stroke();cx.restore();}
     else{cx.strokeStyle="#fff";cx.lineWidth=1.5;cx.beginPath();cx.arc(px,py,rad,0,7);cx.fill();cx.stroke();}
     R._pts.push({px,py,rad,r});
-    if(r.ideal>0.03*smax){cx.fillStyle="#1c2330";cx.font="11px sans-serif";cx.fillText(r.cat,px+rad+4,py-rad-2);}
+    if(r.ideal>0.03*smax){cx.fillStyle="#1c2330";cx.font="11px sans-serif";const tx=px+rad+4>W-mr-50?px-rad-4-cx.measureText(r.cat).width:px+rad+4;cx.fillText(r.cat,tx,py+4);}
   }
 }
-function fmt(x,d){d=d===undefined?1:d; return Math.abs(x)>=1000?(x/1000).toFixed(d)+"k":x.toFixed(d);}
+function fmt(x){const a=Math.abs(x); if(a===0)return "0"; if(a>=100)return x.toFixed(0); if(a>=1)return x.toFixed(1); if(a>=0.01)return x.toFixed(2); if(a>=0.0001)return x.toFixed(4); return x.toExponential(1);}
 function renderDataflow(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
   let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one "+(D.n_moe>0?"full-attn + MoE":"dense")+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
@@ -323,13 +357,35 @@ function renderDataflow(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o
   }
   const tot=ch.reduce((a,o)=>a+o.ms,0);
   h+="<div style='margin-top:8px;font-size:12px;color:#334'><b>layer Σ ideal ≈ "+tot.toFixed(3)+" ms</b> (serial; cross-op overlap not modelled)</div>";
-  document.getElementById("df").innerHTML=h;
+  g("df").innerHTML=h;
 }
-function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s);
-  let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e9)+"</td><td>"+fmt(r.hbm/1e6)+"</td><td>"+fmt(r.ici/1e6)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
+function renderFusion(s){const decode=s.phase==="decode"; const tokens=decode?s.batch:s.chunk;
+  const H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
+  const C=[["input_layernorm","qkv_proj","RMSNorm → matmul prologue",H,attnN],
+    ["qkv_proj","rope","RoPE → matmul epilogue",qsz,attnN],
+    ["rope","attention","RoPE → fold into attention-kernel prologue",qsz,attnN],
+    ["o_proj","attn_residual_add","residual add → matmul epilogue",H,attnN],
+    ["post_attn_layernorm",(D.n_moe>0?"router_gate":"gate_up_proj"),"RMSNorm → matmul prologue",H,attnN]];
+  if(D.n_moe>0) C.push(["experts","moe_residual_add","residual add → fold into MoE-kernel epilogue",H,D.n_moe]);
+  else C.push(["gate_up_proj","silu","SiLU → matmul epilogue",D.DENSE_F,D.n_dense],["silu","down_proj","SiLU → matmul prologue",D.DENSE_F,D.n_dense]);
+  const rows=C.map(c=>({p:c[0],q:c[1],r:c[2],saved:tokens*c[3]*2*c[4]})).sort((a,b)=>b.saved-a.saved);
+  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>structural single-producer→consumer fusions · HBM saved = the intermediate activation round-trip removed (per device, this phase, summed over layers). Whether XLA already fused is unknown — verify with a trace.</div>";
+  h+="<table style='margin-top:0'><thead><tr><th class='l'>producer → consumer</th><th class='l'>fusion</th><th>HBM saved (GB)</th></tr></thead><tbody>";
+  for(const r of rows) h+="<tr><td class='l'>"+r.p+" → "+r.q+"</td><td class='l'>"+r.r+"</td><td>"+fmt(r.saved/1e9)+"</td></tr>";
+  g("fus").innerHTML=h+"</tbody></table>";
+}
+function renderJaxpr(){const J=D.jaxpr; if(!J){g("jax").innerHTML="<div style='color:#a55'>jaxpr structure unavailable (report built without jax).</div>";return;}
+  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one reference layer traced to a jaxpr ("+J.num_eqns+" equations). Primitive histogram + the source line that emits each — from the descriptor's reference forward (a faithful stand-in, not the production module's exact lines). Static (does not depend on the knobs).</div>";
+  h+="<div style='display:flex;gap:28px;flex-wrap:wrap'>";
+  h+="<div style='flex:0 0 auto'><b>by primitive</b><table style='width:auto'><tbody>"+J.by_primitive.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
+  h+="<div style='flex:1 1 320px'><b>by source line</b><table style='width:auto'><tbody>"+J.by_source.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
+  g("jax").innerHTML=h+"</div>";
+}
+function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s); renderFusion(s);
+  let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e12)+"</td><td>"+fmt(r.hbm/1e9)+"</td><td>"+fmt(r.ici/1e9)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
   document.querySelector("#tbl tbody").innerHTML=tb;
-  const L=R.L; const qstr = (Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16"))) + (Q.wq!=="bf16"?(" → "+wpeak()+" MXU"+(Q.wq==="block"?" (block-wise capped)":"")):"");
-  document.getElementById("summary").innerHTML =
+  const L=R.L; const qstr=(Q.wq==="bf16"?"bf16":("fp8 "+(Q.wq==="block"?("block-"+Q.blk):Q.wq)+" "+(Q.aq==="fp8"?"W8A8":"W8A16")))+(Q.wq!=="bf16"?(" → "+wpeak()+" MXU"+(Q.wq==="block"?" (block-wise capped)":"")):"");
+  g("summary").innerHTML =
    "<b>mesh</b> data="+L.dp+" × tensor="+L.t+" = "+L.devices+" devices &nbsp; <b>EP</b>="+L.ep+(s.enable_sp?" &nbsp;<span class='pill'>+SP</span>":"")+" &nbsp;<span class='pill'>"+qstr+"</span>"
    +"<br><b>"+(R.decode?"decode":"prefill")+"</b> · tokens/DP="+R.tokens+" · MoE global="+(R.tokens*L.dp)
    +"<br><b>bound: <span class='tag b-"+R.tbound+"'>"+R.tbound+"</span></b> &nbsp; step ≈ "+R.tot.toFixed(2)+" ms"
@@ -347,9 +403,10 @@ function fillDp(){const tp=+g("tp").value; const cur=+g("dp").value; const opts=
 function syncQuant(){Q.wq=g("wq").value; Q.blk=+g("blk").value; Q.aq=g("aq").value; g("blk").disabled=(Q.wq!=="block");}
 function syncLabels(){g("tv").textContent="t="+Math.max(1,Math.floor(g("tp").value/g("dp").value));
   g("batchv").textContent=g("batch").value; g("seqv").textContent=g("seq_len").value; g("chunkv").textContent=g("chunk").value;}
-function setTab(df){g("tab-rf").className=df?"":"on"; g("tab-df").className=df?"on":""; cv.style.display=df?"none":"block"; g("df").style.display=df?"block":"none";}
+const TABS={rf:"cv",df:"df",fus:"fus",jax:"jax"};
+function setTab(name){for(const k in TABS){g("tab-"+k).className=(k===name)?"on":""; g(TABS[k]).style.display=(k===name)?"block":"none";} if(name==="rf"&&LAST)draw(LAST);}
 function init(){
-  g("arch").textContent=D.arch; setupCanvas();
+  g("arch").textContent=D.arch;
   const d=D.defaults;
   const tpopts=divisors(D.NEXP).filter(x=>x<=1024 && validDp(x).length>0);
   g("tp").innerHTML=tpopts.map(x=>"<option value='"+x+"'>"+x+"</option>").join("");
@@ -364,15 +421,16 @@ function init(){
   g("sp").addEventListener("change",render);
   g("ph-decode").onclick=()=>{PHASE="decode";g("ph-decode").className="on";g("ph-prefill").className="";render();};
   g("ph-prefill").onclick=()=>{PHASE="prefill";g("ph-prefill").className="on";g("ph-decode").className="";render();};
-  g("tab-rf").onclick=()=>setTab(false); g("tab-df").onclick=()=>setTab(true); setTab(false);
+  for(const k in TABS) g("tab-"+k).onclick=()=>setTab(k);
   g("legend").innerHTML=Object.keys(CAT).map(c=>"<span style='color:"+CAT[c]+"'>●</span> "+c).join(" &nbsp; ")+" &nbsp; ✕ = ICI-bound (below roof)";
   cv.addEventListener("mousemove",e=>{const rect=cv.getBoundingClientRect();const mx=e.clientX-rect.left,my=e.clientY-rect.top;
     let hit=null; if(LAST&&LAST._pts)for(const p of LAST._pts){if((mx-p.px)**2+(my-p.py)**2<(p.rad+5)**2){hit=p;break;}}
     const tip=g("tip"); if(hit){const r=hit.r; tip.style.display="block";tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY+8)+"px";
-      tip.innerHTML="<b>"+r.cat+"</b> (×"+r.cnt+")<br>"+fmt(r.flops/1e9)+" GFLOP · "+fmt(r.hbm/1e6)+" MB HBM · "+fmt(r.ici/1e6)+" MB ICI<br>OI="+r.oi.toFixed(1)+" · ideal "+r.ideal.toFixed(3)+"ms · <b>"+r.bound+"</b>";}
+      tip.innerHTML="<b>"+r.cat+"</b> (×"+r.cnt+")<br>"+fmt(r.flops/1e12)+" TFLOP · "+fmt(r.hbm/1e9)+" GB HBM · "+fmt(r.ici/1e9)+" GB ICI<br>OI="+r.oi.toFixed(1)+" · ideal "+r.ideal.toFixed(3)+"ms · <b>"+r.bound+"</b>";}
     else tip.style.display="none";});
   cv.addEventListener("mouseleave",()=>g("tip").style.display="none");
-  syncLabels(); render();
+  window.addEventListener("resize",()=>{setupCanvas(); if(LAST)draw(LAST);});
+  setupCanvas(); renderJaxpr(); syncLabels(); render(); setTab("rf");
 }
 init();
 </script></body></html>"""
