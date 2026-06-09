@@ -47,7 +47,7 @@ def main():
 
     import jax
 
-    from sgl_jax.srt.utils.roofline import parallelism, trace_analyze, trace_report_html
+    from sgl_jax.srt.utils.roofline import parallelism, report_html, trace_analyze
     from sgl_jax.srt.utils.roofline.forward_jaxpr_dump import (
         dump_closed_jaxpr,
         extract_jaxpr_records,
@@ -99,10 +99,19 @@ def main():
 
     if args.html:
         records = records_by.get("prefill") or next(iter(records_by.values()))
-        os.makedirs(os.path.dirname(os.path.abspath(args.html)), exist_ok=True)
-        trace_report_html.build_trace_report(
-            arch, config, layout, results, records, peaks, args.html
+        codepath = trace_analyze.code_path_index(records, config)
+        # interactive report (live knobs + Dataflow + Fusion) grounded in the real
+        # trace's code-path + kernel tabs; defaults seed the knobs at this layout.
+        defaults = dict(
+            tp=args.tp,
+            dp=args.dp,
+            batch=256,
+            seq_len=args.seq_len,
+            chunk=256,
+            enable_sp=args.enable_sp,
         )
+        os.makedirs(os.path.dirname(os.path.abspath(args.html)), exist_ok=True)
+        report_html.build_html_report(arch, config, peaks, defaults, args.html, codepath=codepath)
         print(f"\nHTML report -> {args.html}")
 
 

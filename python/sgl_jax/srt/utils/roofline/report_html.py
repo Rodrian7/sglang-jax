@@ -146,8 +146,11 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
     }
 
 
-def build_html_report(arch, config, peaks: HardwarePeaks, defaults: dict, out_path: str) -> str:
+def build_html_report(
+    arch, config, peaks: HardwarePeaks, defaults: dict, out_path: str, codepath: dict | None = None
+) -> str:
     data = _bake(arch, config, peaks, defaults)
+    data["codepath"] = codepath  # real per-op code-path index + Pallas kernels from a trace
     html = _TEMPLATE.replace("__DATA__", json.dumps(data))
     with open(out_path, "w") as f:
         f.write(html)
@@ -207,11 +210,12 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <div id="summary"></div>
  </div>
  <div id="right">
-  <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button><button id="tab-fus">Fusion</button><button id="tab-jax">jaxpr ops</button></div>
+  <div class="seg" style="margin-bottom:10px"><button id="tab-rf" class="on">Roofline</button><button id="tab-df">Dataflow</button><button id="tab-fus">Fusion</button><button id="tab-cp">Code path</button><button id="tab-kn">Kernels</button></div>
   <canvas id="cv"></canvas>
   <div id="df" class="panel"></div>
   <div id="fus" class="panel"></div>
-  <div id="jax" class="panel"></div>
+  <div id="cp" class="panel"></div>
+  <div id="kn" class="panel"></div>
   <div class="legend" id="legend"></div>
   <table id="tbl"><thead><tr><th class="l">op category</th><th>cnt</th><th>TFLOP</th><th>HBM GB</th><th>ICI GB</th><th>OI</th><th>ideal ms</th><th>%step</th><th>bound</th></tr></thead><tbody></tbody></table>
  </div>
@@ -395,13 +399,19 @@ function renderFusion(s){const decode=s.phase==="decode"; const tokens=decode?s.
   for(const r of rows) h+="<tr><td class='l'>"+r.p+" → "+r.q+"</td><td class='l'>"+r.r+"</td><td>"+fmt(r.saved/1e9)+"</td></tr>";
   g("fus").innerHTML=h+"</tbody></table>";
 }
-function renderJaxpr(){const J=D.jaxpr; if(!J){g("jax").innerHTML="<div style='color:#a55'>jaxpr structure unavailable (report built without jax).</div>";return;}
-  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>one reference layer traced to a jaxpr ("+J.num_eqns+" equations). Left: how many of each <b>primitive</b> the layer lowers to. Right: how many primitives each <b>logical op</b> emits — keyed by the reference forward's function name (rms_norm / linear / _pallas_id / layer), since the trace runs the descriptor's stand-in, not the production module (so these are op names, not real-module line numbers). Static.</div>";
-  h+="<div style='display:flex;gap:28px;flex-wrap:wrap'>";
-  h+="<div style='flex:0 0 auto'><b>by primitive</b><table style='width:auto'><tbody>"+J.by_primitive.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
-  h+="<div style='flex:0 0 auto'><b>by logical op (reference fn)</b><table style='width:auto'><tbody>"+J.by_source.map(p=>"<tr><td>"+p[1]+"</td><td class='l'>"+p[0]+"</td></tr>").join("")+"</tbody></table></div>";
-  g("jax").innerHTML=h+"</div>";
-}
+function renderCodepath(){const C=D.codepath; const el=g("cp"); if(!C){el.innerHTML="<div style='color:#a55'>code-path index unavailable (HTML built without a trace).</div>";return;}
+  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>The REAL forward, traced ("+(C.num_eqns_all||0).toLocaleString()+" jaxpr equations, "+(C.num_eqns_top||0).toLocaleString()+" top-level). Each op group → its actual <b>models/*.py</b> call chain (innermost frame = op kind, outer = role). Layer counts are emergent from the trace, not a hand-written pattern.</div>";
+  h+="<table><thead><tr><th class='l'>role</th><th class='l'>category</th><th>count</th><th class='l'>code path (innermost ← caller)</th></tr></thead><tbody>";
+  for(const r of (C.gemms||[])){const chain=(r.stack||[]).slice(0,5).map((f,i)=>i===0?("<b>"+f+"</b>"):f).join(" <span style='color:#94a3b8'>←</span> ");
+    h+="<tr><td class='l'>"+r.role+"</td><td class='l'><span style='color:"+(CAT[r.category]||'#888')+"'>●</span> "+r.category+"</td><td>"+r.count+"</td><td class='l' style='font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#475569'>"+chain+"</td></tr>";}
+  el.innerHTML=h+"</tbody></table>";}
+function renderKernels(){const C=D.codepath; const el=g("kn"); if(!C){el.innerHTML="";return;}
+  let h="<div style='font-size:11px;color:#667;margin-bottom:8px'>Pallas kernels found in the traced forward — real kernel names + per-device input/output avals + the shard_map call site. RPA-v3 / fused-MoE-v2 declare no cost_estimate, so the roofline prices them from their reference math.</div>";
+  for(const k of (C.kernels||[])){const av=a=>(a||[]).map(x=>x.dtype+"["+x.shape.join(",")+"]").join(", ");
+    const col=k.kind==="attention"?CAT.attention:(k.kind==="moe"?CAT.moe:"#888");
+    h+="<div style='margin:4px 0;padding:8px 10px;border:1px solid #e6e9ef;border-radius:8px'><div style='font-weight:600;color:#0f172a'><span style='color:"+col+"'>●</span> "+k.name+" <span class='pill'>×"+k.count+"</span> <span class='pill'>"+k.kind+"</span></div>"
+      +"<div style='font-family:ui-monospace,Menlo,monospace;color:#667;font-size:11px;margin-top:3px'>in: "+av(k.in_avals)+"<br>out: "+av(k.out_avals)+"<br>@ "+(k.ctx||"")+"</div></div>";}
+  el.innerHTML=h;}
 function render(){const s=state(); const R=compute(s); draw(R); renderDataflow(s); renderFusion(s);
   let tb=""; for(const r of R.rows){ tb+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==="fp8"?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.cnt+"</td><td>"+fmt(r.flops/1e12)+"</td><td>"+fmt(r.hbm/1e9)+"</td><td>"+fmt(r.ici/1e9)+"</td><td>"+r.oi.toFixed(1)+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td></tr>";}
   document.querySelector("#tbl tbody").innerHTML=tb;
@@ -425,7 +435,7 @@ function syncQuant(){Q.wq=g("wq").value; Q.blk=+g("blk").value; Q.aq=g("aq").val
 function syncLabels(){g("tv").textContent="t="+Math.max(1,Math.floor(g("tp").value/g("dp").value));
   g("batchv").textContent=g("batch").value; g("seqv").textContent=g("seq_len").value; g("chunkv").textContent=g("chunk").value;}
 function syncPhaseCtl(){const dec=PHASE==="decode"; g("ctl-batch").style.display=dec?"block":"none"; g("ctl-seq").style.display=dec?"block":"none"; g("ctl-chunk").style.display=dec?"none":"block";}
-const TABS={rf:"cv",df:"df",fus:"fus",jax:"jax"};
+const TABS={rf:"cv",df:"df",fus:"fus",cp:"cp",kn:"kn"};
 function setTab(name){for(const k in TABS){g("tab-"+k).className=(k===name)?"on":""; g(TABS[k]).style.display=(k===name)?"block":"none";} if(name==="rf"&&LAST)draw(LAST);}
 function init(){
   g("arch").textContent=D.arch;
@@ -458,7 +468,7 @@ function init(){
     else tip.style.display="none";});
   cv.addEventListener("mouseleave",()=>g("tip").style.display="none");
   window.addEventListener("resize",()=>{setupCanvas(); if(LAST)draw(LAST);});
-  setupCanvas(); renderJaxpr(); syncLabels(); syncPhaseCtl(); render(); setTab("rf");
+  setupCanvas(); renderCodepath(); renderKernels(); syncLabels(); syncPhaseCtl(); render(); setTab("rf");
 }
 init();
 </script></body></html>"""
