@@ -317,10 +317,13 @@ def analyze_trace(
     if moe_kernels:
         n_moe = len(moe_kernels)
         local_experts = NEXP / ep
-        for p in moe_kernels[:1]:  # read dims from one kernel's weight aval
+        for p in moe_kernels[:1]:  # read #local experts from a weight aval [E, d, f]
             for a in p.get("in_avals", []):
-                if a and len(a["shape"]) == 3 and a["shape"][0] <= NEXP:
-                    local_experts = a["shape"][0]
+                if not a or len(a["shape"]) != 3:
+                    continue
+                e0, d1, d2 = a["shape"]
+                if e0 <= NEXP and {d1, d2} <= {H, MOEF} and d1 >= MOEF:
+                    local_experts = e0
                     break
         moe_tokens = tokens_pd * dp  # full-mesh EP pools all DP groups
         tokens_per_dev = max(1, moe_tokens * TOPK // ep)
@@ -345,21 +348,7 @@ def analyze_trace(
         )
         rows.append(op)
 
-    # ---- norm / rope / router-softmax / elementwise: counts from the trace
-    file_groups = defaultdict(lambda: {"count": 0, "src": ""})
-    for e in top:
-        prim = e["prim"]
-        stack = e.get("source_stack", []) or []
-        inner = stack[0] if stack else (e.get("source", "") or "")
-        if "layernorm.py" in inner and prim in ("rsqrt", "mul"):
-            key = "norm"
-        elif "embeddings.py" in inner and prim in ("sin", "cos"):
-            key = "rope"
-        else:
-            continue
-        g = file_groups[key]
-        g["count"] += 1
-        g["src"] = inner
+    # ---- norm / rope / elementwise residuals: counts from the trace
     # norms: count rsqrt occurrences = number of RMSNorms
     n_norm = sum(1 for e in top if e["prim"] == "rsqrt" and "layernorm" in (e.get("source") or ""))
     if n_norm:
@@ -379,6 +368,26 @@ def analyze_trace(
         op.count = n_rope
         op.flops = int(op.flops * n_rope / t)
         op.hbm_bytes = int(op.hbm_bytes * n_rope / t)
+        rows.append(op)
+
+    # residual adds (2 per decoder layer) + dense SiLU -> "other"
+    n_layers = attn_full + attn_swa
+    n_dense = max(0, n_layers - len(moe_kernels))
+    if n_layers:
+        op = ops.to_op(
+            ops.elementwise(tokens_pd, H), f"residualx{2*n_layers}", "other", source="residual add"
+        )
+        op.count = 2 * n_layers
+        op.flops *= 2 * n_layers
+        op.hbm_bytes *= 2 * n_layers
+        rows.append(op)
+    if n_dense:
+        op = ops.to_op(
+            ops.elementwise(tokens_pd, DENSE_F), f"silux{n_dense}", "other", source="MLP silu"
+        )
+        op.count = n_dense
+        op.flops *= n_dense
+        op.hbm_bytes *= n_dense
         rows.append(op)
 
     meta = dict(
