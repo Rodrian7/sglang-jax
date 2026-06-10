@@ -2252,3 +2252,433 @@ def eagle3_spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
         speculative_num_draft_tokens=n,
         target_logits=target_logits_out,
     )
+
+
+# ===========================================================================
+# Fused EAGLE3 Prefill: target_extend + argmax + draft_extend + topk in 1 JIT
+# ===========================================================================
+
+
+def _build_fused_eagle3_prefill_jit(topk, mesh):
+    """Build a single JIT that fuses target-extend + sample + draft-extend + topk."""
+    from sgl_jax.srt.speculative.eagle_draft_worker import topk_probs_from_logits
+
+    @partial(
+        jax.jit,
+        donate_argnames=["target_memory_pools", "draft_memory_pools"],
+        static_argnames=[
+            "target_model_state_def",
+            "draft_model_state_def",
+            "topk",
+        ],
+    )
+    def fused_eagle3_prefill(
+        # Target model
+        target_model_def,
+        target_model_state_def,
+        target_leaves,
+        target_forward_batch,
+        target_memory_pools,
+        target_logits_metadata,
+        # Draft model
+        draft_model_def,
+        draft_model_state_def,
+        draft_leaves,
+        draft_forward_batch,
+        draft_memory_pools,
+        draft_logits_metadata,
+        # Extra
+        last_token_offsets,
+        *,
+        topk,
+    ):
+        rep = NamedSharding(mesh, P())
+
+        def _rep(x):
+            if x is None:
+                return x
+            return jax.sharding.reshard(x, rep)
+
+        # Phase 1: Target model forward (EXTEND, CaptureHiddenMode.FULL)
+        target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
+        target_model = nnx.merge(target_model_def, target_state)
+        target_output, target_pool_updates, _, _ = target_model(
+            target_forward_batch, target_memory_pools, target_logits_metadata
+        )
+
+        # Phase 2: Greedy sampling — argmax
+        next_token_ids = jnp.argmax(target_output.next_token_logits, axis=-1).astype(
+            jnp.int32
+        )
+        next_token_ids = _rep(next_token_ids)
+
+        # Phase 3: Prepare draft extend inputs on-device
+        # Reshard input_ids to replicated for scatter, then set sampled tokens
+        draft_input_ids = jax.sharding.reshard(draft_forward_batch.input_ids, rep)
+        draft_forward_batch.input_ids = draft_input_ids.at[
+            last_token_offsets
+        ].set(next_token_ids)
+        draft_forward_batch.spec_info.hidden_states = target_output.hidden_states
+
+        # Phase 4: Draft model forward (EXTEND, CaptureHiddenMode.LAST)
+        draft_state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_leaves)
+        draft_model = nnx.merge(draft_model_def, draft_state)
+        draft_output, draft_pool_updates, _, _ = draft_model(
+            draft_forward_batch, draft_memory_pools, draft_logits_metadata
+        )
+
+        # Phase 5: topk_probs_from_logits on draft logits
+        draft_logits = _rep(draft_output.next_token_logits)
+        topk_p, topk_index = topk_probs_from_logits(draft_logits, topk)
+        draft_hidden = _rep(draft_output.hidden_states)
+
+        return (
+            next_token_ids,
+            target_pool_updates,
+            draft_pool_updates,
+            topk_p,
+            topk_index,
+            draft_hidden,
+        )
+
+    return fused_eagle3_prefill
+
+
+def _build_eagle3_prefill_packed(
+    model_worker_batch,
+    draft_mr,
+    target_mr,
+    spec_worker,
+):
+    """Build target + draft ForwardBatches for prefill with single batched H2D."""
+    from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
+    from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardBatch,
+        ForwardMode,
+    )
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+    from sgl_jax.srt.utils.jax_utils import device_array
+
+    mesh = target_mr.mesh
+    data_sharding = NamedSharding(mesh, P("data"))
+    bs = len(model_worker_batch.seq_lens)
+    total_tokens = len(model_worker_batch.input_ids)
+    hidden_size = spec_worker.target_worker.model_config.hidden_size
+    sel = model_worker_batch.logits_indices_selector
+
+    all_np = {}
+
+    # ===== Phase A: Target extend fields =====
+    all_np["t_input_ids"] = np.asarray(model_worker_batch.input_ids, dtype=np.int32)
+    all_np["t_seq_lens"] = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
+    all_np["t_out_cache_loc"] = np.asarray(model_worker_batch.out_cache_loc, dtype=np.int32)
+    all_np["t_positions"] = np.asarray(model_worker_batch.positions, dtype=np.int32)
+    all_np["t_req_pool_indices"] = np.asarray(
+        model_worker_batch.req_pool_indices, dtype=np.int32
+    )
+    all_np["t_cache_loc"] = np.asarray(model_worker_batch.cache_loc, dtype=np.int32)
+    all_np["t_extend_prefix_lens"] = np.asarray(
+        model_worker_batch.extend_prefix_lens, dtype=np.int32
+    )
+    all_np["t_extend_seq_lens"] = np.asarray(
+        model_worker_batch.extend_seq_lens, dtype=np.int32
+    )
+    all_np["t_lm_extend_seq_lens"] = all_np["t_extend_seq_lens"]
+    all_np["t_lm_logits_indices"] = np.asarray(
+        model_worker_batch.logits_indices, dtype=np.int32
+    )
+
+    # Target forward_metadata (attention)
+    t_fwd_np = target_mr.attn_backend.get_forward_metadata(
+        model_worker_batch, return_numpy=True
+    )
+    for k, v in t_fwd_np.items():
+        if v is not None:
+            all_np[f"t_fm_{k}"] = np.asarray(v, dtype=np.int32)
+
+    # ===== Phase B: Draft extend fields =====
+    # Left-shift input_ids per request, placeholder 0 at last position
+    draft_input_ids = np.empty(total_tokens, dtype=np.int32)
+    extend_seq_lens = model_worker_batch.extend_seq_lens
+    dp_size = model_worker_batch.dp_size
+    per_dp_bs = model_worker_batch.per_dp_bs_size
+    per_dp_tok = total_tokens // dp_size
+
+    last_token_offsets_list = []
+    for dp_rank in range(dp_size):
+        pt = dp_rank * per_dp_tok
+        for slot_in_rank in range(per_dp_bs):
+            slot = dp_rank * per_dp_bs + slot_in_rank
+            ext_len = int(extend_seq_lens[slot])
+            if ext_len == 0:
+                last_token_offsets_list.append(0)
+                continue
+            src = model_worker_batch.input_ids[pt : pt + ext_len]
+            draft_input_ids[pt : pt + ext_len - 1] = src[1:]
+            draft_input_ids[pt + ext_len - 1] = 0  # placeholder
+            last_token_offsets_list.append(pt + ext_len - 1)
+            pt += ext_len
+
+    last_token_offsets_np = np.array(last_token_offsets_list, dtype=np.int32)
+    all_np["d_input_ids"] = draft_input_ids
+    all_np["d_last_token_offsets"] = last_token_offsets_np
+
+    # Draft extend uses same seq_lens, positions, etc as target
+    # (the draft model processes the same sequence structure)
+    all_np["d_seq_lens"] = all_np["t_seq_lens"].copy()
+    all_np["d_positions"] = all_np["t_positions"].copy()
+    all_np["d_req_pool_indices"] = all_np["t_req_pool_indices"].copy()
+    all_np["d_out_cache_loc"] = np.asarray(model_worker_batch.out_cache_loc, dtype=np.int32)
+    all_np["d_cache_loc"] = np.asarray(model_worker_batch.cache_loc, dtype=np.int32)
+    all_np["d_extend_prefix_lens"] = all_np["t_extend_prefix_lens"].copy()
+    all_np["d_extend_seq_lens"] = all_np["t_extend_seq_lens"].copy()
+    all_np["d_lm_extend_seq_lens"] = all_np["d_extend_seq_lens"]
+    all_np["d_lm_logits_indices"] = all_np["t_lm_logits_indices"].copy()
+
+    # Draft forward_metadata (eagle attention for extend)
+    d_fwd_np = draft_mr.attn_backend.get_eagle_forward_metadata(
+        model_worker_batch, return_numpy=True
+    )
+    for k, v in d_fwd_np.items():
+        if v is not None:
+            all_np[f"d_fm_{k}"] = np.asarray(v, dtype=np.int32)
+
+    # ===== Single batched H2D transfer =====
+    blob, keys, sizes = _pack_int32_arrays(all_np)
+    dev_blob = device_array(blob, sharding=data_sharding)
+    D = _unpack_int32_arrays(dev_blob, keys, sizes)
+
+    # ===== Assemble target forward metadata =====
+    t_meta = FlashAttentionMetadata()
+    t_meta.custom_mask = None
+    t_meta.cu_q_lens = D["t_fm_cu_q_lens"]
+    t_meta.cu_kv_lens = D["t_fm_cu_kv_lens"]
+    t_meta.page_indices = D["t_fm_page_indices"]
+    t_meta.swa_page_indices = D.get("t_fm_swa_page_indices")
+    t_meta.seq_lens = D["t_fm_seq_lens"]
+    t_meta.distribution = D["t_fm_distribution"]
+    target_mr.attn_backend.forward_metadata = t_meta
+
+    # ===== Assemble draft forward metadata =====
+    d_meta = FlashAttentionMetadata()
+    d_meta.custom_mask = None
+    d_meta.cu_q_lens = D["d_fm_cu_q_lens"]
+    d_meta.cu_kv_lens = D["d_fm_cu_kv_lens"]
+    d_meta.page_indices = D["d_fm_page_indices"]
+    d_meta.seq_lens = D["d_fm_seq_lens"]
+    d_meta.distribution = D["d_fm_distribution"]
+    draft_mr.attn_backend.forward_metadata = d_meta
+
+    expert_loc = get_global_expert_location_metadata()
+
+    # ===== Assemble target ForwardBatch =====
+    target_forward_batch = ForwardBatch(
+        bid=model_worker_batch.bid,
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=bs,
+        input_ids=D["t_input_ids"],
+        seq_lens=D["t_seq_lens"],
+        out_cache_loc=D["t_out_cache_loc"],
+        positions=D["t_positions"],
+        req_pool_indices=D["t_req_pool_indices"],
+        cache_loc=D["t_cache_loc"],
+        extend_prefix_lens=D["t_extend_prefix_lens"],
+        extend_seq_lens=D["t_extend_seq_lens"],
+        attn_backend=target_mr.attn_backend,
+        spec_info=None,
+        spec_algorithm=model_worker_batch.spec_algorithm,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        expert_location_metadata=expert_loc,
+    )
+
+    # ===== Assemble target LogitsMetadata =====
+    target_logits_metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        extend_return_logprob=False,
+        extend_return_top_logprob=False,
+        extend_token_ids_logprob=False,
+        extend_seq_lens=D["t_lm_extend_seq_lens"],
+        logits_indices=D["t_lm_logits_indices"],
+        accept_lens=None,
+        extend_seq_lens_cpu=None,
+        extend_logprob_start_lens_cpu=None,
+        extend_logprob_pruned_lens_cpu=None,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_input_logprob_token_ids_device=None,
+    )
+
+    # ===== Assemble draft ForwardBatch =====
+    draft_spec_info = EagleDraftInput()
+    # Cache the zeros placeholder to avoid per-call convert_element_type + broadcast_in_dim JIT ops
+    _ph_key = (total_tokens, hidden_size)
+    if not hasattr(spec_worker, "_prefill_ph") or spec_worker._prefill_ph_key != _ph_key:
+        spec_worker._prefill_ph = jnp.zeros(
+            (total_tokens, hidden_size), dtype=jnp.bfloat16
+        )
+        spec_worker._prefill_ph_key = _ph_key
+    draft_spec_info.hidden_states = spec_worker._prefill_ph
+    draft_spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+
+    draft_forward_batch = ForwardBatch(
+        bid=model_worker_batch.bid,
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=bs,
+        input_ids=D["d_input_ids"],
+        seq_lens=D["d_seq_lens"],
+        out_cache_loc=D["d_out_cache_loc"],
+        positions=D["d_positions"],
+        req_pool_indices=D["d_req_pool_indices"],
+        cache_loc=D["d_cache_loc"],
+        extend_prefix_lens=D["d_extend_prefix_lens"],
+        extend_seq_lens=D["d_extend_seq_lens"],
+        attn_backend=draft_mr.attn_backend,
+        spec_info=draft_spec_info,
+        spec_algorithm=model_worker_batch.spec_algorithm,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+        expert_location_metadata=expert_loc,
+    )
+
+    # ===== Assemble draft LogitsMetadata =====
+    draft_logits_metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+        extend_return_logprob=False,
+        extend_return_top_logprob=False,
+        extend_token_ids_logprob=False,
+        extend_seq_lens=D["d_lm_extend_seq_lens"],
+        logits_indices=D["d_lm_logits_indices"],
+        accept_lens=None,
+        extend_seq_lens_cpu=None,
+        extend_logprob_start_lens_cpu=None,
+        extend_logprob_pruned_lens_cpu=None,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_input_logprob_token_ids_device=None,
+    )
+
+    # ===== last_token_offsets as device array =====
+    last_token_offsets = device_array(last_token_offsets_np, sharding=NamedSharding(mesh, P()))
+
+    return (
+        target_forward_batch,
+        target_logits_metadata,
+        draft_forward_batch,
+        draft_logits_metadata,
+        last_token_offsets,
+    )
+
+
+def eagle3_prefill(spec_worker, model_worker_batch):
+    """Fused EAGLE3 prefill: target_extend + argmax + draft_extend + topk in one JIT."""
+    from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    draft_worker = spec_worker.draft_worker
+    target_worker = spec_worker.target_worker
+    target_mr = target_worker.model_runner
+    draft_mr = draft_worker.draft_model_runner
+    topk = draft_worker.topk
+    mesh = draft_worker.mesh
+    sel = np.asarray(model_worker_batch.logits_indices_selector)
+
+    # ==================================================================
+    # A. Batched host prep → single H2D transfer
+    # ==================================================================
+    (
+        target_forward_batch,
+        target_logits_metadata,
+        draft_forward_batch,
+        draft_logits_metadata,
+        last_token_offsets,
+    ) = _build_eagle3_prefill_packed(
+        model_worker_batch,
+        draft_mr,
+        target_mr,
+        spec_worker,
+    )
+
+    # ==================================================================
+    # B. Build + call fused JIT
+    # ==================================================================
+    if not hasattr(spec_worker, "_fused_eagle3_prefill_jit_fn"):
+        spec_worker._fused_eagle3_prefill_jit_fn = _build_fused_eagle3_prefill_jit(
+            topk, mesh
+        )
+
+    with jax.set_mesh(mesh):
+        (
+            next_token_ids,
+            target_pool_updates,
+            draft_pool_updates,
+            topk_p,
+            topk_index,
+            draft_hidden,
+        ) = spec_worker._fused_eagle3_prefill_jit_fn(
+            target_mr._model_def,
+            target_mr._model_state_def,
+            tuple(target_mr.model_state_leaves),
+            target_forward_batch,
+            target_mr.memory_pools,
+            target_logits_metadata,
+            draft_mr._model_def,
+            draft_mr._model_state_def,
+            tuple(draft_mr.model_state_leaves),
+            draft_forward_batch,
+            draft_mr.memory_pools,
+            draft_logits_metadata,
+            last_token_offsets,
+            topk=topk,
+        )
+
+    # ==================================================================
+    # C. Pool updates
+    # ==================================================================
+    target_mr.memory_pools.replace_all(target_pool_updates)
+    draft_mr.memory_pools.replace_all(draft_pool_updates)
+
+    # ==================================================================
+    # D. Materialize D2H → build GenerationBatchResult + EagleDraftInput
+    # ==================================================================
+    with jax.profiler.TraceAnnotation("fused_eagle3_prefill_d2h"):
+        jax.copy_to_host_async(next_token_ids)
+        jax.copy_to_host_async(topk_p)
+        jax.copy_to_host_async(topk_index)
+        jax.copy_to_host_async(draft_hidden)
+
+        next_token_ids_np = np.asarray(next_token_ids)
+        topk_p_np = np.asarray(topk_p)[sel]
+        topk_index_np = np.asarray(topk_index)[sel]
+        draft_hidden_np = np.asarray(draft_hidden)[sel]
+        verified_id_np = next_token_ids_np[sel]
+
+    # Build the EagleDraftInput for the next decode round
+    next_draft_input = EagleDraftInput(
+        hidden_states=draft_hidden_np,
+        verified_id=verified_id_np,
+        allocate_lens=np.asarray(model_worker_batch.seq_lens)[sel],
+    )
+    next_draft_input.topk_p = topk_p_np
+    next_draft_input.topk_index = topk_index_np
+    model_worker_batch.spec_info_padded = next_draft_input
+
+    return GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=None,
+        ),
+        next_token_ids=next_token_ids,
+        next_draft_input=next_draft_input,
+        allocate_lens=np.asarray(model_worker_batch.seq_lens)[sel],
+        bid=model_worker_batch.bid,
+        cache_miss_count=0,
+        extend_input_len_per_req=None,
+        extend_logprob_start_len_per_req=None,
+    )

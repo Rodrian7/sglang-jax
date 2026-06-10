@@ -114,6 +114,13 @@ class BaseSpecWorker:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         if model_worker_batch.forward_mode.is_extend():
+            if (
+                self._can_use_fused_eagle3_spec_decode
+                and model_worker_batch.sampling_info.is_all_greedy
+            ):
+                from sgl_jax.srt.speculative.draft_extend_fused import eagle3_prefill
+
+                return eagle3_prefill(self, model_worker_batch)
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]

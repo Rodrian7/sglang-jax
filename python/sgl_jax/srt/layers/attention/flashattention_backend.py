@@ -113,6 +113,7 @@ class FlashAttention(AttentionBackend):
     def get_forward_metadata(
         self,
         batch: ModelWorkerBatch,
+        return_numpy=False,
     ):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
@@ -190,6 +191,15 @@ class FlashAttention(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
+        if return_numpy:
+            return {
+                "cu_q_lens": cu_q_lens,
+                "cu_kv_lens": cu_kv_lens,
+                "page_indices": page_indices,
+                "swa_page_indices": swa_page_indices,
+                "seq_lens": seq_lens,
+                "distribution": distribution,
+            }
         (
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
