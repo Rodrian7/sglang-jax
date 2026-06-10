@@ -6,10 +6,13 @@ flat point-to-point DMA scatter; this is a standalone collective microbench comp
 strategies on the SAME payload:
 
   • flat (direct): ONE jax.lax.all_to_all over all `num_devices` — every device sends each
-    block directly to its final destination in one collective. Payload moved ≈ 1×.
+    block directly to its final destination in one collective. Ships (D-1)/D of the payload once.
   • hierarchical (hybrid): a FACTORED all-to-all — factor the device axis into
-    FACTORS (default 4×2×2 = 32, torus-aligned via create_device_mesh) and exchange one
-    factor per stage. Each stage forwards the full payload → moved ≈ len(FACTORS)× (≈3×).
+    FACTORS (default 4×4×2 = 32, torus-aware via create_device_mesh) and exchange one factor
+    per stage. Stage g relocates the full local payload along that factor, shipping (g-1)/g
+    each → summed over factors ≈ 2× the flat bytes for a 3-factor split. (Measured TIME ratio
+    is typically larger than the byte ratio: extra stages add sync barriers and worse link
+    overlap — that gap is the point of the experiment.)
 
 Both are functionally-correct all-to-alls (verified per-device by a content check: device
 `d` must receive from source `s` exactly the block `s` addressed to `d`). The hierarchical
@@ -53,7 +56,7 @@ if os.environ.get("BENCH_SINGLE_HOST", "0") != "1":
 
 P = jax.sharding.PartitionSpec
 
-FACTORS = tuple(int(x) for x in os.environ.get("BENCH_FACTORS", "4,2,2").split(","))
+FACTORS = tuple(int(x) for x in os.environ.get("BENCH_FACTORS", "4,4,2").split(","))
 ROWS = int(os.environ.get("BENCH_ROWS", "128"))
 H = int(os.environ.get("BENCH_H", "8192"))
 WARMUP = int(os.environ.get("BENCH_WARMUP", "3"))
@@ -69,8 +72,14 @@ AXES = tuple(f"s{i}" for i in range(len(FACTORS)))
 if D != NDEV:
     raise SystemExit(f"BENCH_FACTORS={FACTORS} product {D} != device_count {NDEV}")
 
-# Torus-aligned mesh: logical (f0,f1,...) mapped to the physical ICI topology.
-mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh(FACTORS), AXES)
+# Mesh over the device axis, factored into len(FACTORS) named axes. Prefer a
+# topology-aware layout (better ICI locality); fall back to a plain reshape if
+# create_device_mesh can't tile this factorization onto the physical slice.
+try:
+    _devs = mesh_utils.create_device_mesh(FACTORS)
+except Exception:  # noqa: BLE001
+    _devs = np.array(jax.devices()).reshape(FACTORS)
+mesh = jax.sharding.Mesh(_devs, AXES)
 full_spec = P(AXES)  # shard the leading device axis across all mesh axes
 
 # strides to flatten factored coords -> linear device index (row-major, s0 most significant)
@@ -164,8 +173,13 @@ def _bench(mode, dtype_name):
     bytes_per_elem = 2 if dtype_name == "bf16" else 1
     payload_mb = D * ROWS * H * bytes_per_elem / 1e6  # per-device local tensor
     stages = 1 if mode == "flat" else len(FACTORS)
-    # off-diagonal bytes actually leaving each device, summed over stages
-    moved_mb = stages * (D - 1) / D * payload_mb
+    # Bytes leaving each device. A flat a2a ships (D-1)/D of the payload ONCE; a
+    # factored a2a ships (g-1)/g per stage g, summed over factors (each stage
+    # relocates the full local payload along one factor). So 3 factors ~= 2x bytes.
+    if mode == "flat":
+        moved_mb = (D - 1) / D * payload_mb
+    else:
+        moved_mb = sum((g - 1) / g for g in FACTORS) * payload_mb
     wall = float(np.mean(np.array(disp) + np.array(wait)))
     bw = moved_mb / 1e3 / (wall * 1e-3)  # GB/s aggregate per device
     return {
