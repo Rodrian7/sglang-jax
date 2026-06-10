@@ -501,12 +501,18 @@ function lensFusion(s,R){
   return h;}
 function fusionHLOHTML(){const H=D.hlo; if(!H||!H.fusion)return ""; const f=H.fusion, bk=f.by_kind||{}, c=f.candidates||{};
   let h="<div class='lh' style='margin-top:14px'>Compiler ground truth (optimized HLO)</div>";
-  h+="<div class='note'>What XLA <b>already</b> fused — from the same compiled HLO as the Overlap tab. Evidence, not a model.</div>";
-  h+="<div class='verdict v-go'>XLA created <b>"+(f.n_fusions||0)+" fusions</b> ("+Object.keys(bk).map(k=>bk[k]+"× "+k).join(", ")+"). "
-    +"<span class='mono'>kOutput</span> = matmul-epilogue (residual / SiLU folded into the matmul output); <span class='mono'>kLoop</span> = elementwise/norm loop fusions; <span class='mono'>kCustom</span> = Pallas.</div>";
-  const done=Object.keys(c).filter(k=>c[k]>0);
-  if(done.length) h+="<div class='note'>Candidate ops confirmed folded into fusions: "+done.map(k=>"<b>"+k+"</b> ("+c[k]+" ops)").join(", ")+". → the prologue/epilogue fusions above are <b>already done</b> by XLA; the theory \"savings\" are mostly captured.</div>";
-  h+="<div class='note' style='color:#a55'>⚠ what's left is cross-kernel (e.g. rope→attention, residual→MoE) folded inside the Pallas kernels — not separate XLA fusions — or genuinely unfused. So fusion is a small lever here: the bread-and-butter is done.</div>";
+  h+="<div class='note'>What XLA <b>already</b> fused — from the same compiled HLO as the Overlap tab. Evidence, not a model. <b>"+(f.n_fusions||0)+" fusions</b> total.</div>";
+  // table 1: fusion regions by kind
+  const KMEAN={kLoop:"elementwise / norm / RoPE chains",kOutput:"matmul epilogue (residual / SiLU folded into the matmul output)",kInput:"matmul prologue (op folded into a matmul input)",kCustom:"Pallas kernels (attention / fused MoE)"};
+  h+="<table><thead><tr><th class='l'>fusion kind</th><th>count</th><th class='l'>what it fuses</th></tr></thead><tbody>";
+  for(const k in bk) h+="<tr><td class='l mono'>"+k+"</td><td>"+bk[k]+"</td><td class='l'>"+(KMEAN[k]||"")+"</td></tr>";
+  h+="</tbody></table>";
+  // table 2: candidate ops -> are they folded into fusions?
+  const CN={rms_norm:"RMSNorm",rotary:"RoPE",silu:"SiLU",softmax:"softmax (attention)"};
+  h+="<table style='margin-top:8px'><thead><tr><th class='l'>candidate op</th><th>#ops folded into fusions</th><th class='l'>status</th></tr></thead><tbody>";
+  for(const k in c) h+="<tr><td class='l'>"+(CN[k]||k)+"</td><td>"+c[k]+"</td><td class='l'>"+(c[k]>0?"<span class='tag b-compute'>fused ✓</span>":"<span class='tag b-ICI'>inside Pallas kernel</span>")+"</td></tr>";
+  h+="</tbody></table>";
+  h+="<div class='verdict v-go'>The prologue/epilogue fusions in the table above are <b>already done</b> by XLA ("+(bk.kOutput||0)+" matmul-epilogue + "+(bk.kLoop||0)+" loop fusions), so the theory \"savings\" are mostly captured. What's left is cross-kernel (rope→attention, residual→MoE) folded inside the Pallas kernels — not separate XLA fusions. <b>Fusion is a small lever here.</b></div>";
   return h;}
 function dataflowHTML(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
