@@ -469,7 +469,7 @@ function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
   h+="<div class='note'>XLA also issues <b>"+(H.memory_prefetch_async||0)+"</b> async HBM↔VMEM prefetch copies (memory latency hiding) — distinct from network comm; this is why the model tracks the HBM roofline.</div>";
   h+="<div class='verdict v-go'>Bottom line from the compiler: SYNC network collectives (TP all-reduce + embed) are exposed barriers; the SP all-gather XLA already overlaps; the dominant MoE a2a is kernel-internal (XLA can't touch it). So the levers are (a) cut the SYNC TP reduce (SP / topology) and (b) the in-kernel a2a pipeline (kernel work, verify with a device trace) — not generic XLA overlap.</div>";
   return h;}
-function lensKernel(R){
+function lensKernel(s,R){
   let h="<div class='lh'>Kernel — which to attack, and how</div><div class='note'>Ranked by ideal ms. Bound → lever: HBM → ↓ bytes; compute → ↑ MXU rate / ↓ flops; ICI → overlap / ↓ comm.</div>";
   h+="<table><thead><tr><th class='l'>op</th><th>ideal ms</th><th>%step</th><th>bound</th><th>OI</th><th class='l'>lever</th></tr></thead><tbody>";
   for(const r of R.rows){const m=rowMs(r); let lever;
@@ -604,11 +604,13 @@ function chartHTML(){return "<canvas id='cv' style='margin-bottom:12px'></canvas
 function render(){const s=state(); const R=compute(s);
   g("scenhelp").innerHTML=HELP[SCEN]||"";
   let html="";
-  if(SCEN==="overview") html=chartHTML()+card(legendHTML()+costTableHTML(R))+card(dataflowHTML(s));
-  else if(SCEN==="overlap") html=chartHTML()+card(lensOverlap(s,R));
-  else if(SCEN==="kernel") html=chartHTML()+card(lensKernel(R));
-  else if(SCEN==="fusion") html=card(lensFusion(s,R));
-  else if(SCEN==="trace") html=card(codepathHTML())+card(kernelsHTML());
+  try{
+    if(SCEN==="overview") html=chartHTML()+card(legendHTML()+costTableHTML(R))+card(dataflowHTML(s));
+    else if(SCEN==="overlap") html=chartHTML()+card(lensOverlap(s,R));
+    else if(SCEN==="kernel") html=chartHTML()+card(lensKernel(s,R));
+    else if(SCEN==="fusion") html=card(lensFusion(s,R));
+    else if(SCEN==="trace") html=card(codepathHTML())+card(kernelsHTML());
+  }catch(e){html="<div class='panel' style='color:#a33'>render error in '"+SCEN+"': "+e.message+"</div>";}
   g("body").innerHTML=html;
   if(g("cv")){draw(R); attachTip();}
   updateSummary(s,R);
