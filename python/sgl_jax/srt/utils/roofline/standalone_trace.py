@@ -148,12 +148,22 @@ def _make_dummy_batch(bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_s
     )
 
 
-def _build_model_config(model_path, attention_tp, ep, moe_backend, dtype, layers=None):
+def _build_model_config(
+    model_path, attention_tp, ep, moe_backend, dtype, layers=None, representative=False
+):
     from sgl_jax.srt.configs.model_config import ModelConfig
 
+    # representative mode builds the FULL config then keeps one layer per distinct
+    # (is_swa, is_moe) type -- so a truncated compile still covers every collective
+    # even when the model is dense-first / MoE-later. Plain `layers` = first-N.
     mc = ModelConfig(
-        model_path=model_path, trust_remote_code=True, dtype=dtype, model_layer_nums=layers
+        model_path=model_path,
+        trust_remote_code=True,
+        dtype=dtype,
+        model_layer_nums=None if representative else layers,
     )
+    if representative:
+        _apply_representative_layers(mc.hf_config)
     # mirror ModelRunner.load_model's hf_config injection (without loading weights)
     mc.configure_for_tensor_parallel(attention_tp)
     hf = mc.hf_config
@@ -164,6 +174,40 @@ def _build_model_config(model_path, attention_tp, ep, moe_backend, dtype, layers
     hf.use_absorbed_mla = True
     hf.enable_sequence_parallel = True
     return mc
+
+
+def representative_layer_types(hf):
+    """One layer index per distinct (is_swa, is_moe) combo, in first-occurrence
+    order -- covers every collective type regardless of layer ordering."""
+    L = hf.num_hidden_layers
+    hlp = list(getattr(hf, "hybrid_layer_pattern", None) or [0] * L)
+    mlf = getattr(hf, "moe_layer_freq", None)
+    mlf = list(mlf) if (mlf is not None and not isinstance(mlf, int)) else [1] * L
+    seen, picked = set(), []
+    for i in range(L):
+        combo = (
+            bool(hlp[i]) if i < len(hlp) else False,
+            bool(mlf[i]) if i < len(mlf) else True,
+        )
+        if combo not in seen:
+            seen.add(combo)
+            picked.append((i, combo))
+    return picked
+
+
+def _apply_representative_layers(hf):
+    picked = representative_layer_types(hf)
+    hlp = list(getattr(hf, "hybrid_layer_pattern", None) or [0] * hf.num_hidden_layers)
+    mlf = getattr(hf, "moe_layer_freq", None)
+    mlf = (
+        list(mlf) if (mlf is not None and not isinstance(mlf, int)) else [1] * hf.num_hidden_layers
+    )
+    idxs = [i for i, _ in picked]
+    hf.num_hidden_layers = len(idxs)
+    if getattr(hf, "hybrid_layer_pattern", None) is not None:
+        hf.hybrid_layer_pattern = [hlp[i] if i < len(hlp) else 0 for i in idxs]
+    if getattr(hf, "moe_layer_freq", None) is not None and not isinstance(hf.moe_layer_freq, int):
+        hf.moe_layer_freq = [mlf[i] if i < len(mlf) else 1 for i in idxs]
 
 
 def _build_kv_pool(mc, mesh, attention_tp, dp, page_size):
@@ -249,7 +293,17 @@ def trace_model_forward(
 
 
 def _build_forward(
-    model_path, tp, dp, *, phase, num_tokens, moe_backend, dtype, page_size, layers=None
+    model_path,
+    tp,
+    dp,
+    *,
+    phase,
+    num_tokens,
+    moe_backend,
+    dtype,
+    page_size,
+    layers=None,
+    representative=False,
 ):
     """Build the abstract model + dummy batch; return the forward closure, its
     (abstract-weights, fb, mp, lm) args, the mesh, and meta. Shared by the jaxpr
@@ -266,7 +320,15 @@ def _build_forward(
     attention_tp = tp // dp
     ep = tp
     mesh = create_device_mesh(ici_parallelism=[dp, attention_tp], dcn_parallelism=[1, 1])
-    mc = _build_model_config(model_path, attention_tp, ep, moe_backend, dtype, layers=layers)
+    mc = _build_model_config(
+        model_path,
+        attention_tp,
+        ep,
+        moe_backend,
+        dtype,
+        layers=layers,
+        representative=representative,
+    )
     model_class, arch = get_model_architecture(mc)
 
     with jax.set_mesh(mesh):
@@ -314,14 +376,16 @@ def compile_forward_hlo(
     dtype="bfloat16",
     page_size=256,
     layers=None,
+    representative=True,
 ) -> str:
     """Lower + compile the real forward for the (real-device) mesh and return the
     optimized, scheduled HLO text. Run on a TPU host/cluster with
     ``jax.distributed`` initialized (so ``jax.devices()`` spans all chips) -- the
     async-collective schedule is target-specific, so CPU HLO is not representative.
-    ``layers`` truncates num_hidden_layers (full 70-layer compile overflows XLA's
-    memory-space assignment with the SWA kernel; a few layers carry the same
-    per-layer + cross-layer collective overlap structure)."""
+    A full 70-layer compile overflows XLA's memory-space assignment with the SWA
+    kernel, so the model is shrunk: ``representative=True`` (default) keeps one
+    layer per distinct (swa, moe) type -- covers every collective even for
+    dense-first/MoE-later models; ``layers=N`` instead keeps the first N."""
     fwd, args, mesh, mc, arch, attention_tp, ep, tokens_global = _build_forward(
         model_path,
         tp,
@@ -330,12 +394,34 @@ def compile_forward_hlo(
         num_tokens=num_tokens,
         moe_backend=moe_backend,
         layers=layers,
+        representative=representative,
         dtype=dtype,
         page_size=page_size,
     )
     with jax.set_mesh(mesh):
         compiled = jax.jit(fwd).lower(*args).compile()
-    return compiled.as_text()
+    devices = tp
+    sp_triggered = bool(mc.hf_config.enable_sequence_parallel) and (
+        tokens_global >= devices * 128 and tokens_global % devices == 0
+    )
+    types = [
+        ("SWA" if sw else "full") + ("+MoE" if moe else "+dense")
+        for _, (sw, moe) in representative_layer_types(mc.hf_config)
+    ]
+    meta = {
+        "tp": tp,
+        "dp": dp,
+        "devices": devices,
+        "ep": ep,
+        "tokens_global": tokens_global,
+        "phase": phase,
+        "n_layers_compiled": mc.hf_config.num_hidden_layers,
+        "layer_types": types,
+        "enable_sp": bool(mc.hf_config.enable_sequence_parallel),
+        "sp_triggered": sp_triggered,
+        "sp_threshold_tokens": devices * 128,
+    }
+    return compiled.as_text(), meta
 
 
 def _main():

@@ -112,6 +112,10 @@ def main():
 
             with open(args.hlo) as f:
                 hlo = parse_hlo_overlap(f.read())
+            metap = args.hlo + ".meta.json"
+            if os.path.exists(metap):
+                with open(metap) as f:
+                    hlo["compile"] = json.load(f)
         # interactive report (live knobs + Dataflow + Fusion) grounded in the real
         # trace's code-path + kernel tabs; defaults seed the knobs at this layout.
         defaults = dict(

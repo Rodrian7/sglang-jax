@@ -404,6 +404,8 @@ function lensOverlap(s,R){
   }
   if(attnN>0) items.push({name:"o_proj "+(L.sp?"reduce-scatter + all-gather":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
   if(D.n_dense>0) items.push({name:"down_proj "+(L.sp?"reduce-scatter":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
+  // embedding lookup all-reduce (vocab-sharded embed gather over the tensor axis); once per step
+  if(L.t>1) items.push({name:"embedding all-reduce (vocab-sharded)",ms:msi(allreduce(tokens*D.H*2,L.t)),type:"barrier",cap:0,behind:"—"});
   let hidden=0,exposed=0,commTot=0;
   for(const it of items){if(it.type==="pipelineable"){it.hidden=Math.min(it.ms,it.cap);it.exposed=it.ms-it.hidden;}else{it.hidden=0;it.exposed=it.ms;} hidden+=it.hidden;exposed+=it.exposed;commTot+=it.ms;}
   const nonComm=Math.max(R.Tc,R.Th), pipeStep=nonComm+exposed, noOv=nonComm+commTot;
@@ -446,6 +448,11 @@ function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
   const nb=H.network||{}, bt=nb.by_type||{};
   let h="<div class='lh' style='margin-top:14px'>Compiler ground truth (optimized HLO)</div>";
   h+="<div class='note'>What XLA actually scheduled, parsed from the compiled, scheduled HLO ("+(H.n_entry_instrs||0)+" entry instrs). This is evidence, not a model.</div>";
+  if(H.compile){const c=H.compile;
+    h+="<div class='note' style='background:#f1f5f9;border-radius:6px;padding:6px 9px'><b>compile config</b> (so it lines up with the model above): "
+      +c.n_layers_compiled+" representative layers ["+(c.layer_types||[]).join(", ")+"] · tp="+c.tp+" dp="+c.dp+" · "
+      +c.tokens_global+" global tokens · <b>SP "+(c.sp_triggered?"on":"off")+"</b> (reduce-scatter kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
+      +(c.sp_triggered?"":"At this token count SP did not trigger, so the TP reduces show as plain all-reduce; raise tokens above the threshold to see reduce-scatter.")+"</div>";}
   // network collectives
   h+="<table><thead><tr><th class='l'>network collective</th><th>count</th><th>sync / async</th><th class='l'>replica_groups</th><th>bytes</th></tr></thead><tbody>";
   let any=false;

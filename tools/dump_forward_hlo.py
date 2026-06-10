@@ -28,9 +28,10 @@ def main():
     ap.add_argument(
         "--layers",
         type=int,
-        default=4,
-        help="truncate num_hidden_layers (full 70-layer compile overflows XLA MSA; "
-        "a few layers carry the same collective overlap structure)",
+        default=None,
+        help="keep first-N layers instead of the default representative set "
+        "(one layer per distinct swa/moe type — covers all collectives even for "
+        "dense-first/MoE-later models; avoids the full-70-layer XLA MSA crash)",
     )
     ap.add_argument("--nnodes", type=int, default=1)
     ap.add_argument("--node-rank", type=int, default=0)
@@ -55,7 +56,7 @@ def main():
     from sgl_jax.srt.utils.roofline.standalone_trace import compile_forward_hlo
 
     phase = "extend" if args.phase == "prefill" else args.phase
-    hlo = compile_forward_hlo(
+    hlo, meta = compile_forward_hlo(
         args.model_path,
         args.tp,
         args.dp,
@@ -63,11 +64,22 @@ def main():
         num_tokens=args.tokens,
         moe_backend=args.moe_backend,
         layers=args.layers,
+        representative=args.layers is None,
     )
     if jax.process_index() == 0:
+        import json
+
         with open(args.out, "w") as f:
             f.write(hlo)
+        with open(args.out + ".meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
         print(f"HLO -> {args.out}  ({len(hlo):,} chars)", flush=True)
+        print(
+            f"  compiled: {meta['n_layers_compiled']} layers {meta['layer_types']} · "
+            f"{meta['tokens_global']} tokens · SP {'on' if meta['sp_triggered'] else 'off'}"
+            f" (threshold {meta['sp_threshold_tokens']})",
+            flush=True,
+        )
     else:
         print(f"rank {jax.process_index()} compiled OK", flush=True)
 
