@@ -77,111 +77,71 @@ def _net_opcode(rhs: str):
     return None
 
 
-def _is_compute(rhs: str) -> bool:
-    for kw in ("fusion(", "dot(", "convolution("):
-        if kw in rhs:
-            return True
-    return "custom-call(" in rhs and "tpu_custom_call" in rhs
-
-
-def _entry_body(text: str) -> list[str]:
-    lines = text.splitlines()
-    start = next(
-        (i for i, ln in enumerate(lines) if ln.lstrip().startswith("ENTRY ") or " ENTRY " in ln),
-        None,
-    )
-    if start is None:
-        return lines
-    depth, body, began = 0, [], False
-    for ln in lines[start:]:
-        depth += ln.count("{") - ln.count("}")
-        if "{" in ln and not began:
-            began = True
-            continue
-        if began:
-            if depth <= 0:
-                break
-            body.append(ln)
-    return body
-
-
 def parse_hlo_overlap(text: str) -> dict:
-    body = _entry_body(text)
-    # classify entry instrs in schedule order
-    instrs = []
-    for ln in body:
+    # Scan the WHOLE module (collectives can live in nested computations / async
+    # wrappers, not just ENTRY) for an accurate inventory. Counts are #instructions
+    # in the module (static), not dynamic execution counts.
+    lines = text.splitlines()
+    net_by = {}
+    n_net_sync = n_net_async = 0
+    n_sc = n_copy = n_pallas = 0
+    for ln in lines:
         m = _INSTR.match(ln)
         if not m:
             continue
-        rhs = m.group(2)
+        name, rhs = m.group(1), m.group(2)
+        # A collective shows up either as an opcode (all-reduce(...)) or, when XLA
+        # wraps it async, as an instruction NAMED for it (e.g.
+        # %all-gather.14.cloned.1.call-start = ... async-start(...)). Detect both;
+        # the name carries -start/-done/.call-start/.call-done for sync-vs-async.
         net = _net_opcode(rhs)
-        kind = None
+        ct = st = dn = None
         if net:
-            kind = "net"
-        elif 'async_execution_thread="sparsecore"' in rhs or "sparsecore" in rhs:
-            kind = "sc" if ("-start(" in rhs or "-done(" in rhs or "async-" in rhs) else None
-        elif re.search(r"(copy-start|copy-done|slice-start|slice-done)\(", rhs):
-            kind = "copy"
-        instrs.append(
-            dict(
-                rhs=rhs, net=net, kind=kind, bytes=_first_shape_bytes(rhs), compute=_is_compute(rhs)
-            )
-        )
-
-    # network collectives
-    net_by = {}
-    n_net_sync = n_net_async = 0
-    for idx, it in enumerate(instrs):
-        if not it["net"]:
-            continue
-        c, st, dn = it["net"]
-        rep = _REPL.search(it["rhs"])
-        d = net_by.setdefault(
-            c, dict(count=0, sync=0, async_=0, bytes=0, groups=rep.group(1) if rep else "")
-        )
-        if st:
-            d["async_"] += 1
-            d["count"] += 1
-            d["bytes"] += it["bytes"]
-            n_net_async += 1
-        elif dn:
-            pass  # counted at start
+            ct, st, dn = net
         else:
-            d["sync"] += 1
+            base = name.lstrip("%")
+            for c in _NET:
+                if base.startswith(c) or ".cloned" in base and c in base:
+                    ct = c
+                    st = base.endswith("-start") or base.endswith("call-start")
+                    dn = base.endswith("-done") or base.endswith("call-done")
+                    break
+        if ct:
+            rep = _REPL.search(rhs)
+            d = net_by.setdefault(
+                ct, dict(count=0, sync=0, async_=0, bytes=0, groups=rep.group(1) if rep else "")
+            )
+            if dn:
+                continue  # the -done half is the same collective as its -start
             d["count"] += 1
-            d["bytes"] += it["bytes"]
-            n_net_sync += 1
-        if rep and not d["groups"]:
-            d["groups"] = rep.group(1)
+            d["bytes"] += _first_shape_bytes(rhs)
+            if st:
+                d["async_"] += 1
+                n_net_async += 1
+            else:
+                d["sync"] += 1
+                n_net_sync += 1
+            if rep and not d["groups"]:
+                d["groups"] = rep.group(1)
+        elif 'async_execution_thread="sparsecore"' in rhs and (
+            "-start(" in rhs or "call-start" in rhs
+        ):
+            n_sc += 1
+        elif re.search(r"(copy-start|slice-start)\(", rhs):
+            n_copy += 1
+        elif "custom-call(" in rhs and "tpu_custom_call" in rhs:
+            n_pallas += 1
 
-    # sparsecore async (MoE dispatch/combine) + their TC shadow
-    sc_starts = []
-    sc = dict(count=0, with_shadow=0, shadow_ops=0)
-    for idx, it in enumerate(instrs):
-        if it["kind"] != "sc":
-            continue
-        if "-start(" in it["rhs"] or "async-start(" in it["rhs"] or "call-start" in it["rhs"]:
-            sc_starts.append(idx)
-        elif (
-            "-done(" in it["rhs"] or "async-done(" in it["rhs"] or "call-done" in it["rhs"]
-        ) and sc_starts:
-            sidx = sc_starts.pop()
-            shadow = [j for j in range(sidx + 1, idx) if instrs[j]["compute"]]
-            sc["count"] += 1
-            sc["shadow_ops"] += len(shadow)
-            sc["with_shadow"] += 1 if shadow else 0
-
-    n_copy = sum(1 for it in instrs if it["kind"] == "copy" and "-start(" in it["rhs"])
-    n_pallas = sum(1 for it in instrs if it["compute"] and "tpu_custom_call" in it["rhs"])
-
+    sp_active = ("reduce-scatter" in net_by) or ("all-gather" in net_by)
     return {
-        "n_entry_instrs": len(instrs),
+        "n_module_lines": len(lines),
         "network": {
             "by_type": net_by,
             "n_sync_barrier": n_net_sync,
             "n_async": n_net_async,
+            "sp_active": sp_active,  # reduce-scatter / all-gather present => SP took effect
         },
-        "sparsecore_async": sc,  # MoE dispatch/combine on SparseCore
+        "sparsecore_async": {"count": n_sc},  # MoE dispatch/combine on SparseCore
         "memory_prefetch_async": n_copy,  # HBM<->VMEM async copies (latency hiding)
         "pallas_kernels": n_pallas,  # tpu_custom_call (attention + fused MoE; a2a is in here)
     }

@@ -447,12 +447,12 @@ function lensOverlap(s,R){
 function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
   const nb=H.network||{}, bt=nb.by_type||{};
   let h="<div class='lh' style='margin-top:14px'>Compiler ground truth (optimized HLO)</div>";
-  h+="<div class='note'>What XLA actually scheduled, parsed from the compiled, scheduled HLO ("+(H.n_entry_instrs||0)+" entry instrs). This is evidence, not a model.</div>";
+  h+="<div class='note'>What XLA actually scheduled, parsed from the compiled, scheduled HLO ("+(H.n_module_lines||0)+" instrs). This is evidence, not a model.</div>";
   if(H.compile){const c=H.compile;
     h+="<div class='note' style='background:#f1f5f9;border-radius:6px;padding:6px 9px'><b>compile config</b> (so it lines up with the model above): "
       +c.n_layers_compiled+" representative layers ["+(c.layer_types||[]).join(", ")+"] · tp="+c.tp+" dp="+c.dp+" · "
-      +c.tokens_global+" global tokens · <b>SP "+(c.sp_triggered?"on":"off")+"</b> (reduce-scatter kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
-      +(c.sp_triggered?"":"At this token count SP did not trigger, so the TP reduces show as plain all-reduce; raise tokens above the threshold to see reduce-scatter.")+"</div>";}
+      +c.tokens_global+" global tokens · <b>SP "+(nb.sp_active?"active":"off")+"</b> (reduce-scatter/all-gather kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
+      +(nb.sp_active?"":"At this token count SP did not trigger, so the TP reduces are plain all-reduce; raise tokens above the threshold to see reduce-scatter + all-gather.")+"</div>";}
   // network collectives
   h+="<table><thead><tr><th class='l'>network collective</th><th>count</th><th>sync / async</th><th class='l'>replica_groups</th><th>bytes</th></tr></thead><tbody>";
   let any=false;
@@ -460,14 +460,13 @@ function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
     h+="<tr><td class='l'>"+k+"</td><td>"+t.count+"</td><td>"+(t.sync||0)+" / "+(t.async_||0)+"</td><td class='l mono'>"+(t.groups||"")+"</td><td>"+fmt(t.bytes/1e6)+" MB</td></tr>";}
   if(!any) h+="<tr><td class='l' colspan=5>none</td></tr>";
   h+="</tbody></table>";
-  const allSync=(nb.n_async||0)===0 && (nb.n_sync_barrier||0)>0;
-  h+="<div class='verdict "+(allSync?"v-warn":"v-go")+"'>"
-    +"<b>TP all-reduce</b>: "+(nb.n_sync_barrier||0)+" SYNC + "+(nb.n_async||0)+" async — "
-    +(allSync?"all SYNC (over the tensor axis, per replica_groups) → <b>exposed barriers</b>; XLA did not overlap them. Lever: SP / reduce-scatter, topology."
-            :"some made async by XLA.")+"</div>";
+  h+="<div class='verdict "+((nb.n_sync_barrier||0)>0?"v-warn":"v-go")+"'>"
+    +"<b>"+(nb.n_sync_barrier||0)+" SYNC</b> collectives (exposed barriers — over the tensor axis per replica_groups; mostly TP all-reduce + the embedding gather) "
+    +"&nbsp;·&nbsp; <b>"+(nb.n_async||0)+" async</b> (XLA overlaps these — e.g. the SP all-gather). "
+    +((nb.n_sync_barrier||0)>0?"The SYNC ones are the lever: SP / reduce-scatter, topology.":"")+"</div>";
   h+="<div class='note' style='margin-top:6px'><b>MoE all-to-all is not an XLA collective</b> — it is fused inside the MoE Pallas kernel ("+(H.pallas_kernels||0)+" × <span class='mono'>tpu_custom_call</span>: attention + experts). Its dispatch/combine run in-kernel (SparseCore); whether they hide behind TensorCore compute is a kernel/device-trace question, not an XLA-scheduling one — and has been measured exposed (torus floor).</div>";
   h+="<div class='note'>XLA also issues <b>"+(H.memory_prefetch_async||0)+"</b> async HBM↔VMEM prefetch copies (memory latency hiding) — distinct from network comm; this is why the model tracks the HBM roofline.</div>";
-  h+="<div class='verdict v-go'>Bottom line from the compiler: the only overlappable <i>network</i> comm is the TP all-reduce, left SYNC/exposed; the dominant MoE a2a is kernel-internal. So <b>XLA-level overlap is not the lever</b> — the levers are (a) cut the TP reduce (SP / topology) and (b) the in-kernel a2a pipeline (kernel work, verify with a device trace).</div>";
+  h+="<div class='verdict v-go'>Bottom line from the compiler: SYNC network collectives (TP all-reduce + embed) are exposed barriers; the SP all-gather XLA already overlaps; the dominant MoE a2a is kernel-internal (XLA can't touch it). So the levers are (a) cut the SYNC TP reduce (SP / topology) and (b) the in-kernel a2a pipeline (kernel work, verify with a device trace) — not generic XLA overlap.</div>";
   return h;}
 function lensKernel(R){
   let h="<div class='lh'>Kernel — which to attack, and how</div><div class='note'>Ranked by ideal ms. Bound → lever: HBM → ↓ bytes; compute → ↑ MXU rate / ↓ flops; ICI → overlap / ↓ comm.</div>";
