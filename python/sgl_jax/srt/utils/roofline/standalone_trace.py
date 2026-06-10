@@ -64,6 +64,9 @@ def patch_for_cpu(ver: int = 7):
         "sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3": {
             "get_tpu_version": ver_fn
         },
+        "sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3": {
+            "get_tpu_version": ver_fn
+        },
         "sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes": {
             "get_device_name": dev_name
         },

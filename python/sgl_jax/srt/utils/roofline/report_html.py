@@ -105,6 +105,62 @@ def _bake_moe_block_table(config) -> dict:
     return out
 
 
+def _bake_rpa_block_table(config) -> dict:
+    """The RPA-v3 (bq, bkv) block config the kernel WOULD pick, per (tensor-axis t,
+    stage, sliding_window, max_num_tokens), by calling the kernel's OWN
+    ``get_tuned_block_sizes_v3`` — same change-resilience as the MoE table: tune
+    table / key schema / lookup changes are tracked on the next regenerate with no
+    roofline code change. ``max_num_tokens`` = per-device query tokens (= the token
+    knob, since ``max_num_tokens = queries.shape[0]`` in the kernel). Heads are
+    per-device (nh/t, kv with replication), mirroring the JS card. Returns
+    ``{"t|stage|sw": [{n, bq, bkv}, ...]}``; misses are skipped (JS falls back to the
+    traced kernel name)."""
+    try:
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
+            get_tuned_block_sizes_v3,
+        )
+    except Exception:
+        return {}
+    nh = _cfg(config, "num_attention_heads")
+    nkv = _cfg(config, "num_key_value_heads", default=nh)
+    hd = _cfg(config, "head_dim")
+    if not (nh and hd):
+        return {}
+    swa = _cfg(config, "sliding_window_size", default=None)
+    page_size = 256
+    buckets = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    windows = [None] + ([int(swa)] if swa else [])
+    out: dict[str, list] = {}
+    for t in (1, 2, 4, 8, 16, 32, 64, 128):
+        nq = max(1, nh // t)
+        nkv_dev = 1 if t >= nkv else -(-nkv // t)  # ceil; replicated when t>=nkv
+        for stage in ("d", "p", "m"):
+            for sw in windows:
+                row = []
+                for n in buckets:
+                    try:
+                        hit = get_tuned_block_sizes_v3(
+                            stage,
+                            jnp.bfloat16,
+                            jnp.bfloat16,
+                            nq,
+                            nkv_dev,
+                            hd,
+                            page_size,
+                            n,
+                            sliding_window=sw,
+                        )
+                    except Exception:
+                        hit = None
+                    if hit:
+                        row.append({"n": n, "bq": int(hit[0]), "bkv": int(hit[1])})
+                if row:
+                    out[f"{t}|{stage}|{'full' if sw is None else sw}"] = row
+    return out
+
+
 def _bake_jaxpr(arch, config) -> dict | None:
     """Trace one reference layer to a jaxpr; bake the primitive histogram + the
     source line that emits each (shortened). None if jax / reference unavailable."""
@@ -181,6 +237,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "n_dense": combo[(False, False)] + combo[(True, False)],
         "jaxpr": _bake_jaxpr(arch, config),
         "moe_blocks": _bake_moe_block_table(config),
+        "rpa_blocks": _bake_rpa_block_table(config),
         "peaks": {
             "bf16_tflops": peaks.bf16_tflops,
             "fp8_tflops": peaks.fp8_tflops,
@@ -518,29 +575,8 @@ function lensOverlap(s,R){
   for(const it of items.sort((a,b)=>b.ms-a.ms)) h+="<tr><td class='l'>"+it.name+"</td><td>"+it.ms.toFixed(3)+"</td><td class='l'><span class='tag "+(it.type==="pipelineable"?"b-compute":"b-ICI")+"'>"+it.type+"</span></td><td>"+it.hidden.toFixed(3)+"</td><td>"+it.exposed.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+it.behind+"</td>"+(HV?"<td class='l' style='font-size:11px'>"+xlaCell(it.op,it.type)+"</td>":"")+"</tr>";
   if(!items.length) h+="<tr><td class='l' colspan="+(HV?7:6)+">no collectives at this layout</td></tr>";
   h+="</tbody></table>";
-  h+="<div class='note'>type = model prediction (can it pipeline behind compute?); <b>XLA actual</b> = what the compiled HLO scheduled (✓ = agrees, ⚠ = model says hideable but it is exposed / not XLA-scheduled). Rows are model <b>categories</b> (each spans all its layers), while the HLO counts opcodes — e.g. the 4 all-reduce rows here all map to the single <b>all-reduce</b> opcode (per-opcode totals in the <b>HLO opcode totals</b> line below). The a2a is in-kernel so XLA can't touch it — and it has been <b>measured exposed</b> at the torus floor (cross-host) / VMEM-blocked; a device trace is the final word on how much compute sits in its shadow.</div>";
-  h+=hloOverlapHTML();
-  return h;}
-function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
-  const nb=H.network||{}, bt=nb.by_type||{};
-  let h="<div class='lh' style='margin-top:14px'>Compiler ground truth (optimized HLO)</div>";
-  h+="<div class='note'>What XLA actually scheduled, parsed from the compiled, scheduled HLO ("+(H.n_module_lines||0)+" instrs). This is evidence, not a model.</div>";
-  if(H.compile){const c=H.compile;
-    h+="<div class='note' style='background:#f1f5f9;border-radius:6px;padding:6px 9px'><b>compile config</b> (so it lines up with the model above): "
-      +c.n_layers_compiled+" representative layers ["+(c.layer_types||[]).join(", ")+"] · tp="+c.tp+" dp="+c.dp+" · "
-      +c.tokens_global+" global tokens · <b>SP "+(nb.sp_active?"active":"off")+"</b> (the async all-gather kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
-      +(nb.sp_active?"The row-parallel outputs still complete with a SYNC all-reduce on the tensor axis; SP adds an ASYNC all-gather (overlapped) to re-collect the sequence shards before each linear. No reduce-scatter survives XLA lowering — the scatter is an all-reduce + free local slice.":"At this token count SP did not trigger; the TP reduces are plain all-reduce and there is no SP all-gather.")+"</div>";}
-  // opcode totals folded into one caption (the per-row verdicts live in the merged
-  // table above; only the raw replica_groups + byte totals are added here)
-  let inv=[]; for(const k in bt){const t=bt[k]; inv.push(k+" <b>"+t.count+"×</b> ("+(t.sync||0)+" sync/"+(t.async_||0)+" async) <span class='mono' style='font-size:10px'>"+(t.groups||"")+"</span> "+fmt(t.bytes/1e6)+" MB");}
-  if(inv.length) h+="<div class='note'><b>HLO opcode totals</b> (at the compiled point above): "+inv.join(" &nbsp;·&nbsp; ")+"</div>";
-  h+="<div class='verdict "+((nb.n_sync_barrier||0)>0?"v-warn":"v-go")+"'>"
-    +"<b>"+(nb.n_sync_barrier||0)+" SYNC</b> collectives (exposed barriers — over the tensor axis per replica_groups; mostly TP all-reduce + the embedding gather) "
-    +"&nbsp;·&nbsp; <b>"+(nb.n_async||0)+" async</b> (XLA overlaps these — e.g. the SP all-gather). "
-    +((nb.n_sync_barrier||0)>0?"The SYNC ones are the lever: t-axis locality / topology / fewer cross-host hops on the tensor reduce.":"")+"</div>";
-  h+="<div class='note' style='margin-top:6px'><b>MoE all-to-all is not an XLA collective</b> — it is fused inside the MoE Pallas kernel ("+(H.pallas_kernels||0)+" × <span class='mono'>tpu_custom_call</span>: attention + experts). Its dispatch/combine run in-kernel (SparseCore); whether they hide behind TensorCore compute is a kernel/device-trace question, not an XLA-scheduling one — and has been measured exposed (torus floor).</div>";
-  h+="<div class='note'>XLA also issues <b>"+(H.memory_prefetch_async||0)+"</b> async HBM↔VMEM prefetch copies (memory latency hiding) — distinct from network comm; this is why the model tracks the HBM roofline.</div>";
-  h+="<div class='verdict v-go'>Bottom line from the compiler: SYNC network collectives (TP all-reduce + embed) are exposed barriers; the SP all-gather XLA already overlaps; the dominant MoE a2a is kernel-internal (XLA can't touch it). So the levers are (a) cut the SYNC TP reduce (SP / topology) and (b) the in-kernel a2a pipeline (kernel work, verify with a device trace) — not generic XLA overlap.</div>";
+  const cm=D.hlo&&D.hlo.compile, spon=D.hlo&&D.hlo.network&&D.hlo.network.sp_active;
+  h+="<div class='note'>type = model prediction (can it pipeline behind compute?); <b>XLA actual</b> = what the compiled HLO actually scheduled (✓ agrees · ⚠ model says hideable but it is exposed / not XLA-scheduled)"+(cm?", from the compiled HLO ("+cm.n_layers_compiled+" representative layers · "+cm.tokens_global+" tokens · SP "+(spon?"on":"off")+")":"")+". Rows are model <b>categories</b> (each spans all its layers) while the HLO counts opcodes — so the all-reduce rows all map to the one all-reduce opcode. The a2a is in-kernel (XLA can't touch it) and is <b>measured exposed</b> at the torus floor (cross-host) / VMEM-blocked; a device trace is the final word on how much compute hides in its shadow.</div>";
   return h;}
 function lensKernel(s,R){
   let h="<div class='lh'>Kernel — which to attack, and how</div><div class='note'>Ranked by ideal ms. Bound → lever: HBM → ↓ bytes; compute → ↑ MXU rate / ↓ flops; ICI → overlap / ↓ comm.</div>";
@@ -604,9 +640,17 @@ function kernelTune(s,R){
     const ctx=R.decode?s.seq_len:tokens, eff=d.window?Math.min(ctx,d.window):ctx, inter=tokens*(R.decode?eff:eff/2);
     const o=attention(nq,nkv,hd,vhd,tokens,inter), flops=o.flops;
     const kvB=Math.floor(inter/32)*nkv*2*hd*2, qoB=o.hbm-kvB;
-    const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]);
-    const vmem=blk.bq*hd*2 + blk.bkv*hd*2*2 + blk.bq*blk.bkv*4;
-    h+=card("RPA attention (per device, "+(R.decode?"decode":"prefill")+")", (blk.name||"n/a"), kvB, qoB, flops, [], "bf16", vmem,
+    // tuned (bq,bkv) keyed on max_num_tokens (= per-device q tokens = the knob), t,
+    // stage (decode->d, prefill->p then m), full attention (sw=full). Miss -> traced name.
+    const stg=R.decode?"d":"p", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
+    const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|m|"+sw]);
+    let bq,bkv,blkLbl;
+    if(rk&&rk.length){const rb=rk.find(e=>e.n>=tokens)||rk[rk.length-1]; bq=rb.bq; bkv=rb.bkv;
+      blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode":"prefill")+") → bq="+bq+" bkv="+bkv;}
+    else {const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]); bq=blk.bq||16; bkv=blk.bkv||512;
+      blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+")";}
+    const vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
+    h+=card("RPA attention (per device, "+(R.decode?"decode":"prefill")+")", blkLbl, kvB, qoB, flops, [], "bf16", vmem,
       (bound,x)=>{
         if(bound==="HBM") return "<b>KV-read-bound.</b> KV-cache read ≈ "+fmt(x.wB/1e9)+" GB dominates. Levers: ① fp8 KV cache (½ read); ② fewer KV heads / GQA (nkv/dev="+nkv+"); ③ smaller window for SWA ("+(d.window||"full")+"). bq/bkv tune VMEM + MXU util, not the KV bytes (workload-fixed).";
         return "<b>compute-bound.</b> Levers: ↑ MXU util (bq/bkv tiling), or it's just cheap (decode attention often is).";
