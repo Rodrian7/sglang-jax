@@ -413,10 +413,14 @@ function lensOverlap(s,R){
     +"<div class='bar' style='width:"+(exposed/cmx*100)+"%;background:#ec4899' title='exposed'></div></div>"
     +"<div class='ms'>"+commTot.toFixed(3)+" ms</div></div>";
   h+="<div class='note'><span style='color:#16a34a'>■</span> hidden "+hidden.toFixed(3)+" ms &nbsp; <span style='color:#db2777'>■</span> exposed "+exposed.toFixed(3)+" ms</div>";
-  // step band
-  const bmx=Math.max(noOv,1e-9), bar=(lab,v,col)=>"<div class='dfrow'><div class='nm'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,v/bmx*100)+"%;background:"+col+"'></div></div><div class='ms'>"+v.toFixed(2)+" ms</div></div>";
-  h+="<div class='note' style='margin-top:8px'><b>step estimate</b> (per-resource: ΣC "+R.Tc.toFixed(2)+" / ΣH "+R.Th.toFixed(2)+" / ΣI "+commTot.toFixed(2)+" ms)</div>";
-  h+=bar("no comm overlap",noOv,"#cbd5e1")+bar("pipeline model (a2a hidden, barriers exposed)",pipeStep,"#3b82f6")+bar("perfect overlap floor = max(ΣC,ΣH,ΣI)",R.tot,"#22c55e");
+  // step = compute/HBM wall + exposed comm (single decomposed bar)
+  const W=Math.max(pipeStep,1e-9);
+  h+="<div class='note' style='margin-top:8px'><b>step ≈ "+pipeStep.toFixed(2)+" ms</b> = compute/HBM wall + exposed comm (ΣC "+R.Tc.toFixed(2)+" / ΣH "+R.Th.toFixed(2)+" / ΣI "+commTot.toFixed(2)+" ms)</div>";
+  h+="<div class='dfrow'><div class='nm'>step breakdown</div><div class='barwrap' style='display:flex'>"
+    +"<div class='bar' style='width:"+(nonComm/W*100)+"%;background:#3b82f6' title='compute/HBM wall'></div>"
+    +"<div class='bar' style='width:"+(exposed/W*100)+"%;background:#ec4899' title='exposed comm'></div></div>"
+    +"<div class='ms'>"+pipeStep.toFixed(2)+" ms</div></div>";
+  h+="<div class='note'><span style='color:#2563eb'>■</span> compute/HBM wall = max(ΣC,ΣH) = <b>"+nonComm.toFixed(2)+" ms</b> &nbsp; <span style='color:#db2777'>■</span> exposed comm <b>"+exposed.toFixed(2)+" ms</b> &nbsp;·&nbsp; overlap already hides "+hidden.toFixed(2)+" ms of comm (vs "+noOv.toFixed(2)+" ms if nothing overlapped).</div>";
   // verdict
   if(exposed<0.02*Math.max(nonComm,1e-9)) h+="<div class='verdict v-go'>Exposed comm ≈ <b>"+exposed.toFixed(3)+" ms</b> (≪ "+nonComm.toFixed(2)+" ms compute/HBM) → comm is <b>not</b> the bottleneck; step stays "+R.tbound+"-bound. Overlap won't move the needle — cut "+(R.Th>=R.Tc?"HBM bytes":"flops")+".</div>";
   else h+="<div class='verdict v-warn'>Exposed comm ≈ <b>"+exposed.toFixed(2)+" ms</b> on top of the "+nonComm.toFixed(2)+" ms compute/HBM floor ("+(exposed/pipeStep*100).toFixed(0)+"% of step). Lever: hide the a2a (kernel pipelining / async) or cut barriers (SP, topology, EP locality).</div>";
