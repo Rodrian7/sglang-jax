@@ -483,36 +483,33 @@ function lensKernel(R){
   return h;}
 function lensFusion(s,R){
   const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
-  const C=[["input_norm → qkv","RMSNorm → matmul prologue",H,attnN],["qkv → rope","RoPE → matmul epilogue",qsz,attnN],
-    ["rope → attention","RoPE folded into attention kernel",qsz,attnN],["o_proj → residual","residual → matmul epilogue",H,attnN],
-    ["post_norm → "+(D.n_moe>0?"router":"gate_up"),"RMSNorm → matmul prologue",H,attnN]];
-  if(D.n_moe>0) C.push(["experts → residual","residual → MoE kernel epilogue",H,D.n_moe]);
-  else C.push(["gate_up → silu","SiLU → matmul epilogue",D.DENSE_F,D.n_dense],["silu → down","SiLU → matmul prologue",D.DENSE_F,D.n_dense]);
-  const rows=C.map(c=>{const gb=tokens*c[2]*2*c[3]/1e9; return {name:c[0],why:c[1],gb,ms:gb*1e9/HBMBW*1e3};}).sort((a,b)=>b.ms-a.ms);
+  const f=(D.hlo&&D.hlo.fusion)||null, ko=(f&&f.by_kind&&f.by_kind.kOutput)||0, ki=(f&&f.by_kind&&f.by_kind.kInput)||0;
+  // status of a candidate fusion against the compiled HLO. epilogue = folded into
+  // a matmul output (kOutput); prologue = into a matmul input (kInput — TPU MXU
+  // does NOT do this, so it stays unfused & the activation materialises); kernel
+  // = folded inside a Pallas kernel (kCustom, not a separate XLA fusion).
+  function status(kind){
+    if(!f) return ["b-none","— (no HLO; theory only)"];
+    if(kind==="kernel") return ["b-compute","✓ fused — inside Pallas kernel (kCustom)"];
+    if(kind==="epilogue") return ko>0?["b-compute","✓ fused by XLA — matmul epilogue (kOutput×"+ko+")"]:["b-ICI","✗ not fused"];
+    return ki>0?["b-compute","✓ fused — matmul prologue (kInput×"+ki+")"]:["b-ICI","✗ not fused — TPU MXU has no prologue fusion; activation materialises"];
+  }
+  const C=[
+    ["input_norm → qkv","prologue",H,attnN],
+    ["o_proj → residual_add","epilogue",H,attnN],
+    ["post_norm → "+(D.n_moe>0?"router":"gate_up"),"prologue",H,attnN],
+    ["rope → attention","kernel",qsz,attnN],
+  ];
+  if(D.n_moe>0) C.push(["experts → residual_add","kernel",H,D.n_moe]);
+  else C.push(["gate_up → silu","epilogue",D.DENSE_F,D.n_dense],["silu → down_proj","prologue",D.DENSE_F,D.n_dense]);
+  const rows=C.map(c=>{const gb=tokens*c[2]*2*c[3]/1e9,[cls,txt]=status(c[1]);return {name:c[0],kind:c[1],gb,ms:gb*1e9/HBMBW*1e3,cls,txt};}).sort((a,b)=>b.ms-a.ms);
   const totGB=rows.reduce((a,r)=>a+r.gb,0), totMs=rows.reduce((a,r)=>a+r.ms,0), HgB=R.Th*HBMBW/1e3/1e9;
-  let h="<div class='lh'>Fusion — which intermediate HBM round-trips to remove</div>";
-  h+="<div class='note'>Fold single producer→consumer activations into the neighbouring matmul/kernel, dropping the intermediate's HBM round-trip. Model is <b>"+R.tbound+"-bound</b>"+(R.tbound==="HBM"?" → bytes saved ≈ step saved.":" → saving HBM may not cut step.")+"</div>";
-  h+="<div class='verdict v-go'>Fusable intermediates ≈ <b>"+fmt(totGB)+" GB</b> ≈ <b>"+(R.tot>0?(totMs/R.tot*100).toFixed(0):0)+"% of step</b> ("+(HgB>0?(totGB/HgB*100).toFixed(0):0)+"% of ΣH HBM traffic). Ranked by step saved:</div>";
-  const mx=Math.max(...rows.map(r=>r.ms),1e-9);
-  for(const r of rows) h+="<div class='dfrow'><div class='nm' style='flex-basis:190px'>"+r.name+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,r.ms/mx*100)+"%;background:#0d9488'></div></div><div class='ms'>"+r.ms.toFixed(3)+" ms · "+fmt(r.gb)+" GB</div></div>";
-  h+="<div class='note' style='margin-top:6px'>"+rows.slice(0,3).map(r=>"<b>"+r.name+"</b>: "+r.why).join(" &nbsp;·&nbsp; ")+"</div>";
-  h+="<div class='note' style='color:#a55'>⚠ XLA may already fuse some — this is the upper bound; verify with optimized HLO / trace.</div>";
-  h+=fusionHLOHTML();
-  return h;}
-function fusionHLOHTML(){const H=D.hlo; if(!H||!H.fusion)return ""; const f=H.fusion, bk=f.by_kind||{}, c=f.candidates||{};
-  let h="<div class='lh' style='margin-top:14px'>Compiler ground truth (optimized HLO)</div>";
-  h+="<div class='note'>What XLA <b>already</b> fused — from the same compiled HLO as the Overlap tab. Evidence, not a model. <b>"+(f.n_fusions||0)+" fusions</b> total.</div>";
-  // table 1: fusion regions by kind
-  const KMEAN={kLoop:"elementwise / norm / RoPE chains",kOutput:"matmul epilogue (residual / SiLU folded into the matmul output)",kInput:"matmul prologue (op folded into a matmul input)",kCustom:"Pallas kernels (attention / fused MoE)"};
-  h+="<table><thead><tr><th class='l'>fusion kind</th><th>count</th><th class='l'>what it fuses</th></tr></thead><tbody>";
-  for(const k in bk) h+="<tr><td class='l mono'>"+k+"</td><td>"+bk[k]+"</td><td class='l'>"+(KMEAN[k]||"")+"</td></tr>";
+  let h="<div class='lh'>Fusion — which intermediate HBM round-trips are removed</div>";
+  h+="<div class='note'>Fold a single producer→consumer activation into the neighbouring matmul/kernel, dropping the intermediate's HBM round-trip. Model is <b>"+R.tbound+"-bound</b>"+(R.tbound==="HBM"?" → bytes saved ≈ step saved.":".")+" The <b>status</b> column is from the compiled HLO"+(f?(" ("+f.n_fusions+" fusions: "+Object.keys(f.by_kind).map(k=>f.by_kind[k]+"× "+k).join(", ")+")"):" — none baked")+".</div>";
+  h+="<table><thead><tr><th class='l'>fusion (producer → consumer)</th><th class='l'>type</th><th>HBM GB</th><th>saved ms</th><th class='l'>XLA status (from HLO)</th></tr></thead><tbody>";
+  for(const r of rows) h+="<tr><td class='l'>"+r.name+"</td><td class='l' style='color:#667'>"+r.kind+"</td><td>"+fmt(r.gb)+"</td><td>"+r.ms.toFixed(3)+"</td><td class='l'><span class='tag "+r.cls+"'>"+r.txt+"</span></td></tr>";
   h+="</tbody></table>";
-  // table 2: candidate ops -> are they folded into fusions?
-  const CN={rms_norm:"RMSNorm",rotary:"RoPE",silu:"SiLU",softmax:"softmax (attention)"};
-  h+="<table style='margin-top:8px'><thead><tr><th class='l'>candidate op</th><th>#ops folded into fusions</th><th class='l'>status</th></tr></thead><tbody>";
-  for(const k in c) h+="<tr><td class='l'>"+(CN[k]||k)+"</td><td>"+c[k]+"</td><td class='l'>"+(c[k]>0?"<span class='tag b-compute'>fused ✓</span>":"<span class='tag b-ICI'>inside Pallas kernel</span>")+"</td></tr>";
-  h+="</tbody></table>";
-  h+="<div class='verdict v-go'>The prologue/epilogue fusions in the table above are <b>already done</b> by XLA ("+(bk.kOutput||0)+" matmul-epilogue + "+(bk.kLoop||0)+" loop fusions), so the theory \"savings\" are mostly captured. What's left is cross-kernel (rope→attention, residual→MoE) folded inside the Pallas kernels — not separate XLA fusions. <b>Fusion is a small lever here.</b></div>";
+  h+="<div class='verdict v-go'>Theory upper bound ≈ <b>"+fmt(totGB)+" GB</b> ≈ "+(R.tot>0?(totMs/R.tot*100).toFixed(0):0)+"% of step. But per the HLO: the <b>epilogue</b> + in-<b>kernel</b> fusions are <b>already done</b> by XLA; the only unrealised ones are <b>matmul prologues</b>, which TPU's MXU does not fuse anyway (the normed activation must materialise before the matmul). → <b>fusion is not a lever here.</b></div>";
   return h;}
 function dataflowHTML(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
