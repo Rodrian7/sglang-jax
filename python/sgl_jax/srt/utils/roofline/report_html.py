@@ -463,16 +463,16 @@ function lensOverlap(s,R){
     // the a2a can pipeline behind the experts kernel's execution = its ideal time
     // (compute & HBM overlapped inside the kernel)
     const expMs=Math.max(e.flops/flops_per_s(e.peak), e.hbm/HBMBW)*1e3*D.n_moe;
-    items.push({name:"MoE all-to-all (dispatch + combine)",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts kernel "+expMs.toFixed(1)+" ms"});
-    items.push({name:"MoE output all-reduce (TP, tensor axis)",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
+    items.push({name:"MoE all-to-all (dispatch + combine)",op:"kernel",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts kernel "+expMs.toFixed(1)+" ms"});
+    items.push({name:"MoE output all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
   }
-  if(attnN>0) items.push({name:"o_proj all-reduce (TP, tensor axis)",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
-  if(D.n_dense>0) items.push({name:"down_proj all-reduce (TP, tensor axis)",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
+  if(attnN>0) items.push({name:"o_proj all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
+  if(D.n_dense>0) items.push({name:"down_proj all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
   // SP re-gather: async all-gather (one per block before its input linear) that XLA
   // overlaps with the linear -> hidden comm, not an exposed barrier (HLO ground truth).
-  {const agB=spGather(tokens,D.H,L); if(agB>0) items.push({name:"SP all-gather (re-collect seq before linears)",ms:msi(agB)*(attnN+D.n_moe+D.n_dense),type:"pipelineable",cap:1e9,behind:"input linears (XLA async)"});}
+  {const agB=spGather(tokens,D.H,L); if(agB>0) items.push({name:"SP all-gather (re-collect seq before linears)",op:"all-gather",ms:msi(agB)*(attnN+D.n_moe+D.n_dense),type:"pipelineable",cap:1e9,behind:"input linears (XLA async)"});}
   // embedding lookup all-reduce (vocab-sharded embed gather over the tensor axis); once per step
-  if(L.t>1) items.push({name:"embedding all-reduce (vocab-sharded)",ms:msi(allreduce(tokens*D.H*2,L.t)),type:"barrier",cap:0,behind:"—"});
+  if(L.t>1) items.push({name:"embedding all-reduce (vocab-sharded)",op:"all-reduce",ms:msi(allreduce(tokens*D.H*2,L.t)),type:"barrier",cap:0,behind:"—"});
   let hidden=0,exposed=0,commTot=0;
   for(const it of items){if(it.type==="pipelineable"){it.hidden=Math.min(it.ms,it.cap);it.exposed=it.ms-it.hidden;}else{it.hidden=0;it.exposed=it.ms;} hidden+=it.hidden;exposed+=it.exposed;commTot+=it.ms;}
   const nonComm=Math.max(R.Tc,R.Th), pipeStep=nonComm+exposed, noOv=nonComm+commTot;
@@ -503,12 +503,22 @@ function lensOverlap(s,R){
   if(commTot>nonComm) h+="<div class='verdict v-warn'><b>ICI / comm-bound.</b> ΣI ("+commTot.toFixed(0)+" ms) &gt; compute/HBM wall ("+nonComm.toFixed(0)+" ms): even <b>perfect</b> overlap can't go below the comm time, so step ≥ <b>"+floor.toFixed(0)+" ms</b> regardless of scheduling. Overlap is <b>not</b> the lever — you must <b>reduce comm</b> (the MoE a2a): smaller prefill chunk, EP locality / topology, or fewer cross-host hops.</div>";
   else if(exposed<0.02*Math.max(nonComm,1e-9)) h+="<div class='verdict v-go'>Exposed comm ≈ <b>"+exposed.toFixed(3)+" ms</b> (≪ "+nonComm.toFixed(2)+" ms compute/HBM) → comm is <b>not</b> the bottleneck; step stays "+R.tbound+"-bound. Overlap won't move the needle — cut "+(R.Th>=R.Tc?"HBM bytes":"flops")+".</div>";
   else h+="<div class='verdict v-warn'>Exposed comm ≈ <b>"+exposed.toFixed(2)+" ms</b> on top of the "+nonComm.toFixed(2)+" ms compute/HBM floor ("+(exposed/pipeStep*100).toFixed(0)+"% of step). Lever: hide the a2a (kernel pipelining / async) or cut barriers (SP, topology, EP locality).</div>";
-  // per-collective table
-  h+="<table style='margin-top:10px'><thead><tr><th class='l'>collective</th><th>ICI ms</th><th class='l'>type</th><th>hidden</th><th>exposed</th><th class='l'>hides behind</th></tr></thead><tbody>";
-  for(const it of items.sort((a,b)=>b.ms-a.ms)) h+="<tr><td class='l'>"+it.name+"</td><td>"+it.ms.toFixed(3)+"</td><td class='l'><span class='tag "+(it.type==="pipelineable"?"b-compute":"b-ICI")+"'>"+it.type+"</span></td><td>"+it.hidden.toFixed(3)+"</td><td>"+it.exposed.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+it.behind+"</td></tr>";
-  if(!items.length) h+="<tr><td class='l' colspan=6>no collectives at this layout</td></tr>";
+  // per-collective table — MERGED: model classification + XLA ground truth (HLO) per row
+  const HV=(D.hlo&&D.hlo.network&&D.hlo.network.by_type)||null;
+  function xlaCell(op,type){
+    if(op==="kernel") return "<span style='color:#d97706;font-weight:700'>⚠</span> in-kernel (SparseCore), not XLA-scheduled · <b>measured exposed</b>";
+    if(!HV) return "<span style='color:#aab'>—</span>";
+    const t=HV[op]; if(!t) return "<span style='color:#aab'>absent in HLO</span>";
+    const sy=t.sync||0, as=t.async_||0, isAsync=as>0&&sy===0, isSync=sy>0&&as===0;
+    const verdict=isAsync?"ASYNC (overlapped)":isSync?"SYNC (barrier)":sy+" sync / "+as+" async";
+    const ok=type==="barrier"?isSync:isAsync, c=ok?"#16a34a":"#d97706";
+    return "<span style='color:"+c+";font-weight:700'>"+(ok?"✓":"⚠")+"</span> "+verdict+" <span style='color:#889'>("+t.count+"×)</span>";
+  }
+  h+="<table style='margin-top:10px'><thead><tr><th class='l'>collective</th><th>ICI ms</th><th class='l'>type (model)</th><th>hidden</th><th>exposed</th><th class='l'>hides behind</th>"+(HV?"<th class='l'>XLA actual (HLO)</th>":"")+"</tr></thead><tbody>";
+  for(const it of items.sort((a,b)=>b.ms-a.ms)) h+="<tr><td class='l'>"+it.name+"</td><td>"+it.ms.toFixed(3)+"</td><td class='l'><span class='tag "+(it.type==="pipelineable"?"b-compute":"b-ICI")+"'>"+it.type+"</span></td><td>"+it.hidden.toFixed(3)+"</td><td>"+it.exposed.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+it.behind+"</td>"+(HV?"<td class='l' style='font-size:11px'>"+xlaCell(it.op,it.type)+"</td>":"")+"</tr>";
+  if(!items.length) h+="<tr><td class='l' colspan="+(HV?7:6)+">no collectives at this layout</td></tr>";
   h+="</tbody></table>";
-  h+="<div class='verdict v-warn' style='background:#fffbeb'>⚠ <b>pipelineable ≠ actually overlapped.</b> On this hardware the MoE a2a has been measured <b>exposed</b> at the torus bandwidth floor (cross-host) / VMEM-blocked — XLA may not hide it. The <b>Trace</b>/HLO pass is what confirms which collectives are async and how much compute sits in their shadow.</div>";
+  h+="<div class='note'>type = model prediction (can it pipeline behind compute?); <b>XLA actual</b> = what the compiled HLO scheduled (✓ = agrees, ⚠ = model says hideable but it is exposed / not XLA-scheduled). The a2a is in-kernel so XLA can't touch it — and it has been <b>measured exposed</b> at the torus floor (cross-host) / VMEM-blocked; a device trace is the final word on how much compute sits in its shadow.</div>";
   h+=hloOverlapHTML();
   return h;}
 function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
@@ -520,13 +530,10 @@ function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
       +c.n_layers_compiled+" representative layers ["+(c.layer_types||[]).join(", ")+"] · tp="+c.tp+" dp="+c.dp+" · "
       +c.tokens_global+" global tokens · <b>SP "+(nb.sp_active?"active":"off")+"</b> (the async all-gather kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
       +(nb.sp_active?"The row-parallel outputs still complete with a SYNC all-reduce on the tensor axis; SP adds an ASYNC all-gather (overlapped) to re-collect the sequence shards before each linear. No reduce-scatter survives XLA lowering — the scatter is an all-reduce + free local slice.":"At this token count SP did not trigger; the TP reduces are plain all-reduce and there is no SP all-gather.")+"</div>";}
-  // network collectives
-  h+="<table><thead><tr><th class='l'>network collective</th><th>count</th><th>sync / async</th><th class='l'>replica_groups</th><th>bytes</th></tr></thead><tbody>";
-  let any=false;
-  for(const k in bt){any=true; const t=bt[k];
-    h+="<tr><td class='l'>"+k+"</td><td>"+t.count+"</td><td>"+(t.sync||0)+" / "+(t.async_||0)+"</td><td class='l mono'>"+(t.groups||"")+"</td><td>"+fmt(t.bytes/1e6)+" MB</td></tr>";}
-  if(!any) h+="<tr><td class='l' colspan=5>none</td></tr>";
-  h+="</tbody></table>";
+  // opcode totals folded into one caption (the per-row verdicts live in the merged
+  // table above; only the raw replica_groups + byte totals are added here)
+  let inv=[]; for(const k in bt){const t=bt[k]; inv.push(k+" <b>"+t.count+"×</b> ("+(t.sync||0)+" sync/"+(t.async_||0)+" async) <span class='mono' style='font-size:10px'>"+(t.groups||"")+"</span> "+fmt(t.bytes/1e6)+" MB");}
+  if(inv.length) h+="<div class='note'><b>HLO opcode totals</b> (at the compiled point above): "+inv.join(" &nbsp;·&nbsp; ")+"</div>";
   h+="<div class='verdict "+((nb.n_sync_barrier||0)>0?"v-warn":"v-go")+"'>"
     +"<b>"+(nb.n_sync_barrier||0)+" SYNC</b> collectives (exposed barriers — over the tensor axis per replica_groups; mostly TP all-reduce + the embedding gather) "
     +"&nbsp;·&nbsp; <b>"+(nb.n_async||0)+" async</b> (XLA overlaps these — e.g. the SP all-gather). "
