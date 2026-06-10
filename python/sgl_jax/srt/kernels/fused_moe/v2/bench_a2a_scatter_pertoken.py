@@ -149,7 +149,7 @@ def _runner(h, dtype):
 
 def _check():
     """Single-host only: deterministic int32 payload, pull recv, verify routing."""
-    h = 8
+    h = 128  # last dim must be a multiple of 128 (TPU HBM tiling)
     run = _runner(h, jnp.int32)
     # global x[g*N + r] = g*MULT + r  (g = global device index)
     rows = np.arange(N, dtype=np.int32)
