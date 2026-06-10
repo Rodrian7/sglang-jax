@@ -203,7 +203,7 @@ class FlashAttention(AttentionBackend):
         )
         return metadata
 
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, return_numpy=False):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
@@ -318,6 +318,14 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
         seq_lens = np.array(seq_lens)
+        if return_numpy:
+            return {
+                "cu_q_lens": cu_q_lens,
+                "cu_kv_lens": cu_kv_lens,
+                "page_indices": page_indices,
+                "seq_lens": seq_lens,
+                "distribution": distribution,
+            }
         (
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
@@ -347,7 +355,7 @@ class FlashAttention(AttentionBackend):
             )
         return metadata
 
-    def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
+    def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch, return_numpy=False):
 
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         # NOTE: Use original_selected_cache_locs as the source of truth for all steps
@@ -434,6 +442,17 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack(
             [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
         ).ravel()
+        if return_numpy:
+            return [
+                {
+                    "cu_q_lens": cu_q_lens,
+                    "cu_kv_lens": cu_kv_lens[i],
+                    "page_indices": page_indices[i],
+                    "seq_lens": seq_lens_list[i],
+                    "distribution": distribution,
+                }
+                for i in range(batch.speculative_num_steps)
+            ]
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()

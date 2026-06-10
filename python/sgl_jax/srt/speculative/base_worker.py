@@ -84,6 +84,12 @@ class BaseSpecWorker:
             and self.speculative_num_steps > 1
             and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
         )
+        self._can_use_fused_eagle3_spec_decode = (
+            self.speculative_algorithm.is_eagle3()
+            and self.topk == 1
+            and self.speculative_num_steps > 1
+            and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
@@ -151,6 +157,10 @@ class BaseSpecWorker:
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
             return spec_decode(self, model_worker_batch, cur_allocate_lens)
+        if self._can_use_fused_eagle3_spec_decode and model_worker_batch.sampling_info.is_all_greedy:
+            from sgl_jax.srt.speculative.draft_extend_fused import eagle3_spec_decode
+
+            return eagle3_spec_decode(self, model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
