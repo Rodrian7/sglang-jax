@@ -497,6 +497,16 @@ function lensFusion(s,R){
   for(const r of rows) h+="<div class='dfrow'><div class='nm' style='flex-basis:190px'>"+r.name+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,r.ms/mx*100)+"%;background:#0d9488'></div></div><div class='ms'>"+r.ms.toFixed(3)+" ms · "+fmt(r.gb)+" GB</div></div>";
   h+="<div class='note' style='margin-top:6px'>"+rows.slice(0,3).map(r=>"<b>"+r.name+"</b>: "+r.why).join(" &nbsp;·&nbsp; ")+"</div>";
   h+="<div class='note' style='color:#a55'>⚠ XLA may already fuse some — this is the upper bound; verify with optimized HLO / trace.</div>";
+  h+=fusionHLOHTML();
+  return h;}
+function fusionHLOHTML(){const H=D.hlo; if(!H||!H.fusion)return ""; const f=H.fusion, bk=f.by_kind||{}, c=f.candidates||{};
+  let h="<div class='lh' style='margin-top:14px'>Compiler ground truth (optimized HLO)</div>";
+  h+="<div class='note'>What XLA <b>already</b> fused — from the same compiled HLO as the Overlap tab. Evidence, not a model.</div>";
+  h+="<div class='verdict v-go'>XLA created <b>"+(f.n_fusions||0)+" fusions</b> ("+Object.keys(bk).map(k=>bk[k]+"× "+k).join(", ")+"). "
+    +"<span class='mono'>kOutput</span> = matmul-epilogue (residual / SiLU folded into the matmul output); <span class='mono'>kLoop</span> = elementwise/norm loop fusions; <span class='mono'>kCustom</span> = Pallas.</div>";
+  const done=Object.keys(c).filter(k=>c[k]>0);
+  if(done.length) h+="<div class='note'>Candidate ops confirmed folded into fusions: "+done.map(k=>"<b>"+k+"</b> ("+c[k]+" ops)").join(", ")+". → the prologue/epilogue fusions above are <b>already done</b> by XLA; the theory \"savings\" are mostly captured.</div>";
+  h+="<div class='note' style='color:#a55'>⚠ what's left is cross-kernel (e.g. rope→attention, residual→MoE) folded inside the Pallas kernels — not separate XLA fusions — or genuinely unfused. So fusion is a small lever here: the bread-and-butter is done.</div>";
   return h;}
 function dataflowHTML(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};

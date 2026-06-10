@@ -85,11 +85,36 @@ def parse_hlo_overlap(text: str) -> dict:
     net_by = {}
     n_net_sync = n_net_async = 0
     n_sc = n_copy = n_pallas = 0
+    # fusion ground truth: XLA's fused regions + whether the theory-candidate
+    # elementwise/norm/rope ops were folded into fusions (fused) or left standalone.
+    n_fusion = 0
+    fusion_kind = {}
+    # candidate elementwise/norm/rope categories -> how many of their ops landed
+    # INSIDE a fusion region (= XLA fused them). Case-insensitive op_name match.
+    cand = {k: 0 for k in ("rms_norm", "rotary", "silu", "softmax")}
+    in_fused = False
     for ln in lines:
+        # computation boundaries (headers start at column 0 and end with '{')
+        if ln and ln[0] not in " \t":
+            if ln.rstrip().endswith("{"):
+                in_fused = "fused_computation" in ln.split("(")[0]
+            elif ln.startswith("}"):
+                in_fused = False
         m = _INSTR.match(ln)
         if not m:
             continue
         name, rhs = m.group(1), m.group(2)
+        if re.search(r"(^|[^\w-])fusion\(", rhs):
+            n_fusion += 1
+            km = re.search(r"kind=(k\w+)", rhs)
+            if km:
+                fusion_kind[km.group(1)] = fusion_kind.get(km.group(1), 0) + 1
+        if in_fused and 'op_name="' in rhs:
+            low = rhs.lower()
+            for k in cand:
+                if k in low:
+                    cand[k] += 1
+                    break
         # A collective shows up either as an opcode (all-reduce(...)) or, when XLA
         # wraps it async, as an instruction NAMED for it (e.g.
         # %all-gather.14.cloned.1.call-start = ... async-start(...)). Detect both;
@@ -144,6 +169,11 @@ def parse_hlo_overlap(text: str) -> dict:
         "sparsecore_async": {"count": n_sc},  # MoE dispatch/combine on SparseCore
         "memory_prefetch_async": n_copy,  # HBM<->VMEM async copies (latency hiding)
         "pallas_kernels": n_pallas,  # tpu_custom_call (attention + fused MoE; a2a is in here)
+        "fusion": {
+            "n_fusions": n_fusion,
+            "by_kind": fusion_kind,  # kLoop / kOutput(epilogue) / kInput / kCustom
+            "candidates": cand,  # rms_norm/rotary/silu/softmax: #ops folded into fusions
+        },
     }
 
 
