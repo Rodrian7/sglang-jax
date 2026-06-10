@@ -181,6 +181,9 @@ def _mimo_v2_family(config, phase, par, peaks, arch_name="MiMoV2") -> ModelRoofl
             v_head_dim=d["vhd"],
             q_tokens=tokens,
             total_interactions=int(inter),
+            # decode's q_tokens are separate sequences each reading their own full KV
+            # (no shared flash q-blocking) -> bq=1; prefill blocks one sequence -> bq=32
+            bq=1 if phase == "decode" else 32,
         )
         rows.append(
             _op(

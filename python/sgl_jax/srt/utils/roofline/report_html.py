@@ -368,7 +368,11 @@ function wpeak(){ return (Q.wq!=="bf16" && Q.wq!=="block" && Q.aq==="fp8") ? "fp
 function gemm(m,k,n,role){const q=WROLES[role]&&Q.wq!=="bf16";
   const wb=q?wbytes(k,n):2*k*n, ab=q?abytes(m,k):2*m*k;
   return {flops:2*m*k*n, hbm:wb+ab+2*m*n, ici:0, peak:q?wpeak():"bf16"};}
-function attention(nq,nkv,hd,vhd,qtok,inter){const f=4*nq*hd*inter; const bq=32;
+// bq = query-block size for the flash KV-read model. Prefill blocks ONE sequence's
+// queries (bq=32) so the KV streams ~once per block (~inter/bq). Decode's qtok tokens
+// are SEPARATE sequences each reading their own full KV — no shared blocking, bq=1 ->
+// inter (matches the tuned decode block bq=1). Hardcoding 32 under-counted decode KV 32x.
+function attention(nq,nkv,hd,vhd,qtok,inter,bq){bq=bq||32; const f=4*nq*hd*inter;
   const hbm=qtok*nq*hd*2 + qtok*nq*vhd*2 + Math.floor(inter/bq)*nkv*2*hd*2 + qtok*nkv*2*hd*2; return {flops:f,hbm:hbm,ici:0,peak:"bf16"};}
 function moe(tpd,le,d,f,role){const q=WROLES[role]&&Q.wq!=="bf16";
   const wbf=q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d); const act=(q?abytes(tpd,d):2*tpd*d)+2*tpd*d;
@@ -410,7 +414,7 @@ function compute(s){
     const inter = tokens*(decode? effctx : effctx/2);
     add("linear", gemm(tokens,D.H,qs+ks+vs,"qkv"), count, t);
     add("rope", rope(tokens,qs,ks), count, t);
-    add("attention", attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter), count, 1);
+    add("attention", attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter,decode?1:32), count, 1);
     add("o_proj", gemm(tokens,ao,D.H,"o_proj"), count, t);
     cat.o_proj.ici += rowReduce(tokens,D.H,L)*count;
     add("norm", rms(tokens,D.H), 2*count); add("other", elt(tokens,D.H,2), 2*count);
@@ -638,8 +642,8 @@ function kernelTune(s,R){
   {
     const d=D.full, nq=Math.max(1,Math.floor(d.nh/t)), nkv=kvpd(d.nkv,t), hd=d.hd, vhd=d.vhd;
     const ctx=R.decode?s.seq_len:tokens, eff=d.window?Math.min(ctx,d.window):ctx, inter=tokens*(R.decode?eff:eff/2);
-    const o=attention(nq,nkv,hd,vhd,tokens,inter), flops=o.flops;
-    const kvB=Math.floor(inter/32)*nkv*2*hd*2, qoB=o.hbm-kvB;
+    const o=attention(nq,nkv,hd,vhd,tokens,inter,R.decode?1:32), flops=o.flops;
+    const kvB=Math.floor(inter/(R.decode?1:32))*nkv*2*hd*2, qoB=o.hbm-kvB;
     // tuned (bq,bkv) keyed on max_num_tokens (= per-device q tokens = the knob), t,
     // stage, full attention (sw=full). Prefill runs the MIXED kernel (trace shows RPAm),
     // so try "m" first then "p"; decode -> "d". Miss -> traced kernel name.
