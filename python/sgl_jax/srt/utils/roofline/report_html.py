@@ -23,6 +23,7 @@ need a real trace and stay Python-side.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections import Counter
 
@@ -76,7 +77,35 @@ def _bake_moe_block_table(config) -> dict:
     if not (NEXP and TOPK and H and MOEF):
         return {}
     qc = config.get("quantization_config") or {}
-    wdt = jnp.float8_e4m3fn if "fp8" in str(qc.get("quant_method") or "").lower() else jnp.bfloat16
+    is_fp8 = "fp8" in str(qc.get("quant_method") or "").lower()
+    wdt = jnp.float8_e4m3fn if is_fp8 else jnp.bfloat16
+    wbs = qc.get("weight_block_size")
+    qbk = int(wbs[0]) if wbs else 128
+    # MoE VMEM estimator: AST-extract the PURE estimator from bench_v2 WITHOUT importing
+    # the module (bench_v2 calls jax.distributed.initialize() + jax.devices() at top
+    # level). Reads the live source each regenerate -> tracks formula changes, no copy
+    # that can drift. None if unavailable -> the JS card falls back to its rough formula.
+    vmem_est = None
+    try:
+        import ast as _ast
+        import math as _math
+        import os as _os
+
+        import sgl_jax.srt.kernels.fused_moe.v2 as _v2pkg
+
+        _p = _os.path.join(_os.path.dirname(_v2pkg.__file__), "bench_v2.py")
+        with open(_p) as _f:
+            _tree = _ast.parse(_f.read())
+        _ns = {"math": _math}
+        for _node in _tree.body:
+            if isinstance(_node, _ast.FunctionDef) and _node.name in (
+                "_align_to",
+                "_estimate_vmem_bytes_v2",
+            ):
+                exec(compile(_ast.Module([_node], []), _p, "exec"), _ns)
+        vmem_est = _ns.get("_estimate_vmem_bytes_v2")
+    except Exception:
+        vmem_est = None
     buckets = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     out: dict[int, list] = {}
     for ep in (1, 2, 4, 8, 16, 32, 64, 128, 256):
@@ -97,7 +126,30 @@ def _bake_moe_block_table(config) -> dict:
                     weight_dtype=wdt,
                     ep_size=ep,
                 )
-                row.append({"n": n, "bt": int(cfg.bt), "bf": int(cfg.bf)})
+                e = {"n": n, "bt": int(cfg.bt), "bf": int(cfg.bf)}
+                if vmem_est is not None:
+                    # kernel's own VMEM working-set estimate (double-buffered W1/W3/W2 + staging)
+                    with contextlib.suppress(Exception):
+                        bc = cfg.effective_for(num_tokens=n, ep_size=ep)
+                        e["vmem"] = int(
+                            vmem_est(
+                                bt=bc.bt,
+                                bf=bc.bf,
+                                btc=bc.btc,
+                                bse=bc.bse,
+                                bts=bc.bts,
+                                hidden_size=H,
+                                intermediate_size=MOEF,
+                                num_experts=NEXP,
+                                top_k=TOPK,
+                                ep_size=ep,
+                                num_tokens=n,
+                                use_fp8=is_fp8,
+                                quant_block_k=qbk,
+                                direct_scaled_dot=True,
+                            )
+                        )
+                row.append(e)
             except Exception:
                 pass
         if row:
@@ -118,6 +170,9 @@ def _bake_rpa_block_table(config) -> dict:
     try:
         import jax.numpy as jnp
 
+        from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+            get_vmem_estimate_bytes,
+        )
         from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
             get_tuned_block_sizes_v3,
         )
@@ -154,8 +209,25 @@ def _bake_rpa_block_table(config) -> dict:
                         )
                     except Exception:
                         hit = None
-                    if hit:
-                        row.append({"n": n, "bq": int(hit[0]), "bkv": int(hit[1])})
+                    if not hit:
+                        continue
+                    e = {"n": n, "bq": int(hit[0]), "bkv": int(hit[1])}
+                    # kernel's own VMEM working-set estimate (double-buffered KV+mask, f32 scores)
+                    with contextlib.suppress(Exception):
+                        e["vmem"] = int(
+                            get_vmem_estimate_bytes(
+                                nkv_dev,
+                                max(1, nq // nkv_dev),
+                                hd,
+                                hit[0],
+                                hit[1],
+                                jnp.bfloat16,
+                                jnp.bfloat16,
+                                use_custom_mask=False,
+                                bkv_csz=hit[3],
+                            )
+                        )
+                    row.append(e)
                 if row:
                     out[f"{t}|{stage}|{'full' if sw is None else sw}"] = row
     return out
@@ -614,7 +686,7 @@ function kernelTune(s,R){
     let c="<div class='panel' style='margin:8px 0;box-shadow:none'><div style='font-weight:700'>"+title+" — <span class='tag b-"+(bound==="HBM"?"HBM":bound==="compute"?"compute":"ICI")+"'>"+bound+"-bound</span> ideal "+ideal.toFixed(3)+" ms</div><div class='note mono'>block: "+blk+"</div>";
     for(const p of parts) c+=kbar(p[0],p[1],tot,p[2]);
     c+="<div class='note' style='margin-top:4px'>HBM = weight+act = "+hms.toFixed(3)+" ms · compute "+cms.toFixed(3)+" ms · comm (ICI) "+ims.toFixed(3)+" ms → ideal = max = <b>"+ideal.toFixed(3)+" ms</b>. OI = <b>"+oi.toFixed(1)+"</b> · ridge "+ridge.toFixed(0)+" → MXU at "+Math.min(100,oi/ridge*100).toFixed(0)+"% "+peakKind+" peak.</div>";
-    c+="<div class='note'>VMEM working set ≈ <b>"+(vmem/1e6).toFixed(1)+" MB</b> / "+(VMEM/1e6).toFixed(0)+" MB "+(vmem>VMEM?"<span class='tag b-ICI'>over budget — would spill</span>":"<span class='tag b-compute'>fits ("+((VMEM-vmem)/1e6).toFixed(0)+" MB headroom)</span>")+"</div>";
+    c+="<div class='note'>VMEM working set ≈ <b>"+(vmem/1e6).toFixed(1)+" MB</b> (kernel's own estimate) / "+(VMEM/1e6).toFixed(0)+" MB "+(vmem>VMEM?"<span class='tag b-ICI'>over budget — would spill</span>":"<span class='tag b-compute'>fits ("+((VMEM-vmem)/1e6).toFixed(0)+" MB headroom)</span>")+"</div>";
     c+="<div class='verdict "+(bound==="compute"?"v-go":"v-warn")+"'>"+levFn(bound,{wB,aB,flops,iciB,oi,ridge,hms,ims})+"</div>";
     return c+"</div>";
   }
@@ -630,7 +702,7 @@ function kernelTune(s,R){
     const tb=tbl&&tbl.length?(tbl.find(e=>e.n>=mt)||tbl[tbl.length-1]):null;
     const bt=tb?tb.bt:16, bf=tb?tb.bf:512;
     const blkLbl=tb?("tuned @ num_tokens="+tb.n+" (chunk×dp="+mt+") → bt="+bt+" bf="+bf):("bt="+bt+" bf="+bf+" (default; no tuned entry)");
-    const vmem=bf*d*(q?1:2)+bt*d*2+bt*bf*4;
+    const vmem=(tb&&tb.vmem)?tb.vmem:(bf*d*(q?1:2)+bt*d*2+bt*bf*4);  // kernel estimate (double-buf W1/W3/W2 + staging); fallback rough
     h+=card("fused-MoE-v2 experts (per device, per layer)", blkLbl, wB, aB, flops, iciParts, wpeak(), vmem,
       (bound,x)=>{
         if(bound==="ICI") return "<b>comm-bound (ICI).</b> a2a (in-kernel, SparseCore) "+(a2aB/ICI*1e3).toFixed(3)+" ms + output all-reduce (TP, tensor axis) "+(reshardB/ICI*1e3).toFixed(3)+" ms = "+x.ims.toFixed(3)+" ms &gt; HBM "+x.hms.toFixed(3)+" ms. a2a is measured exposed at the torus floor; the all-reduce is a SYNC barrier over the tensor axis (HLO-verified). The SP all-gather that re-collects the sequence is async/hidden, not counted here. Levers: EP locality / topology / fewer cross-host hops; smaller chunk shrinks a2a; raise t-axis locality for the all-reduce.";
@@ -649,12 +721,13 @@ function kernelTune(s,R){
     // so try "m" first then "p"; decode -> "d". Miss -> traced kernel name.
     const stg=R.decode?"d":"m", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
     const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|p|"+sw]);
-    let bq,bkv,blkLbl;
+    let bq,bkv,blkLbl,vmem;
     if(rk&&rk.length){const rb=rk.find(e=>e.n>=tokens)||rk[rk.length-1]; bq=rb.bq; bkv=rb.bkv;
+      vmem=rb.vmem||(bq*hd*2 + bkv*hd*2*2 + bq*bkv*4);  // kernel estimate (double-buf KV+mask, f32 scores); fallback rough
       blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode/d":"prefill/m")+") → bq="+bq+" bkv="+bkv;}
     else {const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]); bq=blk.bq||16; bkv=blk.bkv||512;
+      vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
       blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+")";}
-    const vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
     h+=card("RPA attention (per device, "+(R.decode?"decode":"prefill")+")", blkLbl, kvB, qoB, flops, [], "bf16", vmem,
       (bound,x)=>{
         if(bound==="HBM") return "<b>KV-read-bound.</b> KV-cache read ≈ "+fmt(x.wB/1e9)+" GB dominates. Levers: ① fp8 KV cache (½ read); ② fewer KV heads / GQA (nkv/dev="+nkv+"); ③ smaller window for SWA ("+(d.window||"full")+"). bq/bkv tune VMEM + MXU util, not the KV bytes (workload-fixed).";
