@@ -641,12 +641,13 @@ function kernelTune(s,R){
     const o=attention(nq,nkv,hd,vhd,tokens,inter), flops=o.flops;
     const kvB=Math.floor(inter/32)*nkv*2*hd*2, qoB=o.hbm-kvB;
     // tuned (bq,bkv) keyed on max_num_tokens (= per-device q tokens = the knob), t,
-    // stage (decode->d, prefill->p then m), full attention (sw=full). Miss -> traced name.
-    const stg=R.decode?"d":"p", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
-    const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|m|"+sw]);
+    // stage, full attention (sw=full). Prefill runs the MIXED kernel (trace shows RPAm),
+    // so try "m" first then "p"; decode -> "d". Miss -> traced kernel name.
+    const stg=R.decode?"d":"m", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
+    const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|p|"+sw]);
     let bq,bkv,blkLbl;
     if(rk&&rk.length){const rb=rk.find(e=>e.n>=tokens)||rk[rk.length-1]; bq=rb.bq; bkv=rb.bkv;
-      blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode":"prefill")+") → bq="+bq+" bkv="+bkv;}
+      blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode/d":"prefill/m")+") → bq="+bq+" bkv="+bkv;}
     else {const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]); bq=blk.bq||16; bkv=blk.bkv||512;
       blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+")";}
     const vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
