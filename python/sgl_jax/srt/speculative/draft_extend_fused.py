@@ -1815,7 +1815,7 @@ def _build_eagle3_batches_packed(
     for k, v in tv_np.items():
         all_np[f"tv_{k}"] = v
 
-    all_np["tv_seq_lens"] = model_worker_batch.seq_lens.copy()
+    all_np["tv_fb_seq_lens"] = model_worker_batch.seq_lens.copy()
     all_np["tv_req_pool_indices"] = np.asarray(
         model_worker_batch.req_pool_indices, dtype=np.int32
     )
@@ -2012,7 +2012,7 @@ def _build_eagle3_batches_packed(
         forward_mode=ForwardMode.TARGET_VERIFY,
         batch_size=bs,
         input_ids=ph["zeros_flat"],
-        seq_lens=D["tv_seq_lens"],
+        seq_lens=D["tv_fb_seq_lens"],
         out_cache_loc=D["tv_out_cache_loc"],
         positions=ph["zeros_flat"],
         req_pool_indices=D["tv_req_pool_indices"],
