@@ -108,7 +108,7 @@ def _check(mode):
     holds block[src][my]=src*1000+my for every source. Returns global max abs error."""
 
     @jax.jit
-    @jax.shard_map(mesh=mesh, in_specs=(full_spec,), out_specs=full_spec, check_vma=False)
+    @jax.shard_map(mesh=mesh, in_specs=(full_spec,), out_specs=P(), check_vma=False)
     def fn(_dummy):
         my = _my_flat_index()
         dest = jnp.arange(D, dtype=jnp.int32)  # linear dest index
@@ -120,14 +120,15 @@ def _check(mode):
             y = _hier_a2a(x.reshape(*FACTORS, 1, 1)).reshape(D, 1, 1)
         src = jnp.arange(D, dtype=jnp.int32)
         expected = (src * 1000 + my)[:, None, None].astype(jnp.int32)
-        err = jnp.max(jnp.abs(y - expected)).reshape(1)
-        return jnp.broadcast_to(err, (D,))  # replicate so out_spec shards cleanly
+        err = jnp.max(jnp.abs(y - expected)).astype(jnp.int32)
+        return lax.pmax(err, AXES)  # global max, replicated across all devices
 
     dummy = jax.device_put(
         jnp.zeros((D, 1, 1), jnp.int32), jax.sharding.NamedSharding(mesh, full_spec)
     )
     out = jax.block_until_ready(fn(dummy))
-    return int(np.max(np.asarray(out)))
+    # `out` is replicated (P()); read a process-local addressable shard (multi-host safe).
+    return int(np.asarray(out.addressable_shards[0].data))
 
 
 # ---------------- timing ----------------------------------------------------------------
