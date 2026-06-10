@@ -395,8 +395,11 @@ function lensOverlap(s,R){
   const items=[];
   if(D.n_moe>0){
     const a2aB=2*(mt*D.TOPK/ep)*D.H*2*remote, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep));
-    const e=moe(tpd,D.NEXP/ep,D.H,D.MOEF,"experts"), expMs=e.flops/flops_per_s(e.peak)/1e3*D.n_moe;
-    items.push({name:"MoE all-to-all (dispatch + combine)",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts compute "+expMs.toFixed(2)+" ms"});
+    const e=moe(tpd,D.NEXP/ep,D.H,D.MOEF,"experts");
+    // the a2a can pipeline behind the experts kernel's execution = its ideal time
+    // (compute & HBM overlapped inside the kernel)
+    const expMs=Math.max(e.flops/flops_per_s(e.peak), e.hbm/HBMBW)*1e3*D.n_moe;
+    items.push({name:"MoE all-to-all (dispatch + combine)",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts kernel "+expMs.toFixed(1)+" ms"});
     items.push({name:"MoE output reshard (reduce)",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
   }
   if(attnN>0) items.push({name:"o_proj "+(L.sp?"reduce-scatter + all-gather":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
@@ -421,8 +424,10 @@ function lensOverlap(s,R){
     +"<div class='bar' style='width:"+(exposed/W*100)+"%;background:#ec4899' title='exposed comm'></div></div>"
     +"<div class='ms'>"+pipeStep.toFixed(2)+" ms</div></div>";
   h+="<div class='note'><span style='color:#2563eb'>■</span> compute/HBM wall = max(ΣC,ΣH) = <b>"+nonComm.toFixed(2)+" ms</b> &nbsp; <span style='color:#db2777'>■</span> exposed comm <b>"+exposed.toFixed(2)+" ms</b> &nbsp;·&nbsp; overlap already hides "+hidden.toFixed(2)+" ms of comm (vs "+noOv.toFixed(2)+" ms if nothing overlapped).</div>";
-  // verdict
-  if(exposed<0.02*Math.max(nonComm,1e-9)) h+="<div class='verdict v-go'>Exposed comm ≈ <b>"+exposed.toFixed(3)+" ms</b> (≪ "+nonComm.toFixed(2)+" ms compute/HBM) → comm is <b>not</b> the bottleneck; step stays "+R.tbound+"-bound. Overlap won't move the needle — cut "+(R.Th>=R.Tc?"HBM bytes":"flops")+".</div>";
+  // verdict — lead with the robust ΣI-vs-wall comparison (model-independent)
+  const floor=Math.max(R.Tc,R.Th,commTot);  // perfect-overlap lower bound
+  if(commTot>nonComm) h+="<div class='verdict v-warn'><b>ICI / comm-bound.</b> ΣI ("+commTot.toFixed(0)+" ms) &gt; compute/HBM wall ("+nonComm.toFixed(0)+" ms): even <b>perfect</b> overlap can't go below the comm time, so step ≥ <b>"+floor.toFixed(0)+" ms</b> regardless of scheduling. Overlap is <b>not</b> the lever — you must <b>reduce comm</b> (the MoE a2a): smaller prefill chunk, EP locality / topology, or fewer cross-host hops.</div>";
+  else if(exposed<0.02*Math.max(nonComm,1e-9)) h+="<div class='verdict v-go'>Exposed comm ≈ <b>"+exposed.toFixed(3)+" ms</b> (≪ "+nonComm.toFixed(2)+" ms compute/HBM) → comm is <b>not</b> the bottleneck; step stays "+R.tbound+"-bound. Overlap won't move the needle — cut "+(R.Th>=R.Tc?"HBM bytes":"flops")+".</div>";
   else h+="<div class='verdict v-warn'>Exposed comm ≈ <b>"+exposed.toFixed(2)+" ms</b> on top of the "+nonComm.toFixed(2)+" ms compute/HBM floor ("+(exposed/pipeStep*100).toFixed(0)+"% of step). Lever: hide the a2a (kernel pipelining / async) or cut barriers (SP, topology, EP locality).</div>";
   // per-collective table
   h+="<table style='margin-top:10px'><thead><tr><th class='l'>collective</th><th>ICI ms</th><th class='l'>type</th><th>hidden</th><th>exposed</th><th class='l'>hides behind</th></tr></thead><tbody>";
