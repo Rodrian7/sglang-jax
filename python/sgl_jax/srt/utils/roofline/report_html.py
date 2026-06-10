@@ -52,6 +52,57 @@ def _quant_default(config) -> dict:
     return {"wq": wq, "blk": blk, "aq": aq}
 
 
+def _bake_moe_block_table(config) -> dict:
+    """The fused-MoE-v2 block config the kernel WOULD pick, per (ep, num_tokens),
+    by calling the kernel's OWN lookup ``get_tuned_fused_moe_v2_block_config`` —
+    not by parsing the table. So if the tuned table (or its key schema, or the
+    lookup logic) changes, the report tracks it on the next regenerate with **no
+    roofline code change**. num_tokens = global tokens entering MoE (= per-DP
+    chunk x dp). Returns {ep: [{n, bt, bf}, ... sorted]}."""
+    try:
+        import jax.numpy as jnp
+
+        from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+            get_tuned_fused_moe_v2_block_config,
+        )
+    except Exception:
+        return {}
+    NEXP = _cfg(config, "n_routed_experts", "num_experts", default=0)
+    TOPK = _cfg(config, "num_experts_per_tok", default=0)
+    H = _cfg(config, "hidden_size")
+    MOEF = _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size"))
+    if not (NEXP and TOPK and H and MOEF):
+        return {}
+    qc = config.get("quantization_config") or {}
+    wdt = jnp.float8_e4m3fn if "fp8" in str(qc.get("quant_method") or "").lower() else jnp.bfloat16
+    buckets = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    out: dict[int, list] = {}
+    for ep in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+        if NEXP % ep != 0:
+            continue
+        row = []
+        for n in buckets:
+            if n % ep != 0:
+                continue
+            try:
+                cfg = get_tuned_fused_moe_v2_block_config(
+                    num_tokens=n,
+                    num_experts=NEXP,
+                    top_k=TOPK,
+                    hidden_size=H,
+                    intermediate_size=MOEF,
+                    dtype=jnp.bfloat16,
+                    weight_dtype=wdt,
+                    ep_size=ep,
+                )
+                row.append({"n": n, "bt": int(cfg.bt), "bf": int(cfg.bf)})
+            except Exception:
+                pass
+        if row:
+            out[ep] = row
+    return out
+
+
 def _bake_jaxpr(arch, config) -> dict | None:
     """Trace one reference layer to a jaxpr; bake the primitive histogram + the
     source line that emits each (shortened). None if jax / reference unavailable."""
@@ -127,6 +178,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "n_moe": combo[(False, True)] + combo[(True, True)],
         "n_dense": combo[(False, False)] + combo[(True, False)],
         "jaxpr": _bake_jaxpr(arch, config),
+        "moe_blocks": _bake_moe_block_table(config),
         "peaks": {
             "bf16_tflops": peaks.bf16_tflops,
             "fp8_tflops": peaks.fp8_tflops,
@@ -513,12 +565,16 @@ function kernelTune(s,R){
     const E=D.NEXP/ep, d=D.H, f=D.MOEF, mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep)), q=Q.wq!=="bf16";
     const wB=E*(q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d)), aB=2*tpd*d*2, flops=2*tpd*3*d*f;
     const remote=ep>1?(ep-1)/ep:0, iciB=2*(mt*D.TOPK/ep)*d*2*remote;  // dispatch + combine a2a
-    const blk=blockOf(/fused-moe/,["bt","bf","k"]);
-    const vmem=blk.bf*d*(q?1:2)+blk.bt*d*2+blk.bt*blk.bf*4;
-    h+=card("fused-MoE-v2 experts (per device, per layer)", (blk.name||"n/a"), wB, aB, flops, iciB, wpeak(), vmem,
+    // tuned block config keyed on num_tokens = mt (global = per-DP chunk x dp)
+    const tbl=(D.moe_blocks&&(D.moe_blocks[ep]||D.moe_blocks[String(ep)]))||null;
+    const tb=tbl&&tbl.length?(tbl.find(e=>e.n>=mt)||tbl[tbl.length-1]):null;
+    const bt=tb?tb.bt:16, bf=tb?tb.bf:512;
+    const blkLbl=tb?("tuned @ num_tokens="+tb.n+" (chunk×dp="+mt+") → bt="+bt+" bf="+bf):("bt="+bt+" bf="+bf+" (default; no tuned entry)");
+    const vmem=bf*d*(q?1:2)+bt*d*2+bt*bf*4;
+    h+=card("fused-MoE-v2 experts (per device, per layer)", blkLbl, wB, aB, flops, iciB, wpeak(), vmem,
       (bound,x)=>{
         if(bound==="ICI(a2a)") return "<b>a2a-bound (in-kernel, SparseCore/ICI).</b> dispatch+combine ="+fmt(x.iciB/1e9)+" GB on ICI — measured exposed at the torus floor. Levers: EP locality / topology / fewer cross-host hops; smaller prefill chunk shrinks a2a.";
-        if(bound==="HBM") return "<b>weight-HBM-bound.</b> weights "+fmt(x.wB/1e9)+" GB of "+fmt((x.wB+x.aB)/1e9)+" GB ("+(x.wB/(x.wB+x.aB)*100).toFixed(0)+"%), read once. Levers: ① fp8 weights (quant knob; block-fp8 caps at bf16 MXU); ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ raise OI ("+x.oi.toFixed(0)+"→ridge "+x.ridge.toFixed(0)+") via more tokens/expert (tpd="+tpd+", bigger batch/chunk). bt/bf affect VMEM + MXU util, not the byte budget.";
+        if(bound==="HBM") return "<b>weight-HBM-bound.</b> weights "+fmt(x.wB/1e9)+" GB of "+fmt((x.wB+x.aB)/1e9)+" GB ("+(x.wB/(x.wB+x.aB)*100).toFixed(0)+"%), read once. Levers: ① fp8 weights (quant knob; block-fp8 caps at bf16 MXU); ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ raise OI ("+x.oi.toFixed(0)+"→ridge "+x.ridge.toFixed(0)+") via more tokens/expert (tpd="+tpd+", bigger batch/chunk). bt/bf (tuned for num_tokens="+(tb?tb.n:"?")+") set VMEM + MXU util, not the byte budget.";
         return "<b>compute-bound.</b> Above the ridge — lever: ↑ MXU rate (non-block W8A8) or ↓ flops.";
       });
   }
