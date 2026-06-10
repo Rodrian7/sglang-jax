@@ -423,7 +423,12 @@ function lensOverlap(s,R){
     +"<div class='bar' style='width:"+(nonComm/W*100)+"%;background:#3b82f6' title='compute/HBM wall'></div>"
     +"<div class='bar' style='width:"+(exposed/W*100)+"%;background:#ec4899' title='exposed comm'></div></div>"
     +"<div class='ms'>"+pipeStep.toFixed(2)+" ms</div></div>";
-  h+="<div class='note'><span style='color:#2563eb'>■</span> compute/HBM wall = max(ΣC,ΣH) = <b>"+nonComm.toFixed(2)+" ms</b> &nbsp; <span style='color:#db2777'>■</span> exposed comm <b>"+exposed.toFixed(2)+" ms</b> &nbsp;·&nbsp; overlap already hides "+hidden.toFixed(2)+" ms of comm (vs "+noOv.toFixed(2)+" ms if nothing overlapped).</div>";
+  h+="<div class='note'><span style='color:#2563eb'>■</span> compute/HBM wall = max(ΣC,ΣH) = <b>"+nonComm.toFixed(2)+" ms</b> &nbsp; <span style='color:#db2777'>■</span> exposed comm <b>"+exposed.toFixed(2)+" ms</b> &nbsp;·&nbsp; overlap already hides "+hidden.toFixed(2)+" ms of comm.</div>";
+  // three reference step estimates (perfect overlap = the lower bound)
+  h+="<div class='note' style='background:#f1f5f9;border-radius:6px;padding:6px 9px'>reference step estimates: "
+    +"&nbsp;<b>perfect overlap</b> (all engines, lower bound) = max(ΣC,ΣH,ΣI) = <b>"+Math.max(R.Tc,R.Th,commTot).toFixed(1)+" ms</b>"
+    +"&nbsp;·&nbsp; pipeline model (this bar) = "+pipeStep.toFixed(1)+" ms"
+    +"&nbsp;·&nbsp; no overlap (comm serial) = "+noOv.toFixed(1)+" ms</div>";
   // verdict — lead with the robust ΣI-vs-wall comparison (model-independent)
   const floor=Math.max(R.Tc,R.Th,commTot);  // perfect-overlap lower bound
   if(commTot>nonComm) h+="<div class='verdict v-warn'><b>ICI / comm-bound.</b> ΣI ("+commTot.toFixed(0)+" ms) &gt; compute/HBM wall ("+nonComm.toFixed(0)+" ms): even <b>perfect</b> overlap can't go below the comm time, so step ≥ <b>"+floor.toFixed(0)+" ms</b> regardless of scheduling. Overlap is <b>not</b> the lever — you must <b>reduce comm</b> (the MoE a2a): smaller prefill chunk, EP locality / topology, or fewer cross-host hops.</div>";
