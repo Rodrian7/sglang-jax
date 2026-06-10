@@ -12,7 +12,9 @@ responsive canvas), works offline.
 
 The JS cost model mirrors ``descriptors._mimo_v2_family`` + ``parallelism`` +
 ``ops`` (tensor axis t = tp//dp, fused-MoE EP = devices, MoE global tokens =
-per-DP tokens * dp, SP reduce-scatter/all-gather gated on should_scatter).
+per-DP tokens * dp; row-parallel outputs complete with a SYNC all-reduce on the
+'tensor' axis, and under SP an ASYNC all-gather re-collects the sequence shards
+before the next linear — HLO-verified, no standalone reduce-scatter).
 Quant: fp8 weight = 1 byte + scale (per-tensor ~0 / per-channel 4/k / block
 4/B^2 per elem); block-wise stays bf16 MXU rate, per-tensor/per-channel + fp8
 acts reach the fp8 MXU rate. Closed-form roofline only; the jaxpr View F costs
@@ -322,10 +324,19 @@ function allreduce(msg,p){return p<=1?0:2*(p-1)/p*msg;}
 function reducescatter(msg,p){return p<=1?0:(p-1)/p*msg;}
 function resolve(s){const tp=s.tp, dp=s.dp, devices=tp; const t=Math.max(1,Math.floor(tp/dp)); return {t, ep:devices, devices, dp};}
 function kvpd(nkv,t){return t>=nkv?1:Math.ceil(nkv/t);}
-function rowReduce(tokens,H,L){const msg=tokens*H*2;
-  const sp = L.sp && tokens>=L.devices*D.defaults.scatter_min && tokens%L.devices===0;
-  if(sp) return reducescatter(msg,L.devices)+reducescatter(msg,L.devices);
-  return allreduce(msg,L.t);}
+// Exposed row-parallel completion = all-reduce on the 'tensor' axis. HLO ground
+// truth (SP on, 4096 tok): replica_groups = groups of t, SYNC barrier, no
+// reduce-scatter survives. The contracted dim consumed 'tensor' upstream so the
+// partial sum must reduce over t (no-op when t=1). Under SP the result is
+// sequence-sharded by a FREE local dynamic-slice; re-collecting it is a separate
+// ASYNC all-gather (spGather) hidden behind the next linear — XLA lowered the
+// scatter as all-reduce + slice, so the reduce itself is a plain TP all-reduce.
+function rowReduce(tokens,H,L){return allreduce(tokens*H*2,L.t);}
+// SP re-gather (seq-shard -> tensor-replicated) before each input linear; async in
+// the HLO (overlaps the linear), so it counts as hidden comm, not an exposed barrier.
+function spGather(tokens,H,L){const g=tokens*L.dp;
+  const on = L.sp && L.t>1 && g>=L.devices*D.defaults.scatter_min && g%L.devices===0;
+  return on ? (L.t-1)/L.t*tokens*H*2 : 0;}
 
 function compute(s){
   const L=resolve(s); L.sp=s.enable_sp;
@@ -453,10 +464,13 @@ function lensOverlap(s,R){
     // (compute & HBM overlapped inside the kernel)
     const expMs=Math.max(e.flops/flops_per_s(e.peak), e.hbm/HBMBW)*1e3*D.n_moe;
     items.push({name:"MoE all-to-all (dispatch + combine)",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts kernel "+expMs.toFixed(1)+" ms"});
-    items.push({name:"MoE output reshard (reduce)",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
+    items.push({name:"MoE output all-reduce (TP, tensor axis)",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
   }
-  if(attnN>0) items.push({name:"o_proj "+(L.sp?"reduce-scatter + all-gather":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
-  if(D.n_dense>0) items.push({name:"down_proj "+(L.sp?"reduce-scatter":"all-reduce")+" (TP)",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
+  if(attnN>0) items.push({name:"o_proj all-reduce (TP, tensor axis)",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
+  if(D.n_dense>0) items.push({name:"down_proj all-reduce (TP, tensor axis)",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
+  // SP re-gather: async all-gather (one per block before its input linear) that XLA
+  // overlaps with the linear -> hidden comm, not an exposed barrier (HLO ground truth).
+  {const agB=spGather(tokens,D.H,L); if(agB>0) items.push({name:"SP all-gather (re-collect seq before linears)",ms:msi(agB)*(attnN+D.n_moe+D.n_dense),type:"pipelineable",cap:1e9,behind:"input linears (XLA async)"});}
   // embedding lookup all-reduce (vocab-sharded embed gather over the tensor axis); once per step
   if(L.t>1) items.push({name:"embedding all-reduce (vocab-sharded)",ms:msi(allreduce(tokens*D.H*2,L.t)),type:"barrier",cap:0,behind:"—"});
   let hidden=0,exposed=0,commTot=0;
@@ -504,8 +518,8 @@ function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
   if(H.compile){const c=H.compile;
     h+="<div class='note' style='background:#f1f5f9;border-radius:6px;padding:6px 9px'><b>compile config</b> (so it lines up with the model above): "
       +c.n_layers_compiled+" representative layers ["+(c.layer_types||[]).join(", ")+"] · tp="+c.tp+" dp="+c.dp+" · "
-      +c.tokens_global+" global tokens · <b>SP "+(nb.sp_active?"active":"off")+"</b> (reduce-scatter/all-gather kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
-      +(nb.sp_active?"":"At this token count SP did not trigger, so the TP reduces are plain all-reduce; raise tokens above the threshold to see reduce-scatter + all-gather.")+"</div>";}
+      +c.tokens_global+" global tokens · <b>SP "+(nb.sp_active?"active":"off")+"</b> (the async all-gather kicks in at ≥ "+c.sp_threshold_tokens+" tokens). "
+      +(nb.sp_active?"The row-parallel outputs still complete with a SYNC all-reduce on the tensor axis; SP adds an ASYNC all-gather (overlapped) to re-collect the sequence shards before each linear. No reduce-scatter survives XLA lowering — the scatter is an all-reduce + free local slice.":"At this token count SP did not trigger; the TP reduces are plain all-reduce and there is no SP all-gather.")+"</div>";}
   // network collectives
   h+="<table><thead><tr><th class='l'>network collective</th><th>count</th><th>sync / async</th><th class='l'>replica_groups</th><th>bytes</th></tr></thead><tbody>";
   let any=false;
@@ -516,7 +530,7 @@ function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
   h+="<div class='verdict "+((nb.n_sync_barrier||0)>0?"v-warn":"v-go")+"'>"
     +"<b>"+(nb.n_sync_barrier||0)+" SYNC</b> collectives (exposed barriers — over the tensor axis per replica_groups; mostly TP all-reduce + the embedding gather) "
     +"&nbsp;·&nbsp; <b>"+(nb.n_async||0)+" async</b> (XLA overlaps these — e.g. the SP all-gather). "
-    +((nb.n_sync_barrier||0)>0?"The SYNC ones are the lever: SP / reduce-scatter, topology.":"")+"</div>";
+    +((nb.n_sync_barrier||0)>0?"The SYNC ones are the lever: t-axis locality / topology / fewer cross-host hops on the tensor reduce.":"")+"</div>";
   h+="<div class='note' style='margin-top:6px'><b>MoE all-to-all is not an XLA collective</b> — it is fused inside the MoE Pallas kernel ("+(H.pallas_kernels||0)+" × <span class='mono'>tpu_custom_call</span>: attention + experts). Its dispatch/combine run in-kernel (SparseCore); whether they hide behind TensorCore compute is a kernel/device-trace question, not an XLA-scheduling one — and has been measured exposed (torus floor).</div>";
   h+="<div class='note'>XLA also issues <b>"+(H.memory_prefetch_async||0)+"</b> async HBM↔VMEM prefetch copies (memory latency hiding) — distinct from network comm; this is why the model tracks the HBM roofline.</div>";
   h+="<div class='verdict v-go'>Bottom line from the compiler: SYNC network collectives (TP all-reduce + embed) are exposed barriers; the SP all-gather XLA already overlaps; the dominant MoE a2a is kernel-internal (XLA can't touch it). So the levers are (a) cut the SYNC TP reduce (SP / topology) and (b) the in-kernel a2a pipeline (kernel work, verify with a device trace) — not generic XLA overlap.</div>";
@@ -562,8 +576,8 @@ function kernelTune(s,R){
     const E=D.NEXP/ep, d=D.H, f=D.MOEF, mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep)), q=Q.wq!=="bf16";
     const wB=E*(q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d)), aB=2*tpd*d*2, flops=2*tpd*3*d*f;
     const remote=ep>1?(ep-1)/ep:0, a2aB=2*(mt*D.TOPK/ep)*d*2*remote;  // dispatch + combine a2a (in-kernel)
-    const reshardB=rowReduce(tokens,d,L);  // MoE output reshard (post-kernel TP reduce) — matches the model-level 'moe' ici
-    const iciParts=[["a2a (in-kernel)",a2aB,"#ec4899"],["output reshard (TP)",reshardB,"#db2777"]];
+    const reshardB=rowReduce(tokens,d,L);  // post-kernel TP all-reduce (tensor axis) — matches the model-level 'moe' ici; SP all-gather is async/hidden (see Overlap)
+    const iciParts=[["a2a (in-kernel)",a2aB,"#ec4899"],["output all-reduce (TP)",reshardB,"#db2777"]];
     // tuned block config keyed on num_tokens = mt (global = per-DP chunk x dp)
     const tbl=(D.moe_blocks&&(D.moe_blocks[ep]||D.moe_blocks[String(ep)]))||null;
     const tb=tbl&&tbl.length?(tbl.find(e=>e.n>=mt)||tbl[tbl.length-1]):null;
@@ -572,7 +586,7 @@ function kernelTune(s,R){
     const vmem=bf*d*(q?1:2)+bt*d*2+bt*bf*4;
     h+=card("fused-MoE-v2 experts (per device, per layer)", blkLbl, wB, aB, flops, iciParts, wpeak(), vmem,
       (bound,x)=>{
-        if(bound==="ICI") return "<b>comm-bound (ICI).</b> a2a (in-kernel, SparseCore) "+(a2aB/ICI*1e3).toFixed(3)+" ms + output reshard "+(reshardB/ICI*1e3).toFixed(3)+" ms = "+x.ims.toFixed(3)+" ms &gt; HBM "+x.hms.toFixed(3)+" ms. a2a is measured exposed at the torus floor. Levers: EP locality / topology / fewer cross-host hops; smaller chunk shrinks a2a; SP variant for the reshard.";
+        if(bound==="ICI") return "<b>comm-bound (ICI).</b> a2a (in-kernel, SparseCore) "+(a2aB/ICI*1e3).toFixed(3)+" ms + output all-reduce (TP, tensor axis) "+(reshardB/ICI*1e3).toFixed(3)+" ms = "+x.ims.toFixed(3)+" ms &gt; HBM "+x.hms.toFixed(3)+" ms. a2a is measured exposed at the torus floor; the all-reduce is a SYNC barrier over the tensor axis (HLO-verified). The SP all-gather that re-collects the sequence is async/hidden, not counted here. Levers: EP locality / topology / fewer cross-host hops; smaller chunk shrinks a2a; raise t-axis locality for the all-reduce.";
         if(bound==="HBM") return "<b>weight-HBM-bound.</b> weights "+fmt(x.wB/1e9)+" GB of "+fmt((x.wB+x.aB)/1e9)+" GB ("+(x.wB/(x.wB+x.aB)*100).toFixed(0)+"%), read once. Levers: ① fp8 weights (quant knob; block-fp8 caps at bf16 MXU); ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ raise OI ("+x.oi.toFixed(0)+"→ridge "+x.ridge.toFixed(0)+") via more tokens/expert (tpd="+tpd+", bigger batch/chunk). bt/bf (tuned for num_tokens="+(tb?tb.n:"?")+") set VMEM + MXU util, not the byte budget.";
         return "<b>compute-bound.</b> Above the ridge — lever: ↑ MXU rate (non-block W8A8) or ↓ flops.";
       });
