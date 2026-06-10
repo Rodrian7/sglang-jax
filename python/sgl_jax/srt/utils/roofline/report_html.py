@@ -222,7 +222,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <style>
  body{font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f6f8fa;color:#1c2330}
  #wrap{display:flex;flex-wrap:wrap;gap:20px;padding:20px}
- #left{flex:0 0 300px} #right{flex:1 1 700px;min-width:560px}
+ #left{flex:0 0 300px;position:sticky;top:12px;align-self:flex-start;max-height:calc(100vh - 24px);overflow-y:auto} #right{flex:1 1 700px;min-width:560px}
  h1{font-size:17px;margin:0 0 2px} .sub{color:#667;font-size:11px;margin-bottom:14px}
  .ctl{margin:11px 0} .ctl label{display:block;color:#445;font-size:11px;margin-bottom:4px;font-weight:600}
  .ctl .v{color:#0a5;font-weight:700}
