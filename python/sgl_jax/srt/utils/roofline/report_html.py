@@ -530,9 +530,6 @@ function lensKernel(s,R){
     else lever="↓ / overlap comm (SP / topology) · "+(m.c+m.h).toFixed(3)+" ms could hide it";
     h+="<tr><td class='l'><span style='color:"+(CAT[r.cat]||'#888')+"'>●</span> "+r.cat+(r.peak==='fp8'?" <span class='tag' style='background:#fef3c7;color:#92400e'>fp8</span>":"")+"</td><td>"+r.ideal.toFixed(3)+"</td><td>"+r.pct.toFixed(0)+"%</td><td><span class='tag b-"+r.bound+"'>"+r.bound+"</span></td><td>"+r.oi.toFixed(1)+"</td><td class='l' style='font-size:11px'>"+lever+"</td></tr>";}
   h+="</tbody></table>";
-  const top=R.rows[0], K=(D.codepath&&D.codepath.kernels)||[];
-  const km=K.filter(k=>(top.cat==="moe"&&k.kind==="moe")||(top.cat==="attention"&&k.kind==="attention"));
-  if(km.length) h+="<div class='verdict v-go'>Top: <b>"+top.cat+"</b> ("+top.pct.toFixed(0)+"% step, "+top.bound+"-bound) → real kernel "+km.map(k=>"<span class='mono'>"+k.name+"</span> ×"+k.count).join(", ")+" — see <b>Trace</b> for shapes / block config.</div>";
   h+=kernelTune(s,R);
   return h;}
 // ---------- per-kernel tuning deep-dive (Pallas: fused-MoE-v2, RPA attention) ----------
