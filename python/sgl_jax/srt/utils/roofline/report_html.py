@@ -512,13 +512,13 @@ function lensOverlap(s,R){
     const sy=t.sync||0, as=t.async_||0, isAsync=as>0&&sy===0, isSync=sy>0&&as===0;
     const verdict=isAsync?"ASYNC (overlapped)":isSync?"SYNC (barrier)":sy+" sync / "+as+" async";
     const ok=type==="barrier"?isSync:isAsync, c=ok?"#16a34a":"#d97706";
-    return "<span style='color:"+c+";font-weight:700'>"+(ok?"✓":"⚠")+"</span> "+verdict+" <span style='color:#889'>("+t.count+"×)</span>";
+    return "<span style='color:"+c+";font-weight:700'>"+(ok?"✓":"⚠")+"</span> "+verdict;
   }
   h+="<table style='margin-top:10px'><thead><tr><th class='l'>collective</th><th>ICI ms</th><th class='l'>type (model)</th><th>hidden</th><th>exposed</th><th class='l'>hides behind</th>"+(HV?"<th class='l'>XLA actual (HLO)</th>":"")+"</tr></thead><tbody>";
   for(const it of items.sort((a,b)=>b.ms-a.ms)) h+="<tr><td class='l'>"+it.name+"</td><td>"+it.ms.toFixed(3)+"</td><td class='l'><span class='tag "+(it.type==="pipelineable"?"b-compute":"b-ICI")+"'>"+it.type+"</span></td><td>"+it.hidden.toFixed(3)+"</td><td>"+it.exposed.toFixed(3)+"</td><td class='l' style='font-size:11px;color:#667'>"+it.behind+"</td>"+(HV?"<td class='l' style='font-size:11px'>"+xlaCell(it.op,it.type)+"</td>":"")+"</tr>";
   if(!items.length) h+="<tr><td class='l' colspan="+(HV?7:6)+">no collectives at this layout</td></tr>";
   h+="</tbody></table>";
-  h+="<div class='note'>type = model prediction (can it pipeline behind compute?); <b>XLA actual</b> = what the compiled HLO scheduled (✓ = agrees, ⚠ = model says hideable but it is exposed / not XLA-scheduled). The a2a is in-kernel so XLA can't touch it — and it has been <b>measured exposed</b> at the torus floor (cross-host) / VMEM-blocked; a device trace is the final word on how much compute sits in its shadow.</div>";
+  h+="<div class='note'>type = model prediction (can it pipeline behind compute?); <b>XLA actual</b> = what the compiled HLO scheduled (✓ = agrees, ⚠ = model says hideable but it is exposed / not XLA-scheduled). Rows are model <b>categories</b> (each spans all its layers), while the HLO counts opcodes — e.g. the 4 all-reduce rows here all map to the single <b>all-reduce</b> opcode (per-opcode totals in the <b>HLO opcode totals</b> line below). The a2a is in-kernel so XLA can't touch it — and it has been <b>measured exposed</b> at the torus floor (cross-host) / VMEM-blocked; a device trace is the final word on how much compute sits in its shadow.</div>";
   h+=hloOverlapHTML();
   return h;}
 function hloOverlapHTML(){const H=D.hlo; if(!H)return "";
