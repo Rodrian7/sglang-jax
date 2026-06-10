@@ -710,30 +710,32 @@ function kernelTune(s,R){
         return "<b>compute-bound.</b> Above the ridge — lever: ↑ MXU rate (non-block W8A8) or ↓ flops.";
       });
   }
-  // ---- RPA attention (phase-appropriate variant) ----
-  {
-    const d=D.full, nq=Math.max(1,Math.floor(d.nh/t)), nkv=kvpd(d.nkv,t), hd=d.hd, vhd=d.vhd;
+  // ---- RPA attention (full + SWA variants, one card each) ----
+  function rpaCard(d,name){
+    const nq=Math.max(1,Math.floor(d.nh/t)), nkv=kvpd(d.nkv,t), hd=d.hd, vhd=d.vhd;
     const ctx=R.decode?s.seq_len:tokens, eff=d.window?Math.min(ctx,d.window):ctx, inter=tokens*(R.decode?eff:eff/2);
     const o=attention(nq,nkv,hd,vhd,tokens,inter,R.decode?1:32), flops=o.flops;
     const kvB=Math.floor(inter/(R.decode?1:32))*nkv*2*hd*2, qoB=o.hbm-kvB;
     // tuned (bq,bkv) keyed on max_num_tokens (= per-device q tokens = the knob), t,
-    // stage, full attention (sw=full). Prefill runs the MIXED kernel (trace shows RPAm),
-    // so try "m" first then "p"; decode -> "d". Miss -> traced kernel name.
+    // stage, sliding_window (SWA -> window, full -> "full"). Prefill runs the MIXED
+    // kernel (trace = RPAm), so try "m" first then "p"; decode -> "d". Miss -> traced.
     const stg=R.decode?"d":"m", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
     const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|p|"+sw]);
     let bq,bkv,blkLbl,vmem;
     if(rk&&rk.length){const rb=rk.find(e=>e.n>=tokens)||rk[rk.length-1]; bq=rb.bq; bkv=rb.bkv;
-      vmem=rb.vmem||(bq*hd*2 + bkv*hd*2*2 + bq*bkv*4);  // kernel estimate (double-buf KV+mask, f32 scores); fallback rough
-      blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode/d":"prefill/m")+") → bq="+bq+" bkv="+bkv;}
+      vmem=rb.vmem||(bq*hd*2 + bkv*hd*2*2 + bq*bkv*4);  // kernel estimate; fallback rough
+      blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode/d":"prefill/m")+(d.window?", SWA "+d.window:"")+") → bq="+bq+" bkv="+bkv;}
     else {const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]); bq=blk.bq||16; bkv=blk.bkv||512;
       vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
-      blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+")";}
-    h+=card("RPA attention (per device, "+(R.decode?"decode":"prefill")+")", blkLbl, kvB, qoB, flops, [], "bf16", vmem,
+      blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+"/"+sw+")";}
+    h+=card("RPA attention — "+name+" (per device, "+(R.decode?"decode":"prefill")+")", blkLbl, kvB, qoB, flops, [], "bf16", vmem,
       (bound,x)=>{
-        if(bound==="HBM") return "<b>KV-read-bound.</b> KV-cache read ≈ "+fmt(x.wB/1e9)+" GB dominates. Levers: ① fp8 KV cache (½ read); ② fewer KV heads / GQA (nkv/dev="+nkv+"); ③ smaller window for SWA ("+(d.window||"full")+"). bq/bkv tune VMEM + MXU util, not the KV bytes (workload-fixed).";
+        if(bound==="HBM") return "<b>KV-read-bound.</b> KV-cache read ≈ "+fmt(x.wB/1e9)+" GB dominates"+(d.window?" (window "+d.window+" caps ctx→"+eff+")":"")+". Levers: ① fp8 KV cache (½ read); ② fewer KV heads / GQA (nkv/dev="+nkv+")"+(d.window?"":"; ③ shorter context / SWA")+". bq/bkv tune VMEM + MXU util, not the KV bytes (workload-fixed).";
         return "<b>compute-bound.</b> Levers: ↑ MXU util (bq/bkv tiling), or it's just cheap (decode attention often is).";
       });
   }
+  if(D.n_full>0) rpaCard(D.full,"full");
+  if(D.n_swa>0) rpaCard(D.swa,"SWA (window="+(D.swa.window||"?")+")");
   return h;}
 function lensFusion(s,R){
   const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
