@@ -70,7 +70,9 @@ mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(1, NDEV), (DP, TP))
 row_spec = P((DP, TP))  # global [NDEV*N, H] sharded on axis 0 -> [N, H] per device
 
 
-def _make_kernel(h, dtype):
+def _make_kernel(inner, dtype):
+    # buffer is [N, *inner]; the per-token DMA slices dim 0 and keeps `inner` whole,
+    # so `inner` (the tiled last dims) is never partially sliced — works for any dtype.
     def _kernel(x_ref, recv_ref, send_sem, recv_sem, barrier_sem):
         tp_size = lax.axis_size(TP)
         dp_size = lax.axis_size(DP)
@@ -120,7 +122,7 @@ def _make_kernel(h, dtype):
 
     return pl.pallas_call(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct((N, h), dtype),
+        out_shape=jax.ShapeDtypeStruct((N, *inner), dtype),
         in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
         out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
         scratch_shapes=[
@@ -136,8 +138,8 @@ def _make_kernel(h, dtype):
     )
 
 
-def _runner(h, dtype):
-    kfn = _make_kernel(h, dtype)
+def _runner(inner, dtype):
+    kfn = _make_kernel(inner, dtype)
 
     @jax.jit
     @jax.shard_map(mesh=mesh, in_specs=(row_spec,), out_specs=row_spec, check_vma=False)
@@ -150,7 +152,7 @@ def _runner(h, dtype):
 def _check():
     """Single-host only: deterministic int32 payload, pull recv, verify routing."""
     h = 128  # last dim must be a multiple of 128 (TPU HBM tiling)
-    run = _runner(h, jnp.int32)
+    run = _runner((h,), jnp.int32)
     # global x[g*N + r] = g*MULT + r  (g = global device index)
     rows = np.arange(N, dtype=np.int32)
     x_host = np.concatenate([(g * MULT + rows)[:, None].repeat(h, 1) for g in range(NDEV)], axis=0)
@@ -168,14 +170,21 @@ def _check():
 
 def _bench(dtype_name):
     dt = jnp.bfloat16 if dtype_name == "bf16" else jnp.float8_e4m3fn
-    run = _runner(H, dt)
+    # Pack tokens as [N, t_packing, h_per_t] (t_packing = 32/bits) so the per-token DMA
+    # slices dim 0 with the tiled (t_packing, h_per_t) block kept whole — mirrors the kernel.
+    tpack = 32 // (jnp.dtype(dt).itemsize * 8)
+    hpt = H // tpack
+    inner = (tpack, hpt)
+    run = _runner(inner, dt)
     key = jax.random.key(0)
     shards = []
     for i, dev in enumerate(jax.local_devices()):
         sk = jax.random.fold_in(key, jax.process_index() * len(jax.local_devices()) + i)
-        shards.append(jax.device_put(jax.random.normal(sk, (N, H), jnp.float32).astype(dt), dev))
+        shards.append(
+            jax.device_put(jax.random.normal(sk, (N, tpack, hpt), jnp.float32).astype(dt), dev)
+        )
     x = jax.make_array_from_single_device_arrays(
-        (NDEV * N, H), jax.sharding.NamedSharding(mesh, row_spec), shards
+        (NDEV * N, tpack, hpt), jax.sharding.NamedSharding(mesh, row_spec), shards
     )
 
     for _ in range(WARMUP):
