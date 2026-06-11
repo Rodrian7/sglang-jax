@@ -65,14 +65,14 @@ CLI 会在 import jax **之前**自动设好 `JAX_PLATFORMS=cpu` 和 `--xla_forc
 - `tp` / `dp` 下拉(只列**合法**组合)
 - decode batch / KV context / prefill chunk 滑块
 
-右侧 **5 个 tab**:
-- **Roofline** —— log-log roofline 图;悬停任一点看 achieved TFLOP/s、GB/s、%peak;ICI-bound 的算子画成 ✕(掉在 roof 下方)
-- **Dataflow** —— 单层算子链 + 每步 bound 条形(compute/HBM/ICI)
-- **Fusion** —— 结构性融合机会 + 省下的 HBM 往返
-- **Code path** ⭐ —— **来自真实 trace**:每个算子角色 → 它实际的 `models/*.py` 调用链(如 `qkv ← mimo_v2_flash.py:310`、`o_proj ← :355`)。不是手写的描述符
-- **Kernels** ⭐ —— **真实 Pallas kernel 清单**:RPAd/RPAm(full + SWA)、fused-moe-v2,带 per-device avals + shard_map 调用点
+右侧顶部 **5 个场景 tab**(每个回答一个问题,给排好序的「专家结论」):
+- **Overview** —— 整体 log-log roofline 图(悬停看 achieved TFLOP/s、GB/s、%peak;ICI-bound 算子画成 ✕)+ 逐类成本表 + 单层 dataflow
+- **Overlap** —— 通信(ICI)能否藏在计算后面;一张合并表:模型预测 vs **XLA 实测调度**(需 `--hlo`)
+- **Kernel** —— 算子按 ideal ms 排序 + 每个 Pallas kernel 深拆(HBM/compute/ICI、OI vs ridge、VMEM/64MB、tuned block、bound-aware lever)
+- **Fusion** —— 可折叠的中间激活 HBM 往返,按省下的 step 排序,`status` 来自编译器 HLO
+- **Trace** —— 真实 forward:Code path(算子 → `models/*.py` 调用链)+ Pallas kernel 清单
 
-报告还按**专家任务分场景**(顶部导航 Overview / Overlap / Kernel / Fusion / Trace):每个场景给排好序的「专家结论」(该攻哪个 kernel、该砍字节还是提算力、哪些融合省 step、通信能否藏住)。
+> **怎么读这些 tab、怎么从报告推到一个优化决策** → 见 [`roofline_html_reading_guide.md`](./roofline_html_reading_guide.md)(读图/使用指南)。
 
 ### Overlap 场景的「编译器实测数据」(可选,需 TPU 编译一次)
 
@@ -93,7 +93,7 @@ PYTHONPATH=python python tools/trace_roofline.py --model-path … --tp 32 --dp 8
     --hlo /tmp/fwd_prefill.hlo --html roofline.html
 ```
 
-Overlap 场景会多出 **"Compiler ground truth (optimized HLO)"** 段:XLA 实发的网络 collective(带 `replica_groups` + sync/async)、MoE a2a 是否在 Pallas kernel 内、async HBM 预取数,以及「真正的 overlap 杠杆在哪」。`hlo_overlap.py` 也可单独 `python python/sgl_jax/srt/utils/roofline/hlo_overlap.py fwd.hlo` 出 JSON。MiMo-V2-Pro tp32 实测结论:网络 collective 只有 4 个 **SYNC** TP all-reduce(tensor 轴 [8,4],暴露的 barrier),**MoE a2a 不是 XLA collective**(在融合 kernel 内,SparseCore 跑,需 device trace 才知是否藏住),另有 37 个 async HBM 预取(贴 HBM roofline 的原因)。
+喂了 `--hlo` 后,Overlap 场景的合并表会多出 **`XLA actual (HLO)`** 列:每个 collective 逐行标注 XLA 实际怎么调度的(✓ 与模型预测吻合 / ⚠ 模型说能藏但实际暴露或不归 XLA 管),并在表下给「HLO opcode totals」(网络 collective 的 `replica_groups` + sync/async + 字节)和编译点说明。`hlo_overlap.py` 也可单独 `python python/sgl_jax/srt/utils/roofline/hlo_overlap.py fwd.hlo` 出 JSON。MiMo-V2-Pro tp32 实测结论:行并行输出的 collective 是 tensor 轴的 **SYNC all-reduce**(暴露的 barrier),SP 加的是 **async all-gather**(藏住的,无 reduce-scatter 残留);**MoE a2a 不是 XLA collective**(在融合 kernel 内、SparseCore 跑,需 device trace 才知是否藏住);另有一批 async HBM 预取(贴 HBM roofline 的原因)。
 
 
 **分享**:HTML 完全自包含(数据/CSS/JS 全部 inline,roofline 用 `<canvas>` 现画,无 CDN/图片/网络请求)。直接把这**一个 `.html` 文件**发出去,对方下载后用任意浏览器离线打开即可,不需要装任何东西。
