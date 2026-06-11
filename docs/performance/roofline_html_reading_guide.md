@@ -1,114 +1,191 @@
-# Roofline HTML 报告 · 使用 / 读图指南
+# Roofline HTML 报告 · 使用与判读说明
 
-> 配套文档:[`roofline_trace_html_howto.md`](./roofline_trace_html_howto.md) 讲**怎么生成**这份 HTML。本文讲**拿到 HTML 后怎么读、怎么从它推到一个优化决策**。
+本文档说明如何阅读由 sglang-jax roofline 工具生成的交互式 HTML 性能报告,并据其进行性能瓶颈定位与优化决策。报告本身的生成方法见配套文档 [`roofline_trace_html_howto.md`](./roofline_trace_html_howto.md)。
 
-报告完全自包含:下载那个 `.html`,任意浏览器离线打开即可,无需装任何东西。所有数字**拖左侧旋钮实时重算**,不用重新生成。
-
----
-
-## 30 秒上手:三步工作流
-
-1. **设场景** —— 左侧旋钮调到你关心的工况:phase(decode / prefill)、`tp`/`dp`、token 数、量化方式。
-2. **看 bound** —— 左下 summary 框直接告诉你瓶颈是哪个引擎:
-   - `bound: HBM` → 访存瓶颈(读权重 / KV / 激活)
-   - `bound: compute` → 算力瓶颈(MXU 打满)
-   - `bound: ICI` → 通信瓶颈(跨设备 collective)
-   - 还有 `step ≈ X ms`(单步理论下界)和 compute / HBM / ICI 各自的 ms。
-3. **进对应 tab 找杠杆** —— bound 决定你该看哪个 tab、能动哪个旋钮:
-
-| bound | 去哪个 tab | 典型杠杆 |
-|---|---|---|
-| **HBM** | Kernel(找字节最重的 kernel)+ Fusion | fp8 权重 / 更大 EP(↓本地专家)/ 砍中间激活往返 / 提 OI |
-| **compute** | Kernel | 提 MXU 速率(W8A8,非 block-fp8)/ 砍 flops |
-| **ICI** | Overlap(先看 comm 是否被藏住) | 若暴露且 ΣI > 算/访存墙 → **overlap 没用,只能砍通信**:更小 chunk / EP 局部性 / 拓扑 / 少跨 host |
-
-> 核心公式贯穿全报告:**`理论 step ≈ max(compute, HBM, ICI)`**。哪个引擎最大,就是 bound;砍别的引擎不会让 step 变快。
+适用读者:模型推理性能工程师、系统优化人员,以及需要评估特定并行配置下推理性能上界的相关人员。
 
 ---
 
-## 左侧旋钮
+## 1. 概述
 
-| 旋钮 | 作用 |
+该报告针对某一具体模型在某一并行配置下的单步前向推理,给出基于 **roofline 模型**的理论性能分析。其核心能力是:
+
+- 在不依赖 TPU、不加载权重、不启动服务的前提下,trace 模型的真实前向计算图,据此分解出各类算子的计算量、访存量与通信量;
+- 以交互方式呈现:调整并行度、量化方式、批量与序列长度等参数后,所有结果即时重算,无需重新生成;
+- 对每一类算子与每一个核函数(kernel),明确指出其性能瓶颈所在(算力 / 访存 / 通信),并给出对应的优化方向。
+
+报告为**单一自包含 HTML 文件**:数据、样式与脚本全部内联,roofline 图由浏览器即时绘制,不依赖任何外部资源或网络请求。下载后以任意现代浏览器离线打开即可。
+
+---
+
+## 2. 方法学与结果性质
+
+正确理解报告结论,需先了解其数值的来源与性质。
+
+### 2.1 计算图来源:真实 trace
+
+报告中的算子清单、层数、核函数身份与各算子到源码的归属,均来自对模型真实前向的符号化 trace(`jax.make_jaxpr`),而非人工编写的描述。因此报告反映的是该模型实际执行的计算结构。权重的**数值**不影响计算图(仅形状相关),故可使用抽象权重在 CPU 上完成 trace。
+
+### 2.2 代价模型:已校验的闭式 roofline
+
+各算子的计算量(FLOPs)、访存量(字节)与通信量(字节),由已验证的 roofline 原语依据模型配置(`config.json`)与并行布局解析计算。量化方式、上下文长度等通过该闭式模型套用。该代价模型的逐类结果与独立的解析模型逐类吻合(比值 1.000,prefill 与 decode 均经校验)。浏览器中的交互重算使用的正是此闭式模型。
+
+### 2.3 结果性质:理论下界
+
+报告给出的是 roofline **理论下界**,其基本关系为:
+
+> **理论单步时间 ≈ max(计算时间, 访存时间, 通信时间)**
+
+即假设三类资源中耗时最长者构成下界。该值不预测以下运行时涌现效应:跨算子的实际重叠程度、核函数的实际 MXU 利用率与流水效率、调度与同步开销。因此:
+
+- 报告适合用于**瓶颈归属**(判断受限于哪类资源)与**相对量级比较**,此类结论对参数误差不敏感,稳健可靠;
+- 报告给出的**绝对毫秒数**应作为理论下界与量级参考,而非实测吞吐预测;实测确认需配合设备级 trace(profile)。
+
+### 2.4 编译器实测证据(可选)
+
+当报告在生成时附带了编译后的 HLO(见生成文档的 `--hlo` 选项),Overlap 视图会额外标注 XLA 编译器**实际调度**的通信行为,作为对理论重叠判断的实测校验。此部分为编译器实测,非理论推断。
+
+---
+
+## 3. 总体布局
+
+报告分为两个区域:
+
+- **左侧控制面板**:并行配置、量化方式与工作负载参数的可调控件,以及一个汇总框(summary),实时显示当前配置下的总体瓶颈与各资源耗时。
+- **右侧视图区**:五个场景视图(Overview / Overlap / Kernel / Fusion / Trace),通过顶部导航切换。每个视图回答一个特定问题。
+
+调整任一控件后,右侧所有视图与汇总框立即依据闭式模型重新计算。
+
+---
+
+## 4. 控制面板
+
+| 控件 | 含义与取值 |
 |---|---|
-| **phase**(decode / prefill) | 切换两种工况。decode 看单 token 解码,prefill 看 chunk 预填。 |
-| **SP** | sequence-parallel 开关(影响 TP reduce 的形态)。 |
-| **weight quant** | bf16 / fp8 per-tensor / per-channel / block-wise(+ block size)。block-wise fp8 的 MXU 速率按 **bf16** 算(per-block scale 打断 K 累加),工具已正确处理。 |
-| **activation** | W8A16(激活 bf16)/ W8A8(激活也 fp8,才能吃到 fp8 MXU 速率)。 |
-| **tp / dp** | 下拉**只列合法组合**。注意:`tp` 是 **mesh 总设备数**,真实 tensor 并行度 `t = tp/dp`,fused-MoE 的 `ep = tp`。 |
-| **decode batch / KV context / prefill chunk** | workload 滑块。**token 口径是「每 DP 组(per-dp)」**;MoE 全局 token = per-dp × dp。 |
+| **phase** | 推理阶段。`decode`:单 token 自回归解码;`prefill`:提示词分块预填充。两阶段的瓶颈通常不同,需分别评估。 |
+| **SP** | sequence-parallel(序列并行)开关。影响张量并行规约(TP reduce)的形态,详见 §5.2。 |
+| **weight quant** | 权重量化方式:`bf16`(不量化)/ `fp8 per-tensor` / `fp8 per-channel` / `fp8 block-wise`。block-wise 方式额外提供 block size 选项。 |
+| **activation** | 激活精度:`W8A16`(权重 fp8、激活 bf16)/ `W8A8`(权重与激活均 fp8)。仅 W8A8 可达到 fp8 矩阵乘单元(MXU)的峰值速率。 |
+| **tp** | mesh 总设备数。注意其**非**张量并行度:真实张量并行度为 `t = tp / dp`,fused-MoE 的专家并行度为 `ep = tp`。 |
+| **dp** | 数据并行度。下拉仅列出与 `tp`、模型头数等约束相容的**合法组合**。 |
+| **decode batch** | decode 阶段的批量(token 数)。 |
+| **decode KV context** | decode 阶段的 KV 缓存上下文长度,决定每序列的 KV 读取量。 |
+| **prefill chunk** | prefill 阶段每次处理的分块 token 数。 |
 
-调任意旋钮,右侧所有 tab + summary 立即重算。
+**token 计数口径**:所有 token 控件均为**每 DP 组(per-dp)**计数;进入 MoE 的全局 token 数为 `per-dp × dp`。
 
----
-
-## 五个 tab,逐个怎么读
-
-### Overview —— 整体 roofline + 逐类成本
-- **回答**:整体在哪个 roofline 区、每类算子各花多少。
-- **怎么读**:log-log roofline 图,每个点是一类算子;悬停看 achieved TFLOP/s、GB/s、%peak。**画成 ✕ 的点是 ICI-bound**(掉在 roof 下方,算力/访存都没打满,卡在通信)。下方成本表给每类的 TFLOP / HBM GB / ICI GB / ideal ms / bound。
-- **看到 → 做什么**:先在这里确认整体 bound 和「谁最贵」,再决定钻哪个 tab。
-
-### Overlap —— 通信能不能藏在计算后面
-- **回答**:ICI 通信是被算力/访存**藏住(hidden)**了,还是**暴露(exposed)**在关键路径上。
-- **怎么读**:一张合并表,每行一个 collective:
-  - `type (model)` = 理论预测能否流水(pipelineable / barrier)。
-  - **`XLA actual (HLO)`** = 编译器实际怎么调度的(✓ 吻合 / ⚠ 模型说能藏但实际暴露)。**这列是实测证据,不是理论**(需生成时带 `--hlo`)。
-  - `hidden / exposed` ms + 顶部 comm budget 条 + step 分解条。
-- **关键判读**:看底部 verdict —
-  - 若 **ΣI > 算/访存墙** → **comm-bound**,即便完美 overlap 也降不到通信时间以下 → overlap **不是**杠杆,必须**砍通信**(更小 chunk / EP 局部性 / 拓扑)。
-  - 若 exposed ≈ 0 → 通信不是瓶颈,别在这浪费精力,回去砍 HBM/flops。
-- **MiMo 实测要点**:MoE a2a 在融合 kernel 内(SparseCore),**不是 XLA collective**,XLA 管不到;且实测在 torus 带宽下沿**暴露**。能不能藏住是 kernel/device-trace 问题。
-
-### Kernel —— 该攻哪个 kernel、怎么攻
-- **回答**:按 ideal ms 排序的算子 + 每个 Pallas kernel 的深度拆解。
-- **怎么读**:每张 kernel 卡(fused-MoE-v2、RPA full、RPA SWA)给:
-  - 三引擎时间条:**HBM(weight+act)/ compute(MXU)/ ICI**,最长的就是 bound。
-  - **OI vs ridge**:operational intensity 低于 ridge → 访存瓶颈;高于 → 算力瓶颈。
-  - **VMEM working set / 64MB**(v7x 单 device 上限 64MB,**取自 kernel 自己的估算器**)—— 接近 64MB 说明大 chunk 下逼近 spill。
-  - **tuned block config** 随 token 旋钮变(查 kernel 自己的 tuned 表)。
-  - bound-aware 的 **lever** 文案:直接告诉你这个 kernel 该砍字节还是提算力。
-- **看到 → 做什么**:照着卡上 lever 走。例:MoE `weight-HBM-bound` → ① fp8 权重 ② 更大 EP(↓本地专家数)③ 提 OI(更大 batch/chunk → 每专家更多 token)。
-
-### Fusion —— 哪些中间激活的 HBM 往返能省
-- **回答**:把 producer→consumer 的中间激活折进相邻 matmul/kernel,省掉它的 HBM 往返。
-- **怎么读**:按「省下的 step」排序;`status` 列是**编译器 HLO 实测**(✓ 已被 XLA 融成 matmul epilogue / ✗ 没融 / 在 Pallas kernel 内)。
-- **看到 → 做什么**:仅当模型 **HBM-bound** 时,省字节 ≈ 省 step,这里才值得动;compute/ICI-bound 时融合基本无感。
-
-### Trace —— 这个模型真实的 forward
-- **回答**:报告里的「类别」对应到**真实代码**哪一行。
-- **怎么读**:Code path = 每个算子角色 → 它实际的 `models/*.py` 调用链(如 `qkv ← mimo_v2_flash.py:310`);层数是从 trace 涌现的,不是手写。Pallas kernels = 真实 kernel 名 + per-device avals + shard_map 调用点。
-- **看到 → 做什么**:在别的 tab 锁定一个贵的类别后,来这里定位到具体代码去改。
+**汇总框(summary)**显示:mesh 维度(`data × tensor` 与 `ep`)、量化模式、当前 phase、总体 **bound**(`compute` / `HBM` / `ICI`)、理论单步时间 `step`,以及计算 / 访存 / 通信三项各自的毫秒数。
 
 ---
 
-## 一个完整例子(MiMo-V2-Pro,tp32 / dp8)
+## 5. 视图详解
 
-**Prefill, chunk 256**:
-1. summary → `bound: ICI`,step 由 a2a 主导。
-2. Overlap → MoE a2a 那行 `XLA actual` 是 **⚠**(模型说可流水,实测暴露在 torus 下沿);ΣI > 算/访存墙 → verdict **comm-bound**。
-3. 结论:别指望 overlap,**砍通信** —— 更小 chunk / EP 局部性 / 减少跨 host 跳数。
+每个视图均围绕一个核心问题组织,以下分别说明其用途、所示量的定义、判读方法与对应的决策指引。
 
-**Decode, batch 适中**:
-1. summary → `bound: HBM`,step ≈ 10ms 级,由 **MoE 权重读**主导(每步读一次,与 batch 无关)。
-2. Kernel → fused-MoE-v2 卡 `weight-HBM-bound`,权重占 HBM ~100%。
-3. 结论:**fp8 权重**(quant 旋钮)/ **更大 EP**;attention 的 KV 读相比之下很小(单序列)。
+### 5.1 Overview —— 总体 roofline 与逐类成本
+
+**用途**:确定整体处于 roofline 的哪个区域,以及各类算子的代价分布。
+
+**所示内容**:
+- **Roofline 图**(对数-对数坐标):每个点代表一类算子,横轴为运算强度(OI),纵轴为达成的算力(TFLOP/s)。悬停可查看该类的达成算力、达成带宽与峰值占比(%peak)。受通信限制(ICI-bound)的算子以叉号(✕)标记,表示其落在 roofline 之下——算力与带宽均未充分利用,受限于通信。
+- **逐类成本表**:每类算子的 FLOPs、HBM 字节、ICI 字节、理论毫秒数与 bound。
+
+**判读**:运算强度 OI 定义为 `FLOPs / HBM 字节`;脊点(ridge)运算强度定义为 `MXU 峰值算力 / HBM 带宽`。当某类算子 `OI < ridge` 时受访存限制,`OI > ridge` 时受算力限制。
+
+**决策指引**:在此视图确认整体瓶颈类型与代价最高的算子类别,再进入相应的专项视图。
+
+### 5.2 Overlap —— 通信是否被计算掩盖
+
+**用途**:判断张量并行 / 专家并行引入的通信(ICI)是否被计算与访存掩盖,还是暴露在关键路径上。
+
+**模型**:单步时间近似为 `step ≈ max(ΣC, ΣH) + 暴露通信`,其中 `ΣC`、`ΣH`、`ΣI` 分别为计算、访存、通信的总时间。理论上完美重叠的下界为 `max(ΣC, ΣH, ΣI)`。
+
+**所示内容**:一张合并表,每行对应一个通信算子(collective):
+- **type(模型预测)**:该通信能否流水于相邻计算之后(`pipelineable` / `barrier`);
+- **hidden / exposed**:被掩盖与暴露的毫秒数;
+- **XLA actual(HLO 实测)**:在附带 HLO 时显示,标注编译器实际调度结果——`✓` 表示与模型预测一致,`⚠` 表示模型判定可掩盖但实际暴露或不由 XLA 调度。
+
+表下另有通信预算条、单步分解条与判定(verdict)。
+
+**判读要点**:
+- 当通信总时间 `ΣI` 大于计算/访存墙 `max(ΣC, ΣH)` 时,系统为**通信受限**:即便达到完美重叠,单步时间也无法低于通信时间。此时重叠并非有效手段,应直接降低通信量。
+- 当暴露通信接近于零时,通信不构成瓶颈,优化重心应回到访存或算力。
+
+**对本类 MoE 模型的实测结论**:行并行输出的规约在张量轴上表现为 **SYNC all-reduce**(暴露的同步屏障);序列并行引入的是 **async all-gather**(异步、被掩盖),编译后无独立的 reduce-scatter。MoE 的 all-to-all 通信融合于 MoE 核函数内部(由 SparseCore 执行),**不是** XLA 层面的通信算子,XLA 调度无法作用于它;其是否被算力掩盖需由设备级 trace 判定,实测显示其在环面带宽下沿暴露。
+
+### 5.3 Kernel —— 核函数瓶颈与优化方向
+
+**用途**:按理论耗时排序各算子,并对每个 Pallas 核函数给出深度拆解与优化方向。
+
+**所示内容**:每张核函数卡片(fused-MoE-v2、RPA full、RPA SWA)包含:
+- **三资源耗时条**:HBM(权重 + 激活)、compute(MXU)、ICI,最长者即为该核函数的 bound;
+- **运算强度与脊点**:`OI` 与 `ridge` 的对比,用以判断访存或算力受限;
+- **VMEM 工作集 / 64 MB**:该核函数实际占用的片上向量内存(VMEM)估计值,对比 v7x 单设备 64 MB 上限。该估计取自**核函数自身的估算器**(计入权重双缓冲、KV 双缓冲、累加器等),接近上限即提示在大分块下逼近溢出;
+- **tuned block 配置**:随 token 参数变化,取自核函数自身的调优表;
+- **lever(优化方向)**:依据该核函数的 bound 给出的具体建议。
+
+**决策指引**(典型):
+- MoE 核函数受**权重访存**限制时:采用 fp8 权重;增大专家并行度 `ep`(减少单设备本地专家数);提高运算强度(增大批量 / 分块,使每专家处理更多 token)。
+- 注意力核函数受 **KV 读取**限制时:采用 fp8 KV 缓存;减少 KV 头数;对滑窗注意力(SWA)缩小窗口。
+
+### 5.4 Fusion —— 可消除的中间激活访存
+
+**用途**:识别可折叠进相邻矩阵乘 / 核函数的中间激活,从而消除其 HBM 往返。
+
+**所示内容**:按"可节省的单步时间"排序的 producer→consumer 融合候选;`status` 列来自编译后的 HLO,标注 XLA 是否已将其融合(如折叠为矩阵乘的尾算子 epilogue)或保持独立。
+
+**判读**:仅当模型整体受**访存**限制时,节省的字节才近似等于节省的单步时间,此类融合方有收益;受算力或通信限制时收益甚微。
+
+### 5.5 Trace —— 真实前向的代码归属
+
+**用途**:将报告中的算子类别映射回真实源码位置。
+
+**所示内容**:
+- **Code path**:每个算子角色对应其在 `models/*.py` 中的实际调用链(例如某模型的 `qkv` 投影对应 `mimo_v2_flash.py:310`);层数由 trace 涌现得出,非人工设定。
+- **Pallas kernels**:真实核函数名、每设备的输入输出抽象形状(aval),以及 `shard_map` 调用位置。
+
+**决策指引**:在其他视图锁定代价较高的算子类别后,经此视图定位到具体源码以实施修改。
 
 ---
 
-## 关键概念速查
+## 6. 术语表
 
-- **roofline / bound**:`ideal = max(compute, HBM, ICI)`;最大的那个是瓶颈。这是**理论下界**,不是实测吞吐。
-- **OI(operational intensity)= flops / bytes**;`ridge = MXU峰值 / HBM带宽`。OI < ridge → 访存瓶颈;> ridge → 算力瓶颈。
-- **exposed vs hidden(ICI)**:暴露的通信加在关键路径上;藏住的被计算盖住。`step ≈ max(ΣC,ΣH) + exposed comm`。
-- **VMEM working set**:kernel 实际占的片上内存(取自 kernel 自己的估算器),对 64MB(v7x 上限)看余量。
-- **t / ep**:`t = tp/dp`(tensor 轴),`ep = tp`(fused-MoE 专家并行)。
+| 术语 | 定义 |
+|---|---|
+| **roofline / bound** | 性能上界模型。`理论时间 = max(计算, 访存, 通信)`;取最大值者为瓶颈(bound)。 |
+| **OI(运算强度)** | `FLOPs / HBM 字节`。衡量每读取一字节所执行的浮点运算数。 |
+| **ridge(脊点)** | `MXU 峰值算力 / HBM 带宽`。OI 低于脊点为访存受限,高于为算力受限。 |
+| **HBM** | 高带宽内存。此处"访存"指 HBM 读写(权重、KV、激活)。 |
+| **ICI** | 芯片间互联。此处"通信"指跨设备 collective 的 ICI 传输。 |
+| **MXU** | 矩阵乘单元。算力峰值的承载单元;fp8 速率仅在 W8A8 下达到。 |
+| **VMEM** | 片上向量内存。核函数工作集须容纳其中;v7x 单设备上限 64 MB。 |
+| **t / ep** | `t = tp / dp` 为张量并行度;`ep = tp` 为 fused-MoE 专家并行度。 |
+| **exposed / hidden(通信)** | 暴露通信计入关键路径;被掩盖通信被计算覆盖。`step ≈ max(ΣC,ΣH) + 暴露通信`。 |
+| **SYNC / async(collective)** | 同步通信为暴露的屏障;异步通信可被编译器与计算重叠。 |
 
 ---
 
-## 常见误读 / 边界
+## 7. 完整解读示例
 
-- **是理论下界,不是实测**。`ideal_ms = max(...)` 不预测跨算子运行时 overlap 等涌现效应;Overlap/Kernel 的最终确认仍需 device trace。报告里 `XLA actual` 列是编译器实测证据(需 `--hlo`),但「kernel 能否打到天花板」要真机 profile。
-- **token 是 per-dp**:旋钮里的 token 是每 DP 组;MoE 全局 = per-dp × dp。
-- **`--seq-len` 只影响 decode 的 KV 读**;prefill 在 chunk 内因果,上下文取 chunk。
-- **bound 比绝对 ms 可信**:各类同构,放缩不改变「哪个引擎最大」;所以「该砍什么」的结论很稳,绝对 ms 当量级看。
-- 这套深度拆解(RPA / fused-MoE-v2 卡、tuned block、VMEM)目前是 **MiMo 系**专用;换架构(如 Ling3 的 KDA/MLA)需要先做适配。
+以下以 MoE 模型在 `tp=32 / dp=8`(即 `t=4`、`ep=32`)下的两个阶段为例,演示从报告到决策的完整路径。
+
+**Prefill(分块 256 token)**:
+1. 汇总框显示 `bound: ICI`,单步时间主要由 all-to-all 通信构成。
+2. 进入 Overlap 视图:MoE all-to-all 一行的 `XLA actual` 标注为 `⚠`(模型判定可流水,实测在环面带宽下沿暴露);通信总时间 `ΣI` 超过计算/访存墙,判定为通信受限。
+3. 结论:重叠无法降低单步时间,应降低通信量——减小预填充分块、提升专家并行的局部性、减少跨主机跳数。
+
+**Decode(适中批量)**:
+1. 汇总框显示 `bound: HBM`,单步时间由 **MoE 权重读取**主导(每步读取一次,与批量无关)。
+2. 进入 Kernel 视图:fused-MoE-v2 卡片判定为权重访存受限,权重占 HBM 流量近 100%。
+3. 结论:采用 fp8 权重(量化控件)或增大专家并行度 `ep`;此配置下注意力的 KV 读取量相对较小。
+
+---
+
+## 8. 适用范围与局限
+
+- **理论下界,非实测**:`理论时间 = max(计算, 访存, 通信)` 不预测跨算子运行时重叠等涌现效应。报告适于瓶颈归属与量级评估;核函数能否达到该理论上界,需设备级 profile 确认。`XLA actual` 列为编译器实测证据(需附带 HLO),用以校验通信调度判断。
+- **瓶颈结论比绝对值更稳健**:同类算子结构一致,缩放不改变"哪类资源最大",故"应优化何处"的结论稳定可靠;绝对毫秒数宜作量级参考。
+- **token 口径为每 DP 组**:控件中的 token 为 per-dp 计数,MoE 全局 token 为 `per-dp × dp`。
+- **`decode KV context` 仅影响 decode 的 KV 读取量**;prefill 在分块内为因果注意力,上下文取分块大小。
+- **block-wise fp8** 的 MXU 速率按 bf16 计(per-block scale 打断 K 维累加),报告已据此处理。
+- **架构适用性**:目前的核函数级深度拆解(注意力 / fused-MoE-v2 卡片、tuned block、VMEM 估计)针对当前 MoE 模型族;应用于其他架构需先完成相应适配。
