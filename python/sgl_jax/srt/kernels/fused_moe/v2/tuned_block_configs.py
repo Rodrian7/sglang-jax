@@ -161,7 +161,23 @@ def get_tuned_fused_moe_v2_block_config(
         cfg_tuple = _lookup(table_key_legacy)
 
     if cfg_tuple is None:
-        return DEFAULT_V2_BLOCK_CONFIG
+        # No tuned entry: the static default's bf=512 is invalid when it does not
+        # divide intermediate_size (e.g. Ling3's 768). Fall back to the largest
+        # 128-multiple that divides intermediate_size (<=512), so validate passes
+        # for any model. (intermediate_size=2048 still yields bf=512, unchanged.)
+        bf = next((b for b in (512, 384, 256, 128) if intermediate_size % b == 0), 128)
+        bse = next((b for b in (256, 128) if intermediate_size % b == 0), 128)
+        if bf == DEFAULT_V2_BLOCK_CONFIG.bf and bse == DEFAULT_V2_BLOCK_CONFIG.bse:
+            return DEFAULT_V2_BLOCK_CONFIG
+        logger.info(
+            "No v2 tuned block config for intermediate_size=%d; default bt=32 bf=%d bse=%d",
+            intermediate_size,
+            bf,
+            bse,
+        )
+        return FusedMoEBlockConfig(
+            bt=DEFAULT_V2_BLOCK_CONFIG.bt, bf=bf, btc=DEFAULT_V2_BLOCK_CONFIG.btc, bse=bse
+        )
 
     if len(cfg_tuple) != 5:
         raise ValueError(f"Unexpected v2 tuned config tuple length: {len(cfg_tuple)}")
