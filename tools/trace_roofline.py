@@ -125,6 +125,7 @@ def main():
             seq_len=args.seq_len,
             chunk=256,
             enable_sp=args.enable_sp,
+            moe_backend=args.moe_backend,
         )
         os.makedirs(os.path.dirname(os.path.abspath(args.html)), exist_ok=True)
         report_html.build_html_report(
