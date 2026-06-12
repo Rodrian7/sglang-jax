@@ -738,73 +738,79 @@ function lensKernel(s,R){
 function blockOf(re,keys){const K=(D.codepath&&D.codepath.kernels)||[]; const k=K.find(x=>re.test(x.name||"")); const o={name:k?k.name:""};
   for(const key of keys){const m=k&&(k.name||"").match(new RegExp(key+"_(\\d+)")); o[key]=m?+m[1]:0;} return o;}
 function kbar(lab,ms,tot,col,sub){return "<div class='dfrow'><div class='nm' style='flex-basis:160px'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,ms/Math.max(tot,1e-9)*100)+"%;background:"+col+"'></div></div><div class='ms'>"+ms.toFixed(3)+" ms"+(sub?" · "+sub:"")+"</div></div>";}
+// ---------- per-kernel tuning cards (generic: each module renders its own) ----------
+// tuneCard = generic engine-split card (HBM weight+act | compute MXU | comm ICI parts;
+// ideal=max; + OI/ridge + VMEM-fit + bound-aware lever). Modules call it from .card().
+function tuneCard(title,blk,wB,aB,flops,iciParts,peakKind,vmem,levFn){
+  const P=D.peaks, HB=HBMBW, ICI=ICIBW, VMEM=(P.vmem_mb||64)*1e6;
+  const peak=(peakKind==="fp8"?P.fp8_tflops:P.bf16_tflops);
+  const iciB=iciParts.reduce((a,p)=>a+p[1],0);
+  const wms=wB/HB*1e3, ams=aB/HB*1e3, hms=wms+ams, cms=flops/(peak*1e12)*1e3, ims=iciB/ICI*1e3;
+  const ideal=Math.max(hms,cms,ims), bound=ideal===ims&&ims>0?"ICI":(ideal===cms?"compute":"HBM");
+  const oi=flops/(wB+aB), ridge=peak*1e12/HB;
+  const parts=[["weight HBM",wms,"#d62728"],["act HBM",ams,"#f59e0b"],["compute (MXU)",cms,"#22c55e"]];
+  for(const p of iciParts) parts.push([p[0],p[1]/ICI*1e3,p[2]]);
+  const tot=Math.max(...parts.map(p=>p[1]));
+  let c="<div class='panel' style='margin:8px 0;box-shadow:none'><div style='font-weight:700'>"+title+" — <span class='tag b-"+(bound==="HBM"?"HBM":bound==="compute"?"compute":"ICI")+"'>"+bound+"-bound</span> ideal "+ideal.toFixed(3)+" ms</div><div class='note mono'>block: "+blk+"</div>";
+  for(const p of parts) c+=kbar(p[0],p[1],tot,p[2]);
+  c+="<div class='note' style='margin-top:4px'>HBM = weight+act = "+hms.toFixed(3)+" ms · compute "+cms.toFixed(3)+" ms · comm (ICI) "+ims.toFixed(3)+" ms → ideal = max = <b>"+ideal.toFixed(3)+" ms</b>. OI = <b>"+oi.toFixed(1)+"</b> · ridge "+ridge.toFixed(0)+" → MXU at "+Math.min(100,oi/ridge*100).toFixed(0)+"% "+peakKind+" peak.</div>";
+  c+="<div class='note'>VMEM working set ≈ <b>"+(vmem/1e6).toFixed(1)+" MB</b> (kernel's own estimate) / "+(VMEM/1e6).toFixed(0)+" MB "+(vmem>VMEM?"<span class='tag b-ICI'>over budget — would spill</span>":"<span class='tag b-compute'>fits ("+((VMEM-vmem)/1e6).toFixed(0)+" MB headroom)</span>")+"</div>";
+  c+="<div class='verdict "+(bound==="compute"?"v-go":"v-warn")+"'>"+levFn(bound,{wB,aB,flops,iciB,oi,ridge,hms,ims})+"</div>";
+  return c+"</div>";
+}
+
+MODULES.rpa.card = function(ctx,dims,R){
+  const t=ctx.t, tokens=ctx.tokens, d=dims;
+  const nq=Math.max(1,Math.floor(d.nh/t)), nkv=kvpd(d.nkv,t), hd=d.hd, vhd=d.vhd;
+  const cl=R.decode?ctx.seq_len:tokens, eff=d.window?Math.min(cl,d.window):cl, inter=tokens*(R.decode?eff:eff/2);
+  const o=attention(nq,nkv,hd,vhd,tokens,inter,R.decode?1:32), flops=o.flops;
+  const kvB=Math.floor(inter/(R.decode?1:32))*nkv*2*hd*2, qoB=o.hbm-kvB;
+  const stg=R.decode?"d":"m", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
+  const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|p|"+sw]);
+  let bq,bkv,blkLbl,vmem;
+  if(rk&&rk.length){const rb=rk.find(e=>e.n>=tokens)||rk[rk.length-1]; bq=rb.bq; bkv=rb.bkv;
+    vmem=rb.vmem||(bq*hd*2 + bkv*hd*2*2 + bq*bkv*4);
+    blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode/d":"prefill/m")+(d.window?", SWA "+d.window:"")+") → bq="+bq+" bkv="+bkv;}
+  else {const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]); bq=blk.bq||16; bkv=blk.bkv||512;
+    vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
+    blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+"/"+sw+")";}
+  const name=d.window?("SWA (window="+d.window+")"):"full";
+  return tuneCard("RPA attention — "+name+" (per device, "+(R.decode?"decode":"prefill")+")", blkLbl, kvB, qoB, flops, [], "bf16", vmem,
+    (bound,x)=>{
+      if(bound==="HBM") return "<b>KV-read-bound.</b> KV-cache read ≈ "+fmt(x.wB/1e9)+" GB dominates"+(d.window?" (window "+d.window+" caps ctx→"+eff+")":"")+". Levers: ① fp8 KV cache (½ read); ② fewer KV heads / GQA (nkv/dev="+nkv+")"+(d.window?"":"; ③ shorter context / SWA")+". bq/bkv tune VMEM + MXU util, not the KV bytes (workload-fixed).";
+      return "<b>compute-bound.</b> Levers: ↑ MXU util (bq/bkv tiling), or it's just cheap (decode attention often is).";
+    });
+};
+
+MODULES.fused_moe_v2.card = function(ctx,dims,R){
+  const t=ctx.t, ep=ctx.ep, L=ctx.L, tokens=ctx.tokens;
+  const E=dims.NEXP/ep, d=D.H, f=dims.MOEF, mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*dims.TOPK/ep)), q=Q.wq!=="bf16";
+  const wB=E*(q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d)), aB=2*tpd*d*2, flops=2*tpd*3*d*f;
+  const remote=ep>1?(ep-1)/ep:0, a2aB=2*(mt*dims.TOPK/ep)*d*2*remote;  // dispatch + combine a2a (in-kernel)
+  const reshardB=rowReduce(tokens,d,L);  // post-kernel TP all-reduce (tensor axis); SP all-gather is async/hidden
+  const iciParts=[["a2a (in-kernel)",a2aB,"#ec4899"],["output all-reduce (TP)",reshardB,"#db2777"]];
+  const tbl=(D.moe_blocks&&(D.moe_blocks[ep]||D.moe_blocks[String(ep)]))||null;
+  const tb=tbl&&tbl.length?(tbl.find(e=>e.n>=mt)||tbl[tbl.length-1]):null;
+  const bt=tb?tb.bt:16, bf=tb?tb.bf:512;
+  const blkLbl=tb?("tuned @ num_tokens="+tb.n+" (chunk×dp="+mt+") → bt="+bt+" bf="+bf):("bt="+bt+" bf="+bf+" (default; no tuned entry)");
+  const vmem=(tb&&tb.vmem)?tb.vmem:(bf*d*(q?1:2)+bt*d*2+bt*bf*4);  // kernel estimate; fallback rough
+  return tuneCard("fused-MoE-v2 experts (per device, per layer)", blkLbl, wB, aB, flops, iciParts, wpeak(), vmem,
+    (bound,x)=>{
+      if(bound==="ICI") return "<b>comm-bound (ICI).</b> a2a (in-kernel, SparseCore) "+(a2aB/ICIBW*1e3).toFixed(3)+" ms + output all-reduce (TP, tensor axis) "+(reshardB/ICIBW*1e3).toFixed(3)+" ms = "+x.ims.toFixed(3)+" ms &gt; HBM "+x.hms.toFixed(3)+" ms. a2a is measured exposed at the torus floor; the all-reduce is a SYNC barrier over the tensor axis (HLO-verified). The SP all-gather that re-collects the sequence is async/hidden, not counted here. Levers: EP locality / topology / fewer cross-host hops; smaller chunk shrinks a2a; raise t-axis locality for the all-reduce.";
+      if(bound==="HBM") return "<b>weight-HBM-bound.</b> weights "+fmt(x.wB/1e9)+" GB of "+fmt((x.wB+x.aB)/1e9)+" GB ("+(x.wB/(x.wB+x.aB)*100).toFixed(0)+"%), read once. Levers: ① fp8 weights (quant knob; block-fp8 caps at bf16 MXU); ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ raise OI ("+x.oi.toFixed(0)+"→ridge "+x.ridge.toFixed(0)+") via more tokens/expert (tpd="+tpd+", bigger batch/chunk). bt/bf (tuned for num_tokens="+(tb?tb.n:"?")+") set VMEM + MXU util, not the byte budget.";
+      return "<b>compute-bound.</b> Above the ridge — lever: ↑ MXU rate (non-block W8A8) or ↓ flops.";
+    });
+};
+
 function kernelTune(s,R){
-  const L=R.L, tokens=R.decode?s.batch:s.chunk, t=L.t, ep=L.ep, P=D.peaks;
-  const HB=P.hbm_gbps*1e9, ICI=P.ici_gbps*1e9, VMEM=(P.vmem_mb||64)*1e6;
-  let h="<div class='lh' style='margin-top:14px'>Pallas kernel tuning — the two hot kernels</div>";
+  let h="<div class='lh' style='margin-top:14px'>Pallas kernel tuning — per kernel/layer-type</div>";
   h+="<div class='note'>Each kernel's time split into the three engines (HBM = weight+act, same bandwidth → they sum; compute on MXU; comm on ICI → parallel axes). <b>ideal = max(HBM, compute, comm)</b> and the longest bar is the bound. Theory gives this ceiling + the VMEM-fit; whether the kernel hits it (tiling / MXU util / pipelining) needs a device trace.</div>";
-  function card(title,blk,wB,aB,flops,iciParts,peakKind,vmem,levFn){
-    const peak=(peakKind==="fp8"?P.fp8_tflops:P.bf16_tflops);
-    const iciB=iciParts.reduce((a,p)=>a+p[1],0);
-    const wms=wB/HB*1e3, ams=aB/HB*1e3, hms=wms+ams, cms=flops/(peak*1e12)*1e3, ims=iciB/ICI*1e3;
-    const ideal=Math.max(hms,cms,ims), bound=ideal===ims&&ims>0?"ICI":(ideal===cms?"compute":"HBM");
-    const oi=flops/(wB+aB), ridge=peak*1e12/HB;
-    const parts=[["weight HBM",wms,"#d62728"],["act HBM",ams,"#f59e0b"],["compute (MXU)",cms,"#22c55e"]];
-    for(const p of iciParts) parts.push([p[0],p[1]/ICI*1e3,p[2]]);
-    const tot=Math.max(...parts.map(p=>p[1]));
-    let c="<div class='panel' style='margin:8px 0;box-shadow:none'><div style='font-weight:700'>"+title+" — <span class='tag b-"+(bound==="HBM"?"HBM":bound==="compute"?"compute":"ICI")+"'>"+bound+"-bound</span> ideal "+ideal.toFixed(3)+" ms</div><div class='note mono'>block: "+blk+"</div>";
-    for(const p of parts) c+=kbar(p[0],p[1],tot,p[2]);
-    c+="<div class='note' style='margin-top:4px'>HBM = weight+act = "+hms.toFixed(3)+" ms · compute "+cms.toFixed(3)+" ms · comm (ICI) "+ims.toFixed(3)+" ms → ideal = max = <b>"+ideal.toFixed(3)+" ms</b>. OI = <b>"+oi.toFixed(1)+"</b> · ridge "+ridge.toFixed(0)+" → MXU at "+Math.min(100,oi/ridge*100).toFixed(0)+"% "+peakKind+" peak.</div>";
-    c+="<div class='note'>VMEM working set ≈ <b>"+(vmem/1e6).toFixed(1)+" MB</b> (kernel's own estimate) / "+(VMEM/1e6).toFixed(0)+" MB "+(vmem>VMEM?"<span class='tag b-ICI'>over budget — would spill</span>":"<span class='tag b-compute'>fits ("+((VMEM-vmem)/1e6).toFixed(0)+" MB headroom)</span>")+"</div>";
-    c+="<div class='verdict "+(bound==="compute"?"v-go":"v-warn")+"'>"+levFn(bound,{wB,aB,flops,iciB,oi,ridge,hms,ims})+"</div>";
-    return c+"</div>";
+  const comp=D.composition||{attn:[],ffn:[]};
+  const ctx={tokens:R.decode?s.batch:s.chunk, decode:R.decode, t:R.L.t, ep:R.L.ep, L:R.L, seq_len:s.seq_len, chunk:s.chunk};
+  for(const e of (comp.ffn||[]).concat(comp.attn||[])){
+    const mod=MODULES[e.m]; if(!mod||!mod.card) continue;
+    h += mod.card(ctx, e.dims, R);
   }
-  // ---- fused MoE v2 ----
-  if(D.n_moe>0){
-    const E=D.NEXP/ep, d=D.H, f=D.MOEF, mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep)), q=Q.wq!=="bf16";
-    const wB=E*(q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d)), aB=2*tpd*d*2, flops=2*tpd*3*d*f;
-    const remote=ep>1?(ep-1)/ep:0, a2aB=2*(mt*D.TOPK/ep)*d*2*remote;  // dispatch + combine a2a (in-kernel)
-    const reshardB=rowReduce(tokens,d,L);  // post-kernel TP all-reduce (tensor axis) — matches the model-level 'moe' ici; SP all-gather is async/hidden (see Overlap)
-    const iciParts=[["a2a (in-kernel)",a2aB,"#ec4899"],["output all-reduce (TP)",reshardB,"#db2777"]];
-    // tuned block config keyed on num_tokens = mt (global = per-DP chunk x dp)
-    const tbl=(D.moe_blocks&&(D.moe_blocks[ep]||D.moe_blocks[String(ep)]))||null;
-    const tb=tbl&&tbl.length?(tbl.find(e=>e.n>=mt)||tbl[tbl.length-1]):null;
-    const bt=tb?tb.bt:16, bf=tb?tb.bf:512;
-    const blkLbl=tb?("tuned @ num_tokens="+tb.n+" (chunk×dp="+mt+") → bt="+bt+" bf="+bf):("bt="+bt+" bf="+bf+" (default; no tuned entry)");
-    const vmem=(tb&&tb.vmem)?tb.vmem:(bf*d*(q?1:2)+bt*d*2+bt*bf*4);  // kernel estimate (double-buf W1/W3/W2 + staging); fallback rough
-    h+=card("fused-MoE-v2 experts (per device, per layer)", blkLbl, wB, aB, flops, iciParts, wpeak(), vmem,
-      (bound,x)=>{
-        if(bound==="ICI") return "<b>comm-bound (ICI).</b> a2a (in-kernel, SparseCore) "+(a2aB/ICI*1e3).toFixed(3)+" ms + output all-reduce (TP, tensor axis) "+(reshardB/ICI*1e3).toFixed(3)+" ms = "+x.ims.toFixed(3)+" ms &gt; HBM "+x.hms.toFixed(3)+" ms. a2a is measured exposed at the torus floor; the all-reduce is a SYNC barrier over the tensor axis (HLO-verified). The SP all-gather that re-collects the sequence is async/hidden, not counted here. Levers: EP locality / topology / fewer cross-host hops; smaller chunk shrinks a2a; raise t-axis locality for the all-reduce.";
-        if(bound==="HBM") return "<b>weight-HBM-bound.</b> weights "+fmt(x.wB/1e9)+" GB of "+fmt((x.wB+x.aB)/1e9)+" GB ("+(x.wB/(x.wB+x.aB)*100).toFixed(0)+"%), read once. Levers: ① fp8 weights (quant knob; block-fp8 caps at bf16 MXU); ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ raise OI ("+x.oi.toFixed(0)+"→ridge "+x.ridge.toFixed(0)+") via more tokens/expert (tpd="+tpd+", bigger batch/chunk). bt/bf (tuned for num_tokens="+(tb?tb.n:"?")+") set VMEM + MXU util, not the byte budget.";
-        return "<b>compute-bound.</b> Above the ridge — lever: ↑ MXU rate (non-block W8A8) or ↓ flops.";
-      });
-  }
-  // ---- RPA attention (full + SWA variants, one card each) ----
-  function rpaCard(d,name){
-    const nq=Math.max(1,Math.floor(d.nh/t)), nkv=kvpd(d.nkv,t), hd=d.hd, vhd=d.vhd;
-    const ctx=R.decode?s.seq_len:tokens, eff=d.window?Math.min(ctx,d.window):ctx, inter=tokens*(R.decode?eff:eff/2);
-    const o=attention(nq,nkv,hd,vhd,tokens,inter,R.decode?1:32), flops=o.flops;
-    const kvB=Math.floor(inter/(R.decode?1:32))*nkv*2*hd*2, qoB=o.hbm-kvB;
-    // tuned (bq,bkv) keyed on max_num_tokens (= per-device q tokens = the knob), t,
-    // stage, sliding_window (SWA -> window, full -> "full"). Prefill runs the MIXED
-    // kernel (trace = RPAm), so try "m" first then "p"; decode -> "d". Miss -> traced.
-    const stg=R.decode?"d":"m", sw=d.window?d.window:"full", RB=D.rpa_blocks||{};
-    const rk=RB[t+"|"+stg+"|"+sw]||(R.decode?null:RB[t+"|p|"+sw]);
-    let bq,bkv,blkLbl,vmem;
-    if(rk&&rk.length){const rb=rk.find(e=>e.n>=tokens)||rk[rk.length-1]; bq=rb.bq; bkv=rb.bkv;
-      vmem=rb.vmem||(bq*hd*2 + bkv*hd*2*2 + bq*bkv*4);  // kernel estimate; fallback rough
-      blkLbl="tuned @ max_num_tokens="+rb.n+" (t="+t+", "+(R.decode?"decode/d":"prefill/m")+(d.window?", SWA "+d.window:"")+") → bq="+bq+" bkv="+bkv;}
-    else {const blk=blockOf(/RPA[dm]-/,["bq","bkv","p"]); bq=blk.bq||16; bkv=blk.bkv||512;
-      vmem=bq*hd*2 + bkv*hd*2*2 + bq*bkv*4;
-      blkLbl=(blk.name||"n/a")+" (traced; no tuned entry for t="+t+"/"+stg+"/"+sw+")";}
-    h+=card("RPA attention — "+name+" (per device, "+(R.decode?"decode":"prefill")+")", blkLbl, kvB, qoB, flops, [], "bf16", vmem,
-      (bound,x)=>{
-        if(bound==="HBM") return "<b>KV-read-bound.</b> KV-cache read ≈ "+fmt(x.wB/1e9)+" GB dominates"+(d.window?" (window "+d.window+" caps ctx→"+eff+")":"")+". Levers: ① fp8 KV cache (½ read); ② fewer KV heads / GQA (nkv/dev="+nkv+")"+(d.window?"":"; ③ shorter context / SWA")+". bq/bkv tune VMEM + MXU util, not the KV bytes (workload-fixed).";
-        return "<b>compute-bound.</b> Levers: ↑ MXU util (bq/bkv tiling), or it's just cheap (decode attention often is).";
-      });
-  }
-  if(D.n_full>0) rpaCard(D.full,"full");
-  if(D.n_swa>0) rpaCard(D.swa,"SWA (window="+(D.swa.window||"?")+")");
   return h;}
 function lensFusion(s,R){
   const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
