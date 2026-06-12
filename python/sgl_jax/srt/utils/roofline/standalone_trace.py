@@ -423,6 +423,9 @@ def _build_hybrid_attn_and_pools(mc, mesh, attention_tp, dp, page_size, runner, 
         page_size=page_size,
         mesh=mesh,
         attention_data_partition_axis="data",
+        # On CPU get_tpu_info() raises ("Unsupported TPU device kind: cpu"); pin the
+        # v7x VMEM cap (64 MiB) so __init__ never calls it. Shapes-only trace anyway.
+        vmem_limit_bytes=int(64 * 1024 * 1024 * 0.9),
     )
     # Gate the wrapper's linear sub-backend (mirror the runner's config properties).
     from sgl_jax.srt.configs.bailing_moe_v3 import BailingMoeV3Config
