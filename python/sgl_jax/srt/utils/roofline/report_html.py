@@ -626,8 +626,8 @@ function gemm(m,k,n,role){const q=WROLES[role]&&Q.wq!=="bf16";
 // queries (bq=32) so the KV streams ~once per block (~inter/bq). Decode's qtok tokens
 // are SEPARATE sequences each reading their own full KV — no shared blocking, bq=1 ->
 // inter (matches the tuned decode block bq=1). Hardcoding 32 under-counted decode KV 32x.
-function attention(nq,nkv,hd,vhd,qtok,inter,bq){bq=bq||32; const f=4*nq*hd*inter;
-  const hbm=qtok*nq*hd*2 + qtok*nq*vhd*2 + Math.floor(inter/bq)*nkv*2*hd*2 + qtok*nkv*2*hd*2; return {flops:f,hbm:hbm,ici:0,peak:"bf16"};}
+function attention(nq,nkv,hd,vhd,qtok,inter,bq,kvShare){bq=bq||32; const kc=kvShare?1:2; const f=4*nq*hd*inter;
+  const hbm=qtok*nq*hd*2 + qtok*nq*vhd*2 + Math.floor(inter/bq)*nkv*kc*hd*2 + qtok*nkv*kc*hd*2; return {flops:f,hbm:hbm,ici:0,peak:"bf16"};}
 function moe(tpd,le,d,f,role){const q=WROLES[role]&&Q.wq!=="bf16";
   const wbf=q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d); const act=(q?abytes(tpd,d):2*tpd*d)+2*tpd*d;
   return {flops:2*tpd*3*d*f, hbm:le*wbf+act, ici:0, peak:q?wpeak():"bf16"};}
@@ -754,9 +754,10 @@ const MODULES = {
       rows.push({cat:"linear", o:gemm(ctx.tokens,kvl,nh*(qkn+vh),"qkv"), shard:t});
       // rope on q_rope (nh*qkr) + k_rope (qkr, 1 latent head)
       rows.push({cat:"rope", o:rope(ctx.tokens,nh*qkr,qkr), shard:t});
-      // absorbed attention: MQA over the latent (qk dim = kvl+qkr, v dim = kvl, nkv=1)
+      // absorbed attention: MQA over the latent (qk dim = kvl+qkr, v dim = kvl, nkv=1).
+      // kvShare=true: the absorbed cache stores ONE shared latent per token (k==v), not separate K/V.
       const eff=ctx.ctxlen, inter=ctx.tokens*(ctx.decode?eff:eff/2);
-      rows.push({cat:"attention", o:attention(Math.max(1,Math.floor(nh/t)),1,kvl+qkr,kvl,ctx.tokens,inter,ctx.decode?1:32)});
+      rows.push({cat:"attention", o:attention(Math.max(1,Math.floor(nh/t)),1,kvl+qkr,kvl,ctx.tokens,inter,ctx.decode?1:32,true)});
       // head-wise output gate g_proj (H->nh), then o_proj + TP reduce
       rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,nh,"qkv"), shard:t});
       rows.push({cat:"o_proj", o:gemm(ctx.tokens,nh*vh,D.H,"o_proj"), shard:t});
@@ -774,7 +775,7 @@ const MODULES = {
         {name:"kv_a_proj (latent)",cat:"linear",o:gemm(ctx.tokens,D.H,kvl+qkr,"qkv")},
         {name:"kv_b_proj (W_UK/W_UV)",cat:"linear",o:gemm(ctx.tokens,kvl,nh*(qkn+vh),"qkv"),shard:t},
         {name:"rope",cat:"rope",o:rope(ctx.tokens,nh*qkr,qkr),shard:t},
-        {name:"attention (latent MQA)",cat:"attention",o:attention(Math.max(1,Math.floor(nh/t)),1,kvl+qkr,kvl,ctx.tokens,inter)},
+        {name:"attention (latent MQA)",cat:"attention",o:attention(Math.max(1,Math.floor(nh/t)),1,kvl+qkr,kvl,ctx.tokens,inter,undefined,true)},
         {name:"o_proj +reduce",cat:"o_proj",o:oproj,shard:t},
       ];
     },
@@ -794,8 +795,11 @@ const MODULES = {
       // short causal depthwise conv on q,k,v (kernel=conv): ~elementwise
       rows.push({cat:"other", o:{flops:3*ctx.tokens*proj*conv*2, hbm:3*ctx.tokens*proj*2*2, ici:0, peak:"bf16"}});
       // gated delta recurrent: per token/head state d_k x d_v (=hd x hd); ~4 ops/tok/head.
-      // HBM driver = recurrent state read+write (fp32), FIXED per token (no growing KV).
-      rows.push({cat:"attention", o:{flops:ctx.tokens*nqh*4*hd*hd, hbm:ctx.tokens*nqh*hd*2*3 + nqh*hd*hd*4*2, ici:0, peak:"bf16"}});
+      // HBM driver = recurrent state read+write (fp32). Decode reads+writes each request's
+      // full [H,d_k,d_v] state once (scales with tokens=batch); prefill keeps it in VMEM
+      // across the chunked scan (one init+final per sequence). No growing KV cache.
+      const st=ctx.decode?ctx.tokens*nqh*hd*hd*4*2:nqh*hd*hd*4*2;
+      rows.push({cat:"attention", o:{flops:ctx.tokens*nqh*4*hd*hd, hbm:ctx.tokens*nqh*hd*2*5 + st, ici:0, peak:"bf16"}});
       // o_norm (gated rms) + o_proj + TP reduce
       rows.push({cat:"norm", o:rms(ctx.tokens,proj)});
       rows.push({cat:"o_proj", o:gemm(ctx.tokens,proj,D.H,"o_proj"), shard:t});
@@ -810,7 +814,7 @@ const MODULES = {
       return [
         {name:"qkv+fg proj (×5)",cat:"linear",o:{flops:5*2*ctx.tokens*D.H*proj, hbm:5*(2*D.H*proj+2*ctx.tokens*D.H+2*ctx.tokens*proj), ici:0, peak:"bf16"},shard:t},
         {name:"short conv (q,k,v)",cat:"other",o:{flops:3*ctx.tokens*proj*dims.conv*2, hbm:3*ctx.tokens*proj*2*2, ici:0, peak:"bf16"}},
-        {name:"gated-delta recurrent",cat:"attention",o:{flops:ctx.tokens*nqh*4*hd*hd, hbm:ctx.tokens*nqh*hd*2*3+nqh*hd*hd*4*2, ici:0, peak:"bf16"}},
+        {name:"gated-delta recurrent",cat:"attention",o:{flops:ctx.tokens*nqh*4*hd*hd, hbm:ctx.tokens*nqh*hd*2*5+(ctx.decode?ctx.tokens*nqh*hd*hd*4*2:nqh*hd*hd*4*2), ici:0, peak:"bf16"}},
         {name:"o_norm",cat:"norm",o:rms(ctx.tokens,proj)},
         {name:"o_proj +reduce",cat:"o_proj",o:oproj,shard:t},
       ];
@@ -823,16 +827,20 @@ const MODULES = {
     flow(){return "MoE";},
     costRows(ctx,dims){
       const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
-      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep));
       const e=moe(tpd, NEXP/ctx.ep, D.H, MOEF, "experts");
-      e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote + rowReduce(ctx.tokens,D.H,ctx.L);
+      // EPMoE replicates ALL mt tokens to every shard (reshard P(None)) and combines via
+      // an expert-axis all-reduce of the FULL [mt,H] output (psum — NOT a routed-token
+      // a2a like fused-v2); a separate TP all-reduce (rowReduce) completes the down-proj.
+      e.hbm += 2*mt*D.H*2;  // full replicated output materialised for the psum
+      e.ici=allreduce(mt*D.H*2,ctx.ep) + rowReduce(ctx.tokens,D.H,ctx.L);
       return [ {cat:"router", o:router(ctx.tokens,D.H,NEXP)}, {cat:"moe", o:e} ];
     },
     chain(ctx,dims){
       const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
-      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
-      const e=moe(tpd,NEXP/ctx.ep,D.H,MOEF,"experts"); e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote+rowReduce(ctx.tokens,D.H,ctx.L);
-      return [ {name:"router_gate",cat:"router",o:router(ctx.tokens,D.H,NEXP)}, {name:"experts +a2a (XLA)",cat:"moe",o:e} ];
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep));
+      const e=moe(tpd,NEXP/ctx.ep,D.H,MOEF,"experts"); e.hbm+=2*mt*D.H*2; e.ici=allreduce(mt*D.H*2,ctx.ep)+rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {name:"router_gate",cat:"router",o:router(ctx.tokens,D.H,NEXP)}, {name:"experts +EP all-reduce (psum)",cat:"moe",o:e} ];
     },
   },
   // ---- shared expert (always-on dense MLP that runs alongside the routed experts) ----
