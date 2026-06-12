@@ -265,8 +265,33 @@ def _bake_jaxpr(arch, config) -> dict | None:
         return None
 
 
-def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
-    H = _cfg(config, "hidden_size")
+_COMPOSERS = {}  # arch_name -> compose(config) -> {"attn":[...], "ffn":[...]}
+
+
+def register_composer(*names):
+    def deco(fn):
+        for n in names:
+            _COMPOSERS[n] = fn
+        return fn
+
+    return deco
+
+
+def _compose(arch, config) -> dict:
+    """Detect which kernel/layer-type modules a model uses, and how many layers of
+    each, as ``{"attn":[{m,count,dims}], "ffn":[{m,count,dims}]}``. The JS generator
+    iterates this and dispatches to its MODULES registry, so the report is not tied
+    to any one model. Per-arch composers register below; the generic fallback covers
+    RPA(full/SWA) attention + fused-MoE-v2 / dense FFN models."""
+    return _COMPOSERS.get(arch, _compose_generic)(config)
+
+
+@register_composer("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM", "MiMoV2ForCausalLM")
+def _compose_generic(config) -> dict:
+    """RPA attention (full + sliding-window) + fused-MoE-v2 / dense FFN, keyed off
+    ``hybrid_layer_pattern`` (SWA layers) and ``moe_layer_freq`` (MoE vs dense).
+    Covers the MiMo-V2 family and dense / all-MoE RPA models (e.g. Qwen3-MoE,
+    whose missing patterns default to all-full-attention + all-MoE)."""
     L = _cfg(config, "num_hidden_layers")
     hlp = _cfg(config, "hybrid_layer_pattern", default=[0] * L)
     mlf = _cfg(config, "moe_layer_freq", default=[1] * L)
@@ -292,19 +317,15 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         vhd=_cfg(config, "swa_v_head_dim", default=full["vhd"]),
         window=_cfg(config, "sliding_window_size", default=4096),
     )
-    # Generic per-layer-type composition (module id + count + dims). The JS
-    # generator iterates this and dispatches to its MODULES registry, instead of
-    # hardcoding MiMo's full/swa + moe/dense. P1 derives it from the same config
-    # logic as the legacy n_* fields below (which are kept for cards/buildChain).
-    _NEXP = _cfg(config, "n_routed_experts", "num_experts", default=8)
-    _TOPK = _cfg(config, "num_experts_per_tok", default=2)
-    _MOEF = _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size"))
-    _DENSE_F = _cfg(config, "intermediate_size")
+    NEXP = _cfg(config, "n_routed_experts", "num_experts", default=8)
+    TOPK = _cfg(config, "num_experts_per_tok", default=2)
+    MOEF = _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size"))
+    DENSE_F = _cfg(config, "intermediate_size")
     n_full = combo[(False, True)] + combo[(False, False)]
     n_swa = combo[(True, True)] + combo[(True, False)]
     n_moe = combo[(False, True)] + combo[(True, True)]
     n_dense = combo[(False, False)] + combo[(True, False)]
-    composition = {
+    return {
         "attn": [
             x
             for x in [
@@ -319,13 +340,63 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
                 {
                     "m": "fused_moe_v2",
                     "count": n_moe,
-                    "dims": {"NEXP": _NEXP, "TOPK": _TOPK, "MOEF": _MOEF},
+                    "dims": {"NEXP": NEXP, "TOPK": TOPK, "MOEF": MOEF},
                 },
-                {"m": "dense", "count": n_dense, "dims": {"DENSE_F": _DENSE_F}},
+                {"m": "dense", "count": n_dense, "dims": {"DENSE_F": DENSE_F}},
             ]
             if x["count"] > 0
         ],
     }
+
+
+@register_composer("Qwen3MoeForCausalLM")
+def _compose_qwen3_moe(config) -> dict:
+    """Qwen3-MoE: GQA full attention (no sliding window) + per-layer MoE/dense.
+    A layer is MoE when it is not in ``mlp_only_layers`` and (i+1) is a multiple of
+    ``decoder_sparse_step`` (HF Qwen3Moe rule); the rest are dense. Qwen3-MoE has no
+    shared experts. Falls back to all-MoE when the sparsity fields are absent
+    (e.g. Qwen3-30B-A3B)."""
+    L = _cfg(config, "num_hidden_layers")
+    NEXP = _cfg(config, "num_experts", "n_routed_experts", default=0)
+    TOPK = _cfg(config, "num_experts_per_tok", default=8)
+    MOEF = _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size"))
+    DENSE_F = _cfg(config, "intermediate_size")
+    step = _cfg(config, "decoder_sparse_step", default=1)
+    mlp_only = set(_cfg(config, "mlp_only_layers", default=[]) or [])
+    nh = _cfg(config, "num_attention_heads")
+    full = dict(
+        nh=nh,
+        nkv=_cfg(config, "num_key_value_heads", default=nh),
+        hd=_cfg(config, "head_dim", default=_cfg(config, "hidden_size") // nh),
+        vhd=_cfg(config, "head_dim", default=_cfg(config, "hidden_size") // nh),
+        window=0,
+    )
+
+    def is_moe(i):
+        return NEXP > 0 and i not in mlp_only and ((i + 1) % step == 0)
+
+    n_moe = sum(is_moe(i) for i in range(L))
+    n_dense = L - n_moe
+    return {
+        "attn": [{"m": "rpa", "count": L, "dims": {**full, "variant": "full"}}],
+        "ffn": [
+            x
+            for x in [
+                {
+                    "m": "fused_moe_v2",
+                    "count": n_moe,
+                    "dims": {"NEXP": NEXP, "TOPK": TOPK, "MOEF": MOEF},
+                },
+                {"m": "dense", "count": n_dense, "dims": {"DENSE_F": DENSE_F}},
+            ]
+            if x["count"] > 0
+        ],
+    }
+
+
+def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
+    H = _cfg(config, "hidden_size")
+    L = _cfg(config, "num_hidden_layers")
     return {
         "arch": arch,
         "H": H,
@@ -335,13 +406,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "TOPK": _cfg(config, "num_experts_per_tok", default=2),
         "MOEF": _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size")),
         "DENSE_F": _cfg(config, "intermediate_size"),
-        "full": full,
-        "swa": swa,
-        "n_full": combo[(False, True)] + combo[(False, False)],
-        "n_swa": combo[(True, True)] + combo[(True, False)],
-        "n_moe": combo[(False, True)] + combo[(True, True)],
-        "n_dense": combo[(False, False)] + combo[(True, False)],
-        "composition": composition,
+        "composition": _compose(arch, config),
         "jaxpr": _bake_jaxpr(arch, config),
         "moe_blocks": _bake_moe_block_table(config),
         "rpa_blocks": _bake_rpa_block_table(config),
