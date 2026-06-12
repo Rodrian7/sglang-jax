@@ -413,7 +413,6 @@ def _build_hybrid_attn_and_pools(mc, mesh, attention_tp, dp, page_size, runner, 
     )
 
     hf = mc.hf_config
-    full_attn_ids = list(hf.full_attention_layer_ids)
     full_attn_backend = MLAAttentionBackend(
         num_attn_heads=mc.num_attention_heads,
         kv_lora_rank=hf.kv_lora_rank,
@@ -443,7 +442,10 @@ def _build_hybrid_attn_and_pools(mc, mesh, attention_tp, dp, page_size, runner, 
         dtype=jnp.bfloat16,
         kv_lora_rank=hf.kv_lora_rank,
         qk_rope_head_dim=hf.qk_rope_head_dim,
-        layer_num=len(full_attn_ids),
+        # index by GLOBAL layer_id (the MLA layers pass their absolute id); the
+        # recurrent (KDA) layers' slots stay unused. Tracing is shapes-only so the
+        # few unused tiny buffers are free.
+        layer_num=hf.num_hidden_layers,
         mesh=mesh,
         dp_size=dp,
     )
