@@ -1067,7 +1067,10 @@ function lensKernel(s,R){
 // ---------- per-kernel tuning deep-dive (Pallas: fused-MoE-v2, RPA attention) ----------
 function blockOf(re,keys){const K=(D.codepath&&D.codepath.kernels)||[]; const k=K.find(x=>re.test(x.name||"")); const o={name:k?k.name:""};
   for(const key of keys){const m=k&&(k.name||"").match(new RegExp(key+"_(\\d+)")); o[key]=m?+m[1]:0;} return o;}
-function kbar(lab,ms,tot,col,sub){return "<div class='dfrow'><div class='nm' style='flex-basis:160px'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,ms/Math.max(tot,1e-9)*100)+"%;background:"+col+"'></div></div><div class='ms'>"+ms.toFixed(3)+" ms"+(sub?" · "+sub:"")+"</div></div>";}
+// adaptive time format: keep ms (3 dp) for >=1us, drop to us/ns below so per-layer
+// per-device decode kernels (sub-us at small batch) read as e.g. "270 ns" not "0.000 ms".
+function fms(ms){ if(!(ms>0)) return "0 ms"; if(ms>=0.001) return ms.toFixed(3)+" ms"; const ns=ms*1e6; return ns>=1000?(ns/1000).toFixed(2)+" µs":ns.toFixed(0)+" ns"; }
+function kbar(lab,ms,tot,col,sub){return "<div class='dfrow'><div class='nm' style='flex-basis:160px'>"+lab+"</div><div class='barwrap'><div class='bar' style='width:"+Math.max(1,ms/Math.max(tot,1e-9)*100)+"%;background:"+col+"'></div></div><div class='ms'>"+fms(ms)+(sub?" · "+sub:"")+"</div></div>";}
 // ---------- per-kernel tuning cards (generic: each module renders its own) ----------
 // tuneCard = generic engine-split card (HBM weight+act | compute MXU | comm ICI parts;
 // ideal=max; + OI/ridge + VMEM-fit + bound-aware lever). Modules call it from .card().
@@ -1081,9 +1084,9 @@ function tuneCard(title,blk,wB,aB,flops,iciParts,peakKind,vmem,levFn){
   const parts=[["weight HBM",wms,"#d62728"],["act HBM",ams,"#f59e0b"],["compute (MXU)",cms,"#22c55e"]];
   for(const p of iciParts) parts.push([p[0],p[1]/ICI*1e3,p[2]]);
   const tot=Math.max(...parts.map(p=>p[1]));
-  let c="<div class='panel' style='margin:8px 0;box-shadow:none'><div style='font-weight:700'>"+title+" — <span class='tag b-"+(bound==="HBM"?"HBM":bound==="compute"?"compute":"ICI")+"'>"+bound+"-bound</span> ideal "+ideal.toFixed(3)+" ms</div><div class='note mono'>block: "+blk+"</div>";
+  let c="<div class='panel' style='margin:8px 0;box-shadow:none'><div style='font-weight:700'>"+title+" — <span class='tag b-"+(bound==="HBM"?"HBM":bound==="compute"?"compute":"ICI")+"'>"+bound+"-bound</span> ideal "+fms(ideal)+"</div><div class='note mono'>block: "+blk+"</div>";
   for(const p of parts) c+=kbar(p[0],p[1],tot,p[2]);
-  c+="<div class='note' style='margin-top:4px'>HBM = weight+act = "+hms.toFixed(3)+" ms · compute "+cms.toFixed(3)+" ms · comm (ICI) "+ims.toFixed(3)+" ms → ideal = max = <b>"+ideal.toFixed(3)+" ms</b>. OI = <b>"+oi.toFixed(1)+"</b> · ridge "+ridge.toFixed(0)+" → MXU at "+Math.min(100,oi/ridge*100).toFixed(0)+"% "+peakKind+" peak.</div>";
+  c+="<div class='note' style='margin-top:4px'>HBM = weight+act = "+fms(hms)+" · compute "+fms(cms)+" · comm (ICI) "+fms(ims)+" → ideal = max = <b>"+fms(ideal)+"</b>. OI = <b>"+oi.toFixed(1)+"</b> · ridge "+ridge.toFixed(0)+" → MXU at "+Math.min(100,oi/ridge*100).toFixed(0)+"% "+peakKind+" peak.</div>";
   c+="<div class='note'>VMEM working set ≈ <b>"+(vmem/1e6).toFixed(1)+" MB</b> (kernel's own estimate) / "+(VMEM/1e6).toFixed(0)+" MB "+(vmem>VMEM?"<span class='tag b-ICI'>over budget — would spill</span>":"<span class='tag b-compute'>fits ("+((VMEM-vmem)/1e6).toFixed(0)+" MB headroom)</span>")+"</div>";
   c+="<div class='verdict "+(bound==="compute"?"v-go":"v-warn")+"'>"+levFn(bound,{wB,aB,flops,iciB,oi,ridge,hms,ims})+"</div>";
   return c+"</div>";
