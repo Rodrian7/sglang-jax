@@ -107,6 +107,7 @@ class FusedEPMoE(nnx.Module):
         disable_post_output_sync: bool = False,
         wait_gather_send_before_output_store: bool = False,
         post_output_sync_after_output_store: bool = False,
+        wait_gather_recv_active_only: bool = False,
         disable_shared_expert: bool = False,
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
@@ -118,6 +119,7 @@ class FusedEPMoE(nnx.Module):
         next_w2_prologue_priority: int = 1,
         w2_fetch_order: str = "after_w13",
         w2_fetch_priority: int = 1,
+        same_expert_w13_early_start: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -176,6 +178,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_post_output_sync = disable_post_output_sync
         self.wait_gather_send_before_output_store = wait_gather_send_before_output_store
         self.post_output_sync_after_output_store = post_output_sync_after_output_store
+        self.wait_gather_recv_active_only = wait_gather_recv_active_only
         self.disable_shared_expert = disable_shared_expert
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
@@ -191,6 +194,7 @@ class FusedEPMoE(nnx.Module):
         self.next_w2_prologue_priority = next_w2_prologue_priority
         self.w2_fetch_order = w2_fetch_order
         self.w2_fetch_priority = w2_fetch_priority
+        self.same_expert_w13_early_start = same_expert_w13_early_start
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -692,6 +696,8 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_post_output_sync=self.disable_post_output_sync,
             wait_gather_send_before_output_store=self.wait_gather_send_before_output_store,
             post_output_sync_after_output_store=self.post_output_sync_after_output_store,
+            wait_gather_recv_active_only=self.wait_gather_recv_active_only
+            or os.environ.get("MOE_WAIT_GATHER_RECV_ACTIVE_ONLY", "0") == "1",
             disable_shared_expert=self.disable_shared_expert,
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
@@ -715,6 +721,7 @@ class FusedEPMoEV2(FusedEPMoE):
             next_w2_prologue_priority=self.next_w2_prologue_priority,
             w2_fetch_order=self.w2_fetch_order,
             w2_fetch_priority=self.w2_fetch_priority,
+            same_expert_w13_early_start=self.same_expert_w13_early_start,
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",

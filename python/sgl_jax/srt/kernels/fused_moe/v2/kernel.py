@@ -265,6 +265,7 @@ def _fused_ep_moe_kernel(
     expert_starts_x2_smem,  # (2, 1, padded_num_experts)
     expert_sizes_x2_smem,  # (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,  # (expert_buffer_count,) or (2, expert_buffer_count)
+    gather_recv_seen_x2_smem,  # (2, padded_num_experts)
     # --- VMEM scratch ---
     a2a_g_acc_vmem,  # (2, top_k, acc_bt, t_packing, h_per_t)
     b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
@@ -358,12 +359,14 @@ def _fused_ep_moe_kernel(
     disable_post_output_sync: bool = False,
     wait_gather_send_before_output_store: bool = False,
     post_output_sync_after_output_store: bool = False,
+    wait_gather_recv_active_only: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
+    same_expert_w13_early_start: bool = False,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     direct_scaled_dot: bool = False,
@@ -527,41 +530,44 @@ def _fused_ep_moe_kernel(
     def sync_barrier():
         if disable_sync_barrier:
             return
-        for i in range(num_devices):
-            pltpu.semaphore_signal(
-                barrier_sem,
-                device_id=get_mesh_device_id(i),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            )
-        pltpu.semaphore_wait(barrier_sem, num_devices)
+        with jax.named_scope("sync/barrier"):
+            for i in range(num_devices):
+                pltpu.semaphore_signal(
+                    barrier_sem,
+                    device_id=get_mesh_device_id(i),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+            pltpu.semaphore_wait(barrier_sem, num_devices)
 
     # ===== Topk fetch/wait =====
     def start_fetch_topk(*, bt_id, priority=0):
         bt_sem_id = bt_bank_id(bt_id)
         bt_start = bt_id * bt
-        pltpu.make_async_copy(
-            src_ref=topk_weights_hbm.at[pl.ds(bt_start, bt)],
-            dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
-            sem=local_sems.at[bt_sem_id, 0],
-        ).start(priority=priority)
-        pltpu.make_async_copy(
-            src_ref=topk_ids_hbm.at[pl.ds(bt_start, bt)],
-            dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
-            sem=local_sems.at[bt_sem_id, 0],
-        ).start(priority=priority)
+        with jax.named_scope("topk/fetch"):
+            pltpu.make_async_copy(
+                src_ref=topk_weights_hbm.at[pl.ds(bt_start, bt)],
+                dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
+                sem=local_sems.at[bt_sem_id, 0],
+            ).start(priority=priority)
+            pltpu.make_async_copy(
+                src_ref=topk_ids_hbm.at[pl.ds(bt_start, bt)],
+                dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
+                sem=local_sems.at[bt_sem_id, 0],
+            ).start(priority=priority)
 
     def wait_fetch_topk(*, bt_id):
         bt_sem_id = bt_bank_id(bt_id)
-        pltpu.make_async_copy(
-            src_ref=b_topk_weights_x2_vmem.at[bt_sem_id],
-            dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id],
-            sem=local_sems.at[bt_sem_id, 0],
-        ).wait()
-        pltpu.make_async_copy(
-            src_ref=b_topk_ids_x2_vmem.at[bt_sem_id],
-            dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id],
-            sem=local_sems.at[bt_sem_id, 0],
-        ).wait()
+        with jax.named_scope("topk/wait"):
+            pltpu.make_async_copy(
+                src_ref=b_topk_weights_x2_vmem.at[bt_sem_id],
+                dst_ref=b_topk_weights_x2_vmem.at[bt_sem_id],
+                sem=local_sems.at[bt_sem_id, 0],
+            ).wait()
+            pltpu.make_async_copy(
+                src_ref=b_topk_ids_x2_vmem.at[bt_sem_id],
+                dst_ref=b_topk_ids_x2_vmem.at[bt_sem_id],
+                sem=local_sems.at[bt_sem_id, 0],
+            ).wait()
 
     # ===== All-reduce metadata =====
     # Copies routing + metadata into SMEM via VMEM staging (HBM→VMEM→SMEM).
@@ -1042,14 +1048,15 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(token_start, token_end, _scatter_one_batch, None, unroll=False)
 
     def start_a2a_scatter_batch(*, bt_sem_id, bt_start, a2a_bank_id):
-        init_a2a_scatter_batch(a2a_bank_id=a2a_bank_id)
-        start_a2a_scatter_batch_range(
-            bt_sem_id=bt_sem_id,
-            bt_start=bt_start,
-            a2a_bank_id=a2a_bank_id,
-            token_start=jnp.int32(0),
-            token_end=jnp.int32(bt),
-        )
+        with jax.named_scope("a2a/scatter/start"):
+            init_a2a_scatter_batch(a2a_bank_id=a2a_bank_id)
+            start_a2a_scatter_batch_range(
+                bt_sem_id=bt_sem_id,
+                bt_start=bt_start,
+                a2a_bank_id=a2a_bank_id,
+                token_start=jnp.int32(0),
+                token_end=jnp.int32(bt),
+            )
 
     # ===== A2A scatter wait =====
 
@@ -1076,7 +1083,8 @@ def _fused_ep_moe_kernel(
 
             return None
 
-        lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
+        with jax.named_scope("a2a/scatter/send_wait"):
+            lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id):
         if disable_a2a or disable_a2a_scatter or disable_a2a_scatter_recv_wait:
@@ -1094,63 +1102,66 @@ def _fused_ep_moe_kernel(
         else:
             sz = total_sz
 
-        @pl.when(sz != 0)
-        def _():
-            ref = a2a_s_ref(a2a_bank_id, e_sem_id, 0, sz)
-            pltpu.make_async_copy(
-                src_ref=ref,
-                dst_ref=ref,
-                sem=scatter_recv_sem(a2a_bank_id, e_sem_id),
-            ).wait()
+        with jax.named_scope("a2a/scatter/recv_wait"):
+
+            @pl.when(sz != 0)
+            def _():
+                ref = a2a_s_ref(a2a_bank_id, e_sem_id, 0, sz)
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=scatter_recv_sem(a2a_bank_id, e_sem_id),
+                ).wait()
 
     # ===== A2A gather (static for loop, prefix sum, dst position 0) =====
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id, gather_bank_id):
         if disable_a2a or disable_a2a_gather:
             return
-        my_e_id = my_id * local_num_experts + local_e_id
-        start = 0
-        for recv_id in range(num_devices):
-            sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
-            is_local = recv_id == my_id
-            local_sz = lax.select(is_local, sz, 0)
-            remote_sz = lax.select(is_local, 0, sz)
+        with jax.named_scope("a2a/gather/start"):
+            my_e_id = my_id * local_num_experts + local_e_id
+            start = 0
+            for recv_id in range(num_devices):
+                sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
+                is_local = recv_id == my_id
+                local_sz = lax.select(is_local, sz, 0)
+                remote_sz = lax.select(is_local, 0, sz)
 
-            if not disable_a2a_gather_local_copy:
+                if not disable_a2a_gather_local_copy:
 
-                @pl.when(local_sz != 0)
-                def _local_copy(
-                    start=start,
-                    local_sz=local_sz,
-                    my_e_id=my_e_id,
-                    e_sem_id=e_sem_id,
-                ):
-                    pltpu.make_async_copy(
-                        src_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, local_sz),
-                        dst_ref=a2a_g_ref(gather_bank_id, my_e_id, 0, local_sz),
-                        sem=a2a_gather_sem_ref(gather_bank_id),
-                    ).start()
+                    @pl.when(local_sz != 0)
+                    def _local_copy(
+                        start=start,
+                        local_sz=local_sz,
+                        my_e_id=my_e_id,
+                        e_sem_id=e_sem_id,
+                    ):
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, local_sz),
+                            dst_ref=a2a_g_ref(gather_bank_id, my_e_id, 0, local_sz),
+                            sem=a2a_gather_sem_ref(gather_bank_id),
+                        ).start()
 
-            if not disable_a2a_gather_remote_copy:
+                if not disable_a2a_gather_remote_copy:
 
-                @pl.when(remote_sz != 0)
-                def _remote_copy(
-                    start=start,
-                    remote_sz=remote_sz,
-                    my_e_id=my_e_id,
-                    e_sem_id=e_sem_id,
-                    recv_id=recv_id,
-                ):
-                    pltpu.make_async_remote_copy(
-                        src_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, remote_sz),
-                        dst_ref=a2a_g_ref(gather_bank_id, my_e_id, 0, remote_sz),
-                        send_sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
-                        recv_sem=a2a_gather_sem_ref(gather_bank_id),
-                        device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+                    @pl.when(remote_sz != 0)
+                    def _remote_copy(
+                        start=start,
+                        remote_sz=remote_sz,
+                        my_e_id=my_e_id,
+                        e_sem_id=e_sem_id,
+                        recv_id=recv_id,
+                    ):
+                        pltpu.make_async_remote_copy(
+                            src_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, remote_sz),
+                            dst_ref=a2a_g_ref(gather_bank_id, my_e_id, 0, remote_sz),
+                            send_sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
+                            recv_sem=a2a_gather_sem_ref(gather_bank_id),
+                            device_id=get_mesh_device_id(recv_id),
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
 
-            start += sz
+                start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id, a2a_bank_id, gather_bank_id):
         if disable_a2a or disable_a2a_gather or disable_a2a_gather_remote_copy or num_devices <= 1:
@@ -1162,14 +1173,16 @@ def _fused_ep_moe_kernel(
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
 
-        @pl.when(remote_sz != 0)
-        def _():
-            ref = a2a_s_acc_ref(a2a_bank_id, e_sem_id, 0, remote_sz)
-            pltpu.make_async_copy(
-                src_ref=ref,
-                dst_ref=ref,
-                sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
-            ).wait()
+        with jax.named_scope("a2a/gather/send_wait"):
+
+            @pl.when(remote_sz != 0)
+            def _():
+                ref = a2a_s_acc_ref(a2a_bank_id, e_sem_id, 0, remote_sz)
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
+                ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_sem_id, gather_bank_id):
         if disable_a2a or disable_a2a_gather:
@@ -1194,133 +1207,167 @@ def _fused_ep_moe_kernel(
                     sem=a2a_gather_sem_ref(gather_bank_id),
                 ).wait()
 
-        def _wait_one_expert(e_id, _):
-            _wait_one_gather_recv(e_id)
+        def _wait_one_active_route(route_id, _):
+            t_id = route_id // top_k
+            k_id = route_id - t_id * top_k
+            e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+            is_valid = e_id >= 0
+            e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+            seen = gather_recv_seen_x2_smem[bt_sem_id, e_id_safe]
+            should_wait = jnp.logical_and(is_valid, seen == 0)
+
+            @pl.when(should_wait)
+            def _():
+                gather_recv_seen_x2_smem[bt_sem_id, e_id_safe] = jnp.int32(1)
+                _wait_one_gather_recv(e_id_safe)
+
             return None
 
-        lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
+        with jax.named_scope("a2a/gather/recv_wait"):
+
+            if wait_gather_recv_active_only:
+
+                def _clear_seen(i, _):
+                    gather_recv_seen_x2_smem[bt_sem_id, i] = jnp.int32(0)
+                    return None
+
+                lax.fori_loop(0, num_experts, _clear_seen, None, unroll=False)
+                lax.fori_loop(0, bt * top_k, _wait_one_active_route, None, unroll=False)
+            else:
+
+                def _wait_one_expert(e_id, _):
+                    _wait_one_gather_recv(e_id)
+                    return None
+
+                lax.fori_loop(0, num_experts, _wait_one_expert, None, unroll=False)
 
     # ===== Weight DMA (per-t_packing loop, matching v1 pattern) =====
 
     def start_fetch_w1(local_e_id, slot, bf_id, priority=1):
         if disable_weight_load or disable_w1_load:
             return
-        for p in range(t_packing):
-            pltpu.make_async_copy(
-                src_ref=w1_hbm.at[
-                    local_e_id,
-                    pl.ds(p * h_per_t, h_per_t),
-                    pl.ds(bf_id * bf, bf),
-                ],
-                dst_ref=b_w1_x2_vmem.at[slot, p],
-                sem=local_sems.at[slot, 4],
-            ).start(priority=priority)
-            if w1_scale_load_enabled:
+        with jax.named_scope("expert/weights/w1/start"):
+            for p in range(t_packing):
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_hbm.at[
+                    src_ref=w1_hbm.at[
                         local_e_id,
-                        pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
-                        pl.ds(0, 1),
+                        pl.ds(p * h_per_t, h_per_t),
                         pl.ds(bf_id * bf, bf),
                     ],
-                    dst_ref=b_w1_scale_x2_vmem.at[slot, p],
+                    dst_ref=b_w1_x2_vmem.at[slot, p],
                     sem=local_sems.at[slot, 4],
                 ).start(priority=priority)
+                if w1_scale_load_enabled:
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                            pl.ds(0, 1),
+                            pl.ds(bf_id * bf, bf),
+                        ],
+                        dst_ref=b_w1_scale_x2_vmem.at[slot, p],
+                        sem=local_sems.at[slot, 4],
+                    ).start(priority=priority)
 
     def wait_fetch_w1(slot):
         if disable_weight_load or disable_w1_load:
             return
-        pltpu.make_async_copy(
-            src_ref=b_w1_x2_vmem.at[slot],
-            dst_ref=b_w1_x2_vmem.at[slot],
-            sem=local_sems.at[slot, 4],
-        ).wait()
-        if w1_scale_load_enabled:
+        with jax.named_scope("expert/weights/w1/wait"):
             pltpu.make_async_copy(
-                src_ref=b_w1_scale_x2_vmem.at[slot],
-                dst_ref=b_w1_scale_x2_vmem.at[slot],
+                src_ref=b_w1_x2_vmem.at[slot],
+                dst_ref=b_w1_x2_vmem.at[slot],
                 sem=local_sems.at[slot, 4],
             ).wait()
+            if w1_scale_load_enabled:
+                pltpu.make_async_copy(
+                    src_ref=b_w1_scale_x2_vmem.at[slot],
+                    dst_ref=b_w1_scale_x2_vmem.at[slot],
+                    sem=local_sems.at[slot, 4],
+                ).wait()
 
     def start_fetch_w3(local_e_id, slot, bf_id, priority=1):
         if disable_weight_load or disable_w3_load:
             return
-        for p in range(t_packing):
-            pltpu.make_async_copy(
-                src_ref=w3_hbm.at[
-                    local_e_id,
-                    pl.ds(p * h_per_t, h_per_t),
-                    pl.ds(bf_id * bf, bf),
-                ],
-                dst_ref=b_w3_x2_vmem.at[slot, p],
-                sem=local_sems.at[slot, 5],
-            ).start(priority=priority)
-            if w3_scale_load_enabled:
+        with jax.named_scope("expert/weights/w3/start"):
+            for p in range(t_packing):
                 pltpu.make_async_copy(
-                    src_ref=w3_scale_hbm.at[
+                    src_ref=w3_hbm.at[
                         local_e_id,
-                        pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
-                        pl.ds(0, 1),
+                        pl.ds(p * h_per_t, h_per_t),
                         pl.ds(bf_id * bf, bf),
                     ],
-                    dst_ref=b_w3_scale_x2_vmem.at[slot, p],
+                    dst_ref=b_w3_x2_vmem.at[slot, p],
                     sem=local_sems.at[slot, 5],
                 ).start(priority=priority)
+                if w3_scale_load_enabled:
+                    pltpu.make_async_copy(
+                        src_ref=w3_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(p * h_per_t // quant_block_k, h_per_t // quant_block_k),
+                            pl.ds(0, 1),
+                            pl.ds(bf_id * bf, bf),
+                        ],
+                        dst_ref=b_w3_scale_x2_vmem.at[slot, p],
+                        sem=local_sems.at[slot, 5],
+                    ).start(priority=priority)
 
     def wait_fetch_w3(slot):
         if disable_weight_load or disable_w3_load:
             return
-        pltpu.make_async_copy(
-            src_ref=b_w3_x2_vmem.at[slot],
-            dst_ref=b_w3_x2_vmem.at[slot],
-            sem=local_sems.at[slot, 5],
-        ).wait()
-        if w3_scale_load_enabled:
+        with jax.named_scope("expert/weights/w3/wait"):
             pltpu.make_async_copy(
-                src_ref=b_w3_scale_x2_vmem.at[slot],
-                dst_ref=b_w3_scale_x2_vmem.at[slot],
+                src_ref=b_w3_x2_vmem.at[slot],
+                dst_ref=b_w3_x2_vmem.at[slot],
                 sem=local_sems.at[slot, 5],
             ).wait()
+            if w3_scale_load_enabled:
+                pltpu.make_async_copy(
+                    src_ref=b_w3_scale_x2_vmem.at[slot],
+                    dst_ref=b_w3_scale_x2_vmem.at[slot],
+                    sem=local_sems.at[slot, 5],
+                ).wait()
 
     def start_fetch_w2(local_e_id, slot, bf_id, priority=0):
         if disable_weight_load or disable_w2_load:
             return
-        for p in range(t_packing):
-            pltpu.make_async_copy(
-                src_ref=w2_hbm.at[
-                    local_e_id,
-                    pl.ds(bf_id * bf, bf),
-                    pl.ds(p * h_per_t, h_per_t),
-                ],
-                dst_ref=b_w2_x2_vmem.at[slot, p],
-                sem=local_sems.at[slot, 6],
-            ).start(priority=priority)
-            if w2_scale_load_enabled:
+        with jax.named_scope("expert/weights/w2/start"):
+            for p in range(t_packing):
                 pltpu.make_async_copy(
-                    src_ref=w2_scale_hbm.at[
+                    src_ref=w2_hbm.at[
                         local_e_id,
-                        pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
-                        pl.ds(0, 1),
+                        pl.ds(bf_id * bf, bf),
                         pl.ds(p * h_per_t, h_per_t),
                     ],
-                    dst_ref=b_w2_scale_x2_vmem.at[slot, p],
+                    dst_ref=b_w2_x2_vmem.at[slot, p],
                     sem=local_sems.at[slot, 6],
                 ).start(priority=priority)
+                if w2_scale_load_enabled:
+                    pltpu.make_async_copy(
+                        src_ref=w2_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
+                            pl.ds(0, 1),
+                            pl.ds(p * h_per_t, h_per_t),
+                        ],
+                        dst_ref=b_w2_scale_x2_vmem.at[slot, p],
+                        sem=local_sems.at[slot, 6],
+                    ).start(priority=priority)
 
     def wait_fetch_w2(slot):
         if disable_weight_load or disable_w2_load:
             return
-        pltpu.make_async_copy(
-            src_ref=b_w2_x2_vmem.at[slot],
-            dst_ref=b_w2_x2_vmem.at[slot],
-            sem=local_sems.at[slot, 6],
-        ).wait()
-        if w2_scale_load_enabled:
+        with jax.named_scope("expert/weights/w2/wait"):
             pltpu.make_async_copy(
-                src_ref=b_w2_scale_x2_vmem.at[slot],
-                dst_ref=b_w2_scale_x2_vmem.at[slot],
+                src_ref=b_w2_x2_vmem.at[slot],
+                dst_ref=b_w2_x2_vmem.at[slot],
                 sem=local_sems.at[slot, 6],
             ).wait()
+            if w2_scale_load_enabled:
+                pltpu.make_async_copy(
+                    src_ref=b_w2_scale_x2_vmem.at[slot],
+                    dst_ref=b_w2_scale_x2_vmem.at[slot],
+                    sem=local_sems.at[slot, 6],
+                ).wait()
 
     def get_prefetch_expert_bf0_target(bt_sem_id, local_e_id, *, enabled=True):
         if not can_cross_expert_prefetch:
@@ -1570,17 +1617,18 @@ def _fused_ep_moe_kernel(
                 tile_start = bts_id * bts
 
                 if not disable_expert_x_load:
-                    # Load tokens for this bts tile once; weights reuse it across bf tiles.
-                    pltpu.make_async_copy(
-                        src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
-                        dst_ref=b_x_vmem,
-                        sem=x_stage_sem.at[0],
-                    ).start(priority=1)
-                    pltpu.make_async_copy(
-                        src_ref=b_x_vmem,
-                        dst_ref=b_x_vmem,
-                        sem=x_stage_sem.at[0],
-                    ).wait()
+                    with jax.named_scope("expert/input/load"):
+                        # Load tokens for this bts tile once; weights reuse it across bf tiles.
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
+                            dst_ref=b_x_vmem,
+                            sem=x_stage_sem.at[0],
+                        ).start(priority=1)
+                        pltpu.make_async_copy(
+                            src_ref=b_x_vmem,
+                            dst_ref=b_x_vmem,
+                            sem=x_stage_sem.at[0],
+                        ).wait()
 
                 if can_cross_expert_prefetch:
                     use_prefetched_bf0 = jnp.logical_and(bf0_prefetched, bts_id == jnp.int32(0))
@@ -1644,7 +1692,8 @@ def _fused_ep_moe_kernel(
                             b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
                             return None
 
-                        lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
+                        with jax.named_scope("expert/ffn1/gate"):
+                            lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
 
                         wait_fetch_w3(slot)
 
@@ -1678,7 +1727,8 @@ def _fused_ep_moe_kernel(
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
 
-                        lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
+                        with jax.named_scope("expert/ffn1/up"):
+                            lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
 
                     elif direct_scaled_dot_ffn1 and w1_scale_hbm is not None:
                         wait_fetch_w1(slot)
@@ -1755,7 +1805,8 @@ def _fused_ep_moe_kernel(
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
 
-                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
+                        with jax.named_scope("expert/ffn1/gate_up"):
+                            lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
 
                     elif ffn1_use_chunked_dequant:
                         wait_fetch_w1(slot)
@@ -1796,12 +1847,13 @@ def _fused_ep_moe_kernel(
                                     ][...] = gate
                                     return None
 
-                                lax.fori_loop(
-                                    0,
-                                    num_btc_per_bts,
-                                    gate_chunk_btc,
-                                    None,
-                                )
+                                with jax.named_scope("expert/ffn1/gate"):
+                                    lax.fori_loop(
+                                        0,
+                                        num_btc_per_bts,
+                                        gate_chunk_btc,
+                                        None,
+                                    )
 
                             dequant_w3_chunk(slot, bf_off)
                             if ffn1_stream_chunked_down and fchunk_id == 0:
@@ -1910,12 +1962,13 @@ def _fused_ep_moe_kernel(
                                     ][...] = up
                                 return None
 
-                            lax.fori_loop(
-                                0,
-                                num_btc_per_bts,
-                                gate_up_chunk_btc,
-                                None,
-                            )
+                            with jax.named_scope("expert/ffn1/gate_up"):
+                                lax.fori_loop(
+                                    0,
+                                    num_btc_per_bts,
+                                    gate_up_chunk_btc,
+                                    None,
+                                )
 
                     else:
                         wait_fetch_w1(slot)
@@ -1952,7 +2005,8 @@ def _fused_ep_moe_kernel(
                             b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
                             return None
 
-                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
+                        with jax.named_scope("expert/ffn1/gate_up"):
+                            lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
 
                     if can_split_w13_w2_prefetch:
                         if bf_id == num_bf - 2:
@@ -1967,6 +2021,13 @@ def _fused_ep_moe_kernel(
                             next_bf0_prefetched = jnp.logical_or(
                                 next_bf0_prefetched, next_has_prefetch
                             )
+
+                    if (
+                        same_expert_w13_early_start
+                        and not ffn1_stream_chunked_down
+                        and next_bf_id < num_bf
+                    ):
+                        start_fetch_w13_w2(local_e_id, slot, next_bf_id, include_w2=False)
 
                     # In w13 mode, next-expert W2 is intentionally not
                     # cross-prefetched here: its own prologue can start W2
@@ -2048,12 +2109,20 @@ def _fused_ep_moe_kernel(
                         return None
 
                     if not ffn1_stream_chunked_down:
-                        lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
+                        with jax.named_scope("expert/ffn2/down"):
+                            lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
 
-                    # Same-expert bf+2 keeps the original full-slot rolling point:
-                    # W1/W3/W2 are fetched together after down frees the slot.
+                    # W2 still waits until down has consumed the current slot.
                     if next_bf_id < num_bf:
-                        start_fetch_w13_w2(local_e_id, slot, next_bf_id)
+                        if ffn1_stream_chunked_down or not same_expert_w13_early_start:
+                            start_fetch_w13_w2(local_e_id, slot, next_bf_id)
+                        else:
+                            start_fetch_w2(
+                                local_e_id,
+                                slot,
+                                next_bf_id,
+                                priority=w2_fetch_priority,
+                            )
                     if can_full_cross_expert_prefetch and bf_id == num_bf - 2:
                         next_has_prefetch = start_prefetch_expert_bf0(
                             bt_sem_id,
@@ -2078,15 +2147,17 @@ def _fused_ep_moe_kernel(
                                 ][...] = acc_slice.astype(t_dtype)
                             return None
 
-                        lax.fori_loop(0, num_btc_per_bts, writeback_btc, None)
+                        with jax.named_scope("expert/store/cast"):
+                            lax.fori_loop(0, num_btc_per_bts, writeback_btc, None)
 
                     if not disable_expert_store_dma:
-                        pltpu.make_async_copy(
-                            src_ref=b_y_stage_vmem,
-                            dst_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, tile_start, bts),
-                            sem=y_store_sem.at[0],
-                        ).start()
-                        wait_expert_store_slot(jnp.int32(0))
+                        with jax.named_scope("expert/store/dma_wait"):
+                            pltpu.make_async_copy(
+                                src_ref=b_y_stage_vmem,
+                                dst_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, tile_start, bts),
+                                sem=y_store_sem.at[0],
+                            ).start()
+                            wait_expert_store_slot(jnp.int32(0))
 
                 return next_bf0_prefetched
 
@@ -2138,7 +2209,8 @@ def _fused_ep_moe_kernel(
 
                 return None
 
-            lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
+            with jax.named_scope("output/acc/load"):
+                lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
 
         def wait_load_acc_bt(*, buf_id, tile_start):
             if disable_acc_and_store or disable_acc_load:
@@ -2157,35 +2229,37 @@ def _fused_ep_moe_kernel(
                     pltpu.make_async_copy(src_ref=ref, dst_ref=ref, sem=a2a_acc_sems.at[0]).wait()
                     return None
 
-                lax.fori_loop(0, num_valid * jnp.int32(top_k), _wait_one, None, unroll=False)
+                with jax.named_scope("output/acc/wait"):
+                    lax.fori_loop(0, num_valid * jnp.int32(top_k), _wait_one, None, unroll=False)
 
         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
-            output_tile = jnp.zeros((acc_bt, t_packing, h_per_t), dtype=jnp.float32)
-            if not disable_acc_and_store and not disable_acc_compute:
-                logits_tile = b_topk_weights_x2_vmem[
-                    bt_sem_id, pl.ds(tile_start, acc_bt), pl.ds(0, top_k)
-                ]
-                for k_id in range(top_k):
-                    acc_tile = a2a_g_acc_vmem[buf_id, k_id, :acc_bt].astype(jnp.float32)
-                    logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
-                    output_tile += acc_tile * logits
+            with jax.named_scope("output/acc/compute_store"):
+                output_tile = jnp.zeros((acc_bt, t_packing, h_per_t), dtype=jnp.float32)
+                if not disable_acc_and_store and not disable_acc_compute:
+                    logits_tile = b_topk_weights_x2_vmem[
+                        bt_sem_id, pl.ds(tile_start, acc_bt), pl.ds(0, top_k)
+                    ]
+                    for k_id in range(top_k):
+                        acc_tile = a2a_g_acc_vmem[buf_id, k_id, :acc_bt].astype(jnp.float32)
+                        logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
+                        output_tile += acc_tile * logits
 
-            out_offset = pl.multiple_of(out_offset, 16)
+                out_offset = pl.multiple_of(out_offset, 16)
 
-            if w1_shared_hbm is not None and not disable_shared_expert:
-                se_tile = b_se_acc_vmem[
-                    out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
-                ]
-                output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
-
-            if not disable_acc_and_store and not disable_acc_store_vmem:
-                if direct_output_store:
-                    target = output_hbm.at[pl.ds(bt_start + out_offset, acc_bt)]
-                else:
-                    target = b_output_x2_vmem.at[
+                if w1_shared_hbm is not None and not disable_shared_expert:
+                    se_tile = b_se_acc_vmem[
                         out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
                     ]
-                target[...] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
+                    output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
+
+                if not disable_acc_and_store and not disable_acc_store_vmem:
+                    if direct_output_store:
+                        target = output_hbm.at[pl.ds(bt_start + out_offset, acc_bt)]
+                    else:
+                        target = b_output_x2_vmem.at[
+                            out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
+                        ]
+                    target[...] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
 
         start_load_acc_bt(tile_start=0, buf_id=0)
 
@@ -2212,11 +2286,12 @@ def _fused_ep_moe_kernel(
             return
         bt_sem_id = bt_bank_id(bt_id)
         bt_start = bt_id * bt
-        pltpu.make_async_copy(
-            src_ref=b_output_x2_vmem.at[bt_sem_id],
-            dst_ref=output_hbm.at[pl.ds(bt_start, bt)],
-            sem=local_sems.at[bt_sem_id, 7],
-        ).start(priority=priority)
+        with jax.named_scope("output/send"):
+            pltpu.make_async_copy(
+                src_ref=b_output_x2_vmem.at[bt_sem_id],
+                dst_ref=output_hbm.at[pl.ds(bt_start, bt)],
+                sem=local_sems.at[bt_sem_id, 7],
+            ).start(priority=priority)
 
     def wait_store_output(*, bt_id):
         if disable_acc_and_store or disable_output_store or direct_output_store:
@@ -2319,11 +2394,12 @@ def _fused_ep_moe_kernel(
         def prepare_bt_metadata(_bt_id, _bt_sem_id):
             wait_fetch_topk(bt_id=_bt_id)
             _t2e_routing = b_topk_ids_x2_vmem[_bt_sem_id]
-            all_reduce_metadata(
-                bt_id=_bt_id,
-                bt_sem_id=_bt_sem_id,
-                t2e_routing=_t2e_routing,
-            )
+            with jax.named_scope("metadata/direct"):
+                all_reduce_metadata(
+                    bt_id=_bt_id,
+                    bt_sem_id=_bt_sem_id,
+                    t2e_routing=_t2e_routing,
+                )
 
         if can_bt_scatter_overlap:
 
@@ -2452,7 +2528,8 @@ def _fused_ep_moe_kernel(
                 and not post_output_sync_after_output_store
                 and not direct_output_store
             ):
-                sync_barrier()
+                with jax.named_scope("output/post_sync"):
+                    sync_barrier()
 
             def wait_gather_send_all():
                 for tail_e_id in range(local_num_experts):
@@ -2474,7 +2551,8 @@ def _fused_ep_moe_kernel(
                 and post_output_sync_after_output_store
                 and not direct_output_store
             ):
-                sync_barrier()
+                with jax.named_scope("output/post_sync"):
+                    sync_barrier()
 
             if not wait_gather_send_before_output_store:
                 wait_gather_send_all()
@@ -2491,7 +2569,8 @@ def _fused_ep_moe_kernel(
 
     # ===== Kernel start =====
     if not disable_kernel_start_sync:
-        sync_barrier()
+        with jax.named_scope("kernel/start_sync"):
+            sync_barrier()
 
     if use_gather_bank:
 
@@ -2525,7 +2604,8 @@ def _fused_ep_moe_kernel(
                 and not post_output_sync_after_output_store
                 and not direct_output_store
             ):
-                sync_barrier()
+                with jax.named_scope("output/post_sync"):
+                    sync_barrier()
 
             def wait_gather_send_tail():
                 tail_start = max(local_num_experts - expert_buffer_count, 0)
@@ -2548,7 +2628,8 @@ def _fused_ep_moe_kernel(
                 and post_output_sync_after_output_store
                 and not direct_output_store
             ):
-                sync_barrier()
+                with jax.named_scope("output/post_sync"):
+                    sync_barrier()
 
             if not wait_gather_send_before_output_store:
                 wait_gather_send_tail()
@@ -2675,6 +2756,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_post_output_sync",
         "wait_gather_send_before_output_store",
         "post_output_sync_after_output_store",
+        "wait_gather_recv_active_only",
         "metadata_mode",
         "enable_bt_scatter_overlap",
         "block_config",
@@ -2692,6 +2774,7 @@ def jax_allreduce_metadata_by_bt(
         "next_w2_prologue_priority",
         "w2_fetch_order",
         "w2_fetch_priority",
+        "same_expert_w13_early_start",
         "skip_inter_bt_sync",
         "interleave_bt",
         "metadata_window_prefetch_first_expert",
@@ -2751,6 +2834,7 @@ def fused_ep_moe_v2(
     disable_post_output_sync: bool = False,
     wait_gather_send_before_output_store: bool = False,
     post_output_sync_after_output_store: bool = False,
+    wait_gather_recv_active_only: bool = False,
     metadata_mode: str = "recursive",
     enable_bt_scatter_overlap: bool = True,
     w1_shared: jax.Array | None = None,
@@ -2772,6 +2856,7 @@ def fused_ep_moe_v2(
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
+    same_expert_w13_early_start: bool = False,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     metadata_window_prefetch_first_expert: bool = False,
@@ -2948,6 +3033,8 @@ def fused_ep_moe_v2(
     if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
         scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
+    if same_expert_w13_early_start:
+        scope_name += "-same_expert_w13_early"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
     if route_smem_topk_only:
@@ -2992,6 +3079,8 @@ def fused_ep_moe_v2(
         scope_name += "-wait_gather_send_before_output_store"
     if post_output_sync_after_output_store:
         scope_name += "-post_output_sync_after_output_store"
+    if wait_gather_recv_active_only:
+        scope_name += "-wait_gather_recv_active_only"
     if disable_metadata_pre_sync:
         scope_name += "-no_metadata_pre_sync"
     if disable_metadata_post_sync:
@@ -3017,6 +3106,7 @@ def fused_ep_moe_v2(
             if use_bt_banking
             else pltpu.SMEM((expert_buffer_count,), jnp.int32)
         ),  # a2a_s_sends
+        pltpu.SMEM((smem_banks, padded_num_experts), jnp.int32),  # gather_recv_seen
         # VMEM: gather accumulation
         pltpu.VMEM((2, top_k, acc_bt, t_packing, h_per_t), t_dtype),  # a2a_g_acc
         # VMEM: topk
@@ -3168,12 +3258,14 @@ def fused_ep_moe_v2(
                 disable_post_output_sync=disable_post_output_sync,
                 wait_gather_send_before_output_store=wait_gather_send_before_output_store,
                 post_output_sync_after_output_store=post_output_sync_after_output_store,
+                wait_gather_recv_active_only=wait_gather_recv_active_only,
                 metadata_mode=metadata_mode,
                 enable_bt_scatter_overlap=use_bt_scatter_bank,
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
                 next_w2_prologue_priority=next_w2_prologue_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
+                same_expert_w13_early_start=same_expert_w13_early_start,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 direct_scaled_dot=direct_scaled_dot,

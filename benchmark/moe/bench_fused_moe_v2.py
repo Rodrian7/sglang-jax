@@ -90,6 +90,12 @@ from sgl_jax.srt.layers.moe import TopK
 # does NOT apply to the v2 kernel; v2 candidates are filtered against 64 MB.
 DEFAULT_TPU_VMEM_BUDGET_MB = 64
 TRACE_TASK = "fused-moe-v2-k_.*"
+XPROF_COUNTER_INDICES = (
+    "indices:1 indices:3 indices:4 indices:10 indices:11 "
+    "indices:31 indices:32 indices:33 indices:34 indices:35 "
+    "indices:37 indices:38 indices:56 indices:57 indices:58 "
+    "indices:73 indices:74 indices:75 indices:105"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +556,10 @@ def run_all(
     dtype: jnp.dtype = jnp.bfloat16,
     warmup_iters: int = 1,
     trace_root: str = "/tmp/sglang_jax_moe_trace",
+    xprof_periodic_counter_sampling: bool = False,
+    xprof_counter_interval_us: int = 1,
+    xprof_counter_indices: str = XPROF_COUNTER_INDICES,
+    xprof_num_tensor_cores_to_trace: int = 1,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
@@ -615,15 +625,29 @@ def run_all(
     disable_post_output_sync: bool = False,
     wait_gather_send_before_output_store: bool = False,
     post_output_sync_after_output_store: bool = False,
+    wait_gather_recv_active_only: bool = False,
     disable_all_reduce_metadata: bool = False,
     cross_expert_prefetch_mode: str = "full",
     next_w2_prologue_priority: int = 1,
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
+    same_expert_w13_early_start: bool = False,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     use_shared_expert = False  # lean decode tuner: omitted
     use_grouped_topk = False  # lean decode tuner: omitted
+
+    profiler_options = None
+    if xprof_periodic_counter_sampling:
+        profiler_options = jax.profiler.ProfileOptions()
+        profiler_options.advanced_configuration = {
+            "tpu_enable_periodic_counter_sampling": True,
+            "tpu_tc_perf_counter_sampling_options": (
+                f"interval_us:{xprof_counter_interval_us} scaling:0 counter_size_bits:1 "
+                f"{xprof_counter_indices}"
+            ),
+            "num_tensor_cores_to_trace_per_device": xprof_num_tensor_cores_to_trace,
+        }
 
     token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
     raw_cases = make_moe_cases(
@@ -729,6 +753,7 @@ def run_all(
             "disable_post_output_sync": disable_post_output_sync,
             "wait_gather_send_before_output_store": wait_gather_send_before_output_store,
             "post_output_sync_after_output_store": post_output_sync_after_output_store,
+            "wait_gather_recv_active_only": wait_gather_recv_active_only,
             "disable_all_reduce_metadata": disable_all_reduce_metadata,
         }.items()
         if enabled
@@ -865,6 +890,7 @@ def run_all(
                 disable_post_output_sync=disable_post_output_sync,
                 wait_gather_send_before_output_store=wait_gather_send_before_output_store,
                 post_output_sync_after_output_store=post_output_sync_after_output_store,
+                wait_gather_recv_active_only=wait_gather_recv_active_only,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 use_grouped_topk=use_grouped_topk,
                 num_groups=1,
@@ -877,6 +903,7 @@ def run_all(
                 next_w2_prologue_priority=next_w2_prologue_priority,
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
+                same_expert_w13_early_start=same_expert_w13_early_start,
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
@@ -1097,6 +1124,7 @@ def run_all(
                         tries=iters,
                         warmup=warmup_iters,
                         trace_root=trace_root,
+                        profiler_options=profiler_options,
                     )
                 except ValueError as e:
                     print(f"SKIP fused_moe_v2 blocks [{i + 1}/{len(v2_block_cfgs)}], reason: {e}")
@@ -1248,6 +1276,29 @@ def parse_args() -> argparse.Namespace:
         help="Where jax.profiler.trace writes (point at the artifact dir to persist traces).",
     )
     parser.add_argument(
+        "--xprof-periodic-counter-sampling",
+        action="store_true",
+        help="Enable TPU periodic counter sampling in the JAX profiler trace.",
+    )
+    parser.add_argument(
+        "--xprof-counter-interval-us",
+        type=int,
+        default=1,
+        help="Periodic counter sampling interval in microseconds.",
+    )
+    parser.add_argument(
+        "--xprof-counter-indices",
+        type=str,
+        default=XPROF_COUNTER_INDICES,
+        help="Space-separated TPU TC counter indices for XProf periodic counter sampling.",
+    )
+    parser.add_argument(
+        "--xprof-num-tensor-cores-to-trace",
+        type=int,
+        default=1,
+        help="Number of tensor cores to trace per device for XProf periodic counter sampling.",
+    )
+    parser.add_argument(
         "--warmup-iters",
         type=int,
         default=5,
@@ -1389,6 +1440,11 @@ def parse_args() -> argparse.Namespace:
         help="Move the post-output sync_barrier after start_send_bo instead of before it.",
     )
     parser.add_argument(
+        "--wait-gather-recv-active-only",
+        action="store_true",
+        help="Wait gather recv only for first-seen routed experts instead of scanning all experts.",
+    )
+    parser.add_argument(
         "--disable-metadata-pre-sync",
         action="store_true",
         help="Skip only the direct-metadata sync_barrier before metadata remote copies.",
@@ -1449,6 +1505,11 @@ def parse_args() -> argparse.Namespace:
         help="Current-expert W2 DMA issue priority.",
     )
     parser.add_argument(
+        "--same-expert-w13-early-start",
+        action="store_true",
+        help="Start same-expert next-bf W1/W3 before current W2 wait/down; W2 stays after down.",
+    )
+    parser.add_argument(
         "--tpu-vmem-budget-mb",
         type=int,
         default=DEFAULT_TPU_VMEM_BUDGET_MB,
@@ -1498,6 +1559,10 @@ if __name__ == "__main__":
             weight_dtype=weight_dtype,
             warmup_iters=args.warmup_iters,
             trace_root=args.trace_root,
+            xprof_periodic_counter_sampling=args.xprof_periodic_counter_sampling,
+            xprof_counter_interval_us=args.xprof_counter_interval_us,
+            xprof_counter_indices=args.xprof_counter_indices,
+            xprof_num_tensor_cores_to_trace=args.xprof_num_tensor_cores_to_trace,
             tune_block_config=args.tune_block_config,
             bt_candidates=args.bt_candidates,
             bts_candidates=args.bts_candidates,
@@ -1575,11 +1640,13 @@ if __name__ == "__main__":
             disable_post_output_sync=disable_all or args.disable_post_output_sync,
             wait_gather_send_before_output_store=args.wait_gather_send_before_output_store,
             post_output_sync_after_output_store=args.post_output_sync_after_output_store,
+            wait_gather_recv_active_only=args.wait_gather_recv_active_only,
             disable_all_reduce_metadata=disable_all or args.disable_all_reduce_metadata,
             cross_expert_prefetch_mode=args.cross_expert_prefetch_mode,
             next_w2_prologue_priority=args.next_w2_prologue_priority,
             w2_fetch_order=args.w2_fetch_order,
             w2_fetch_priority=args.w2_fetch_priority,
+            same_expert_w13_early_start=args.same_expert_w13_early_start,
             return_results=True,
         )
     except BaseException as e:

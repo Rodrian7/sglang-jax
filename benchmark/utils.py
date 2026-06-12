@@ -140,6 +140,7 @@ def multiple_iteration_timeit_from_trace(
     tries: int = 5,
     warmup: int = 0,
     trace_root: str = "/tmp/sglang_jax_moe_trace",
+    profiler_options=None,
 ) -> list[float]:
     """
     Profile multiple iterations and pull per-iteration kernel time from trace.
@@ -155,7 +156,10 @@ def multiple_iteration_timeit_from_trace(
         jax.block_until_ready(out)
     print(f"warmed up in {(time.perf_counter() - start) * 1000} ms")
 
-    with jax.profiler.trace(trace_dir):
+    trace_kwargs = {}
+    if profiler_options is not None:
+        trace_kwargs["profiler_options"] = profiler_options
+    with jax.profiler.trace(trace_dir, **trace_kwargs):
         for i in range(tries):
             data_args = data_generator()
             with jax.profiler.StepTraceAnnotation(task, step_num=i):
