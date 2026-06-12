@@ -1002,7 +1002,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
                 phy_to_log = physical_to_logical_map[layer_idx]
 
-            if moe_backend == "fused":
+            if moe_backend in ("fused", "fused_v2"):
                 expert_target_map = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
                 fused_sharding = (("data", "tensor"), None, None)
             else:  # epmoe
@@ -1029,18 +1029,33 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     physical_to_logical_map=phy_to_log,
                 )
 
-            # Shared experts.
+            # Shared experts. EPMoE keeps a separate BailingMoeV3MLP
+            # (shared_experts.{gate,up,down}_proj); the fused kernel folds it into
+            # the experts module as w1_shared/w3_shared/w2_shared (replicated).
             if self.config.num_shared_experts > 0:
-                for proj_name, sharding in [
-                    ("gate_proj", (None, "tensor")),
-                    ("up_proj", (None, "tensor")),
-                    ("down_proj", ("tensor", None)),
-                ]:
-                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
-                        sharding=sharding,
-                        transpose=True,
-                    )
+                if moe_backend in ("fused", "fused_v2"):
+                    shared_map = [
+                        ("gate_proj", "w1_shared"),
+                        ("up_proj", "w3_shared"),
+                        ("down_proj", "w2_shared"),
+                    ]
+                    for proj_name, target_name in shared_map:
+                        mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
+                            target_path=f"{target_prefix}.experts.{target_name}",
+                            sharding=(None, None),
+                            transpose=True,
+                        )
+                else:
+                    for proj_name, sharding in [
+                        ("gate_proj", (None, "tensor")),
+                        ("up_proj", (None, "tensor")),
+                        ("down_proj", ("tensor", None)),
+                    ]:
+                        mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
+                            sharding=sharding,
+                            transpose=True,
+                        )
 
         return mappings
 
