@@ -1649,7 +1649,7 @@ def _fused_ep_moe_kernel(
                     ).wait()
 
             if expert_input_double_buffer:
-                with jax.named_scope("expert/input/load"):
+                with jax.named_scope("expert/input/start"):
                     start_input_load(jnp.int32(0), jnp.int32(0))
 
             def bts_body(bts_id, next_bf0_prefetched):
@@ -1662,16 +1662,18 @@ def _fused_ep_moe_kernel(
                         return b_x_vmem[x_slot, row_slice, p_id, k_slice]
                     return b_x_vmem[row_slice, p_id, k_slice]
 
-                with jax.named_scope("expert/input/load"):
-                    if expert_input_double_buffer:
+                if expert_input_double_buffer:
+                    with jax.named_scope("expert/input/wait"):
                         wait_input_load(x_slot)
-                        next_bts_id = bts_id + jnp.int32(1)
+                    next_bts_id = bts_id + jnp.int32(1)
 
-                        @pl.when(next_bts_id < num_bts_tiles)
-                        def _start_next_input_load():
+                    @pl.when(next_bts_id < num_bts_tiles)
+                    def _start_next_input_load():
+                        with jax.named_scope("expert/input/start"):
                             start_input_load(next_bts_id % jnp.int32(2), next_bts_id)
 
-                    else:
+                else:
+                    with jax.named_scope("expert/input/load"):
                         start_input_load(jnp.int32(0), bts_id)
                         wait_input_load(jnp.int32(0))
 
