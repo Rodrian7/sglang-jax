@@ -514,6 +514,8 @@ const MODULES = {
   rpa: {
     kind:"attn",
     label(dims){return "RPA attention (per device, %PH%) — "+(dims.window?("SWA (window="+dims.window+")"):"full");},
+    flow(dims){return dims.window?"SWA-attn":"full-attn";},
+    headDiv(dims){return dims.nh;},  // tensor axis t must divide the query heads
     costRows(ctx,dims){
       const nh=dims.nh,nkv=dims.nkv,hd=dims.hd,vhd=dims.vhd,window=dims.window;
       const qs=nh*hd, ks=nkv*hd, vs=nkv*vhd, ao=nh*vhd;
@@ -529,10 +531,26 @@ const MODULES = {
         {cat:"other", o:elt(ctx.tokens,D.H,2), mult:2},
       ];
     },
+    // one representative layer's attention sub-chain (dataflow lens; bq defaults to
+    // 32 to match the legacy single-layer view, distinct from costRows' decode bq=1)
+    chain(ctx,dims){
+      const nh=dims.nh,nkv=dims.nkv,hd=dims.hd,vhd=dims.vhd,window=dims.window;
+      const qs=nh*hd, ks=nkv*hd, vs=nkv*vhd, ao=nh*vhd;
+      const eff=window?Math.min(ctx.ctxlen,window):ctx.ctxlen;
+      const inter=ctx.tokens*(ctx.decode?eff:eff/2);
+      const oproj=gemm(ctx.tokens,ao,D.H,"o_proj"); oproj.ici=rowReduce(ctx.tokens,D.H,ctx.L);
+      return [
+        {name:"qkv_proj",cat:"linear",o:gemm(ctx.tokens,D.H,qs+ks+vs,"qkv"),shard:ctx.t},
+        {name:"rope",cat:"rope",o:rope(ctx.tokens,qs,ks),shard:ctx.t},
+        {name:"attention",cat:"attention",o:attention(Math.max(1,Math.floor(nh/ctx.t)),kvpd(nkv,ctx.t),hd,vhd,ctx.tokens,inter)},
+        {name:"o_proj +reduce",cat:"o_proj",o:oproj,shard:ctx.t},
+      ];
+    },
   },
   fused_moe_v2: {
     kind:"ffn",
     label(){return "fused-MoE-v2 experts (per device, per layer)";},
+    flow(){return "MoE";},
     costRows(ctx,dims){
       const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
       const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
@@ -540,16 +558,31 @@ const MODULES = {
       e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote + rowReduce(ctx.tokens,D.H,ctx.L);
       return [ {cat:"router", o:router(ctx.tokens,D.H,NEXP)}, {cat:"moe", o:e} ];
     },
+    chain(ctx,dims){
+      const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const e=moe(tpd,NEXP/ctx.ep,D.H,MOEF,"experts"); e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote+rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {name:"router_gate",cat:"router",o:router(ctx.tokens,D.H,NEXP)}, {name:"experts +a2a",cat:"moe",o:e} ];
+    },
   },
   dense: {
     kind:"ffn",
     label(){return "dense MLP";},
+    flow(){return "dense";},
     costRows(ctx,dims){
       const F=dims.DENSE_F;
       return [
         {cat:"linear", o:gemm(ctx.tokens,D.H,2*F,"mlp"), shard:ctx.t},
         {cat:"linear", o:gemm(ctx.tokens,F,D.H,"mlp"), shard:ctx.t},
         {cat:"other", o:elt(ctx.tokens,F,1)},
+      ];
+    },
+    chain(ctx,dims){
+      const F=dims.DENSE_F;
+      return [
+        {name:"gate_up_proj",cat:"linear",o:gemm(ctx.tokens,D.H,2*F,"mlp"),shard:ctx.t},
+        {name:"silu",cat:"other",o:elt(ctx.tokens,F,1)},
+        {name:"down_proj",cat:"linear",o:gemm(ctx.tokens,F,D.H,"mlp"),shard:ctx.t},
       ];
     },
   },
@@ -589,25 +622,20 @@ function compute(s){
 
 function buildChain(s){
   const L=resolve(s); L.sp=s.enable_sp; const decode=s.phase==="decode";
-  const tokens=decode?s.batch:s.chunk, ctx=decode?s.seq_len:s.chunk, t=L.t, ep=L.ep;
-  const d=D.full, qs=d.nh*d.hd, ks=d.nkv*d.hd, vs=d.nkv*d.vhd, ao=d.nh*d.vhd;
-  const inter=tokens*(decode?ctx:ctx/2); const ch=[];
+  const tokens=decode?s.batch:s.chunk, ctxlen=decode?s.seq_len:s.chunk, t=L.t, ep=L.ep;
+  const ctx={tokens, ctxlen, decode, t, ep, L};
+  const comp=D.composition||{attn:[],ffn:[]};
+  const ra=(comp.attn||[])[0], rf=(comp.ffn||[])[0];   // representative layer = first attn + first ffn
+  const ch=[];
   const msof=(o,shard)=>{shard=shard||1; const cms=o.flops/shard/flops_per_s(o.peak)*1e3, hms=o.hbm/shard/HBMBW*1e3, ims=(o.ici||0)/ICIBW*1e3;
     const m=Math.max(cms,hms,ims); return {ms:m, bound:(m===ims&&ims>0)?"ICI":(m===cms?"compute":"HBM")};};
   const add=(name,cat,o,shard)=>{const r=msof(o,shard); ch.push({name,cat,ms:r.ms,bound:r.bound});};
   add("input_layernorm","norm",rms(tokens,D.H));
-  add("qkv_proj","linear",gemm(tokens,D.H,qs+ks+vs,"qkv"),t);
-  add("rope","rope",rope(tokens,qs,ks),t);
-  add("attention","attention",attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter));
-  {let o=gemm(tokens,ao,D.H,"o_proj"); o.ici=rowReduce(tokens,D.H,L); add("o_proj +reduce","o_proj",o,t);}
+  if(ra&&MODULES[ra.m].chain) for(const r of MODULES[ra.m].chain(ctx,ra.dims)) add(r.name,r.cat,r.o,r.shard);
   add("+ residual","other",elt(tokens,D.H,2));
   add("post_attn_layernorm","norm",rms(tokens,D.H));
-  if(D.n_moe>0){ add("router_gate","router",router(tokens,D.H,D.NEXP));
-    const mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep)), remote=ep>1?(ep-1)/ep:0;
-    let e=moe(tpd,D.NEXP/ep,D.H,D.MOEF,"experts"); e.ici=2*(mt*D.TOPK/ep)*D.H*2*remote+rowReduce(tokens,D.H,L);
-    add("experts +a2a","moe",e); add("+ residual","other",elt(tokens,D.H,2));
-  } else { add("gate_up_proj","linear",gemm(tokens,D.H,2*D.DENSE_F,"mlp"),t); add("silu","other",elt(tokens,D.DENSE_F,1));
-    add("down_proj","linear",gemm(tokens,D.DENSE_F,D.H,"mlp"),t); add("+ residual","other",elt(tokens,D.H,2)); }
+  if(rf&&MODULES[rf.m].chain) for(const r of MODULES[rf.m].chain(ctx,rf.dims)) add(r.name,r.cat,r.o,r.shard);
+  add("+ residual","other",elt(tokens,D.H,2));
   return ch;
 }
 
@@ -657,22 +685,26 @@ function rowMs(r){return {c:r.flops/flops_per_s(r.peak)*1e3, h:r.hbm/HBMBW*1e3, 
 function ridgeOI(peak){return (peak==="fp8"?P.fp8_tflops:P.bf16_tflops)/(HBMBW/1e12);}
 function lensOverlap(s,R){
   const L=R.L, ep=L.ep, tokens=R.tokens, mt=tokens*L.dp, remote=ep>1?(ep-1)/ep:0, msi=b=>b/ICIBW*1e3;
-  const attnN=D.n_full+D.n_swa;
+  const comp=D.composition||{attn:[],ffn:[]};
+  const attnN=(comp.attn||[]).reduce((a,x)=>a+x.count,0);
+  const moeMods=(comp.ffn||[]).filter(f=>/moe/.test(f.m)), denseMods=(comp.ffn||[]).filter(f=>f.m==="dense");
+  const nMoe=moeMods.reduce((a,x)=>a+x.count,0), nDense=denseMods.reduce((a,x)=>a+x.count,0);
   const items=[];
-  if(D.n_moe>0){
-    const a2aB=2*(mt*D.TOPK/ep)*D.H*2*remote, tpd=Math.max(1,Math.floor(mt*D.TOPK/ep));
-    const e=moe(tpd,D.NEXP/ep,D.H,D.MOEF,"experts");
+  if(nMoe>0){
+    const md=moeMods[0].dims, NEXP=md.NEXP, TOPK=md.TOPK, MOEF=md.MOEF;
+    const a2aB=2*(mt*TOPK/ep)*D.H*2*remote, tpd=Math.max(1,Math.floor(mt*TOPK/ep));
+    const e=moe(tpd,NEXP/ep,D.H,MOEF,"experts");
     // the a2a can pipeline behind the experts kernel's execution = its ideal time
     // (compute & HBM overlapped inside the kernel)
-    const expMs=Math.max(e.flops/flops_per_s(e.peak), e.hbm/HBMBW)*1e3*D.n_moe;
-    items.push({name:"MoE all-to-all (dispatch + combine)",op:"kernel",ms:msi(a2aB)*D.n_moe,type:"pipelineable",cap:expMs,behind:"experts kernel "+expMs.toFixed(1)+" ms"});
-    items.push({name:"MoE output all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*D.n_moe,type:"barrier",cap:0,behind:"—"});
+    const expMs=Math.max(e.flops/flops_per_s(e.peak), e.hbm/HBMBW)*1e3*nMoe;
+    items.push({name:"MoE all-to-all (dispatch + combine)",op:"kernel",ms:msi(a2aB)*nMoe,type:"pipelineable",cap:expMs,behind:"experts kernel "+expMs.toFixed(1)+" ms"});
+    items.push({name:"MoE output all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*nMoe,type:"barrier",cap:0,behind:"—"});
   }
   if(attnN>0) items.push({name:"o_proj all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*attnN,type:"barrier",cap:0,behind:"—"});
-  if(D.n_dense>0) items.push({name:"down_proj all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*D.n_dense,type:"barrier",cap:0,behind:"—"});
+  if(nDense>0) items.push({name:"down_proj all-reduce (TP, tensor axis)",op:"all-reduce",ms:msi(rowReduce(tokens,D.H,L))*nDense,type:"barrier",cap:0,behind:"—"});
   // SP re-gather: async all-gather (one per block before its input linear) that XLA
   // overlaps with the linear -> hidden comm, not an exposed barrier (HLO ground truth).
-  {const agB=spGather(tokens,D.H,L); if(agB>0) items.push({name:"SP all-gather (re-collect seq before linears)",op:"all-gather",ms:msi(agB)*(attnN+D.n_moe+D.n_dense),type:"pipelineable",cap:1e9,behind:"input linears (XLA async)"});}
+  {const agB=spGather(tokens,D.H,L); if(agB>0) items.push({name:"SP all-gather (re-collect seq before linears)",op:"all-gather",ms:msi(agB)*(attnN+nMoe+nDense),type:"pipelineable",cap:1e9,behind:"input linears (XLA async)"});}
   // embedding lookup all-reduce (vocab-sharded embed gather over the tensor axis); once per step
   if(L.t>1) items.push({name:"embedding all-reduce (vocab-sharded)",op:"all-reduce",ms:msi(allreduce(tokens*D.H*2,L.t)),type:"barrier",cap:0,behind:"—"});
   let hidden=0,exposed=0,commTot=0;
@@ -813,7 +845,13 @@ function kernelTune(s,R){
   }
   return h;}
 function lensFusion(s,R){
-  const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H, qsz=D.full.nh*D.full.hd, attnN=D.n_full+D.n_swa;
+  const decode=s.phase==="decode", tokens=decode?s.batch:s.chunk, H=D.H;
+  const comp=D.composition||{attn:[],ffn:[]};
+  const attnN=(comp.attn||[]).reduce((a,x)=>a+x.count,0);
+  const repAttn=(comp.attn||[])[0], qsz=repAttn?repAttn.dims.nh*repAttn.dims.hd:0;
+  const moeMods=(comp.ffn||[]).filter(f=>/moe/.test(f.m)), denseMods=(comp.ffn||[]).filter(f=>f.m==="dense");
+  const nMoe=moeMods.reduce((a,x)=>a+x.count,0), nDense=denseMods.reduce((a,x)=>a+x.count,0);
+  const DENSE_F=(denseMods[0]||{dims:{}}).dims.DENSE_F||D.DENSE_F;
   const f=(D.hlo&&D.hlo.fusion)||null, ko=(f&&f.by_kind&&f.by_kind.kOutput)||0, ki=(f&&f.by_kind&&f.by_kind.kInput)||0;
   // status of a candidate fusion against the compiled HLO. epilogue = folded into
   // a matmul output (kOutput); prologue = into a matmul input (kInput — TPU MXU
@@ -828,11 +866,11 @@ function lensFusion(s,R){
   const C=[
     ["input_norm → qkv","prologue",H,attnN],
     ["o_proj → residual_add","epilogue",H,attnN],
-    ["post_norm → "+(D.n_moe>0?"router":"gate_up"),"prologue",H,attnN],
+    ["post_norm → "+(nMoe>0?"router":"gate_up"),"prologue",H,attnN],
     ["rope → attention","kernel",qsz,attnN],
   ];
-  if(D.n_moe>0) C.push(["experts → residual_add","kernel",H,D.n_moe]);
-  else C.push(["gate_up → silu","epilogue",D.DENSE_F,D.n_dense],["silu → down_proj","prologue",D.DENSE_F,D.n_dense]);
+  if(nMoe>0) C.push(["experts → residual_add","kernel",H,nMoe]);
+  else C.push(["gate_up → silu","epilogue",DENSE_F,nDense],["silu → down_proj","prologue",DENSE_F,nDense]);
   const rows=C.map(c=>{const gb=tokens*c[2]*2*c[3]/1e9,[cls,txt]=status(c[1]);return {name:c[0],kind:c[1],gb,ms:gb*1e9/HBMBW*1e3,cls,txt};}).sort((a,b)=>b.ms-a.ms);
   const totGB=rows.reduce((a,r)=>a+r.gb,0), totMs=rows.reduce((a,r)=>a+r.ms,0), HgB=R.Th*HBMBW/1e3/1e9;
   let h="<div class='lh'>Fusion — which intermediate HBM round-trips are removed</div>";
@@ -844,7 +882,9 @@ function lensFusion(s,R){
   return h;}
 function dataflowHTML(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
-  let h="<div class='note'>one "+(D.n_moe>0?"full-attn + MoE":"dense")+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
+  const comp=D.composition||{attn:[],ffn:[]}, ra=(comp.attn||[])[0], rf=(comp.ffn||[])[0];
+  const flow=[ra&&MODULES[ra.m].flow?MODULES[ra.m].flow(ra.dims):"", rf&&MODULES[rf.m].flow?MODULES[rf.m].flow(rf.dims):""].filter(Boolean).join(" + ");
+  let h="<div class='note'>one "+flow+" layer · per-device · bar ∝ ideal ms · color = bound</div>";
   for(let i=0;i<ch.length;i++){const o=ch[i];
     h+="<div class='dfrow'><div class='nm'><span style='color:"+(CAT[o.cat]||'#888')+"'>●</span> "+o.name+"</div>"
       +"<div class='barwrap'><div class='bar' style='width:"+Math.max(1.5,o.ms/mx*100)+"%;background:"+(BCOL[o.bound]||'#999')+"'></div></div>"
@@ -910,7 +950,9 @@ function updateSummary(s,R){const L=R.L;
 }
 
 function divisors(n){const a=[];for(let i=1;i<=n;i++)if(n%i===0)a.push(i);return a;}
-function validDp(tp){return divisors(tp).filter(d=>D.full.nh%(Math.floor(tp/d))===0);}
+function validDp(tp){const comp=D.composition||{attn:[]};
+  return divisors(tp).filter(d=>{const t=Math.floor(tp/d);
+    return (comp.attn||[]).every(a=>{const hd=MODULES[a.m].headDiv?MODULES[a.m].headDiv(a.dims):null; return hd==null||hd%t===0;});});}
 function g(id){return document.getElementById(id);}
 let PHASE="decode"; let SCEN="overview";
 function setScen(name){SCEN=name; document.querySelectorAll("#scennav button").forEach(b=>b.classList.toggle("on",b.dataset.sc===name)); render();}
