@@ -1168,12 +1168,12 @@ MODULES.ep_moe.card = function(ctx,dims,R){
   const arB=allreduce(mt*d*2,ep), reshardB=rowReduce(tokens,d,L);
   const iciParts=[["EP all-reduce (psum, full output)",arB,"#ec4899"],["output all-reduce (TP)",reshardB,"#db2777"]];
   const vmem=f*d*(q?1:2)+tpd*d*2;
-  return tuneCard("EPMoE experts (per device, per layer)",
-    "replicated tokens (reshard P(None)); no token a2a — expert-axis all-reduce of the full output", wB, aB, flops, iciParts, wpeak(), vmem,
+  return tuneCard("EPMoE — megablox GMM (grouped matmul) + XLA all-reduce (per device, per layer)",
+    "megablox GMM ×3 (gate/up/down, grouped); the only Pallas kernel — reshard(P(None)) + sort/permute + psum are XLA, NOT a fused kernel", wB, aB, flops, iciParts, wpeak(), vmem,
     (bound,x)=>{
-      if(bound==="ICI") return "<b>comm-bound (ICI).</b> EPMoE replicates ALL "+mt+" tokens and combines via an expert-axis all-reduce of the FULL [mt,H] output ("+(arB/ICIBW*1e3).toFixed(3)+" ms) + the TP all-reduce ("+(reshardB/ICIBW*1e3).toFixed(3)+" ms) = "+x.ims.toFixed(3)+" ms. That is ≈ ep/topk = "+(ep/dims.TOPK).toFixed(0)+"× heavier than fused-v2's routed-token a2a. Lever: <b>switch to the fused-v2 backend</b> (in-kernel routed a2a), or fewer EP / better topology.";
-      if(bound==="HBM") return "<b>weight-HBM-bound.</b> experts "+fmt(x.wB/1e9)+" GB read once + the full replicated [mt,H] output materialised for the psum. Levers: ① fp8 weights; ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ fused-v2 avoids the full-token replication.";
-      return "<b>compute-bound.</b> ↑ MXU rate (non-block W8A8) or ↓ flops.";
+      if(bound==="ICI") return "<b>comm-bound (ICI).</b> EPMoE is XLA-orchestrated: it replicates ALL "+mt+" tokens (reshard P(None)) and combines via an expert-axis all-reduce of the FULL [mt,H] output ("+(arB/ICIBW*1e3).toFixed(3)+" ms) + the TP all-reduce ("+(reshardB/ICIBW*1e3).toFixed(3)+" ms) = "+x.ims.toFixed(3)+" ms — plain XLA collectives, not in-kernel. ≈ ep/topk = "+(ep/dims.TOPK).toFixed(0)+"× heavier than fused-v2's in-kernel routed a2a. Lever: <b>switch to the fused-v2 backend</b>, or fewer EP / better topology.";
+      if(bound==="HBM") return "<b>GMM-weight-HBM-bound.</b> the megablox GMM streams "+fmt(x.wB/1e9)+" GB of expert weights once + the full replicated [mt,H] output materialised for the psum. Levers: ① fp8 weights; ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ fused-v2 avoids the full-token replication.";
+      return "<b>compute-bound.</b> the megablox GMM grouped matmul — ↑ MXU rate (non-block W8A8) / GMM tiling, or ↓ flops.";
     });
 };
 
