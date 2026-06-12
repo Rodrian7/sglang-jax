@@ -89,7 +89,7 @@ def patch_for_cpu(ver: int = 7):
 class _Runner:
     """Minimal ModelRunner stand-in: only what ForwardBatch.init_new +
     attn_backend_wrapper actually touch (mesh / attn_backend / model_config, and
-    the three linear-attn configs that gate the no-op wrapper)."""
+    the linear-attn configs that gate the hybrid wrapper)."""
 
     def __init__(self, mesh, attn_backend, model_config):
         self.mesh = mesh
@@ -98,9 +98,13 @@ class _Runner:
         self.linear_recurrent_config = None
         self.kimi_linear_config = None
         self.lightning_config = None
+        self.bailing_moe_v3_config = None
+        self.qwen3_5_hybrid_config = None
 
 
-def _make_dummy_batch(bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_size):
+def _make_dummy_batch(
+    bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_size, recurrent=False
+):
     """Pure-numpy ModelWorkerBatch mirroring CompilationManager._make_dummy_batch."""
     from sgl_jax.srt.managers.schedule_batch import (
         ForwardMode,
@@ -112,6 +116,11 @@ def _make_dummy_batch(bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_s
 
     per_dp = bs // dp_size
     extend = mode == ForwardMode.EXTEND
+    # Hybrid recurrent models (KDA/GDN/Mamba) need the linear-attn metadata: one
+    # recurrent-state slot per request, and a per-request has-initial-state flag
+    # (decode continues prior state; a fresh extend starts empty).
+    recurrent_indices = np.arange(bs, dtype=np.int32) if recurrent else None
+    has_initial_state = np.array([not extend] * bs, dtype=bool) if recurrent else None
     return ModelWorkerBatch(
         bid=1,
         forward_mode=mode,
@@ -146,8 +155,8 @@ def _make_dummy_batch(bs, num_tokens, mode, max_cache_loc_size, vocab_size, dp_s
         per_dp_bs_size=per_dp,
         real_bs_per_dp=[per_dp] * dp_size,
         logits_indices_selector=np.arange(bs, dtype=np.int32),
-        recurrent_indices=None,
-        has_initial_state=None,
+        recurrent_indices=recurrent_indices,
+        has_initial_state=has_initial_state,
     )
 
 
@@ -336,14 +345,14 @@ def _build_forward(
 
     with jax.set_mesh(mesh):
         model = nnx.eval_shape(lambda: model_class(mc.hf_config, dtype=mc.dtype, mesh=mesh))
-        kv_pool = _build_kv_pool(mc, mesh, attention_tp, dp, page_size)
-        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-
-        nkv = mc.get_total_num_kv_heads_with_replication(attention_tp)
-        attn_backend = FlashAttention(
-            mc.num_attention_heads, nkv, mc.head_dim, page_size=page_size, mesh=mesh
+        hf = mc.hf_config
+        # Hybrid recurrent model (e.g. Ling3 BailingMoeV3: KDA + MLA): build the MLA
+        # full-attn backend wrapped in HybridLinearAttnBackend + the recurrent-state
+        # + MLA-latent pools, instead of a single MHA/SWA pool + FlashAttention.
+        hybrid = bool(getattr(hf, "linear_attn_config", None)) and bool(
+            getattr(hf, "full_attention_layer_ids", None)
         )
-        runner = _Runner(mesh, attn_backend, mc)
+        runner = _Runner(mesh, None, mc)
 
         mode = ForwardMode.EXTEND if phase == "extend" else ForwardMode.DECODE
         if mode == ForwardMode.EXTEND:
@@ -351,11 +360,30 @@ def _build_forward(
         else:
             bs = max(ep, dp)  # decode: global tokens(=bs) must align to ep_size
             ntok = bs
-        batch = _make_dummy_batch(bs, ntok, mode, 4 * page_size * dp, mc.hf_config.vocab_size, dp)
+        batch = _make_dummy_batch(
+            bs, ntok, mode, 4 * page_size * dp, hf.vocab_size, dp, recurrent=hybrid
+        )
+
+        if hybrid:
+            attn_backend, mp = _build_hybrid_attn_and_pools(
+                mc, mesh, attention_tp, dp, page_size, runner, bs
+            )
+        else:
+            from sgl_jax.srt.layers.attention.flashattention_backend import (
+                FlashAttention,
+            )
+
+            nkv = mc.get_total_num_kv_heads_with_replication(attention_tp)
+            attn_backend = FlashAttention(
+                mc.num_attention_heads, nkv, mc.head_dim, page_size=page_size, mesh=mesh
+            )
+            mp = _build_non_hybrid_memory_pools(
+                _build_kv_pool(mc, mesh, attention_tp, dp, page_size)
+            )
+        runner.attn_backend = attn_backend
         attn_backend.forward_metadata = attn_backend.get_forward_metadata(batch)
         fb = ForwardBatch.init_new(batch, runner)
         lm = LogitsMetadata.from_model_worker_batch(batch, mesh)
-        mp = _build_non_hybrid_memory_pools(kv_pool)
 
         gd, state = nnx.split(model)
         leaves, treedef = jax.tree_util.tree_flatten(state)
@@ -366,6 +394,67 @@ def _build_forward(
 
     tokens_global = ntok if mode == ForwardMode.EXTEND else bs
     return fwd, (leaves, fb, mp, lm), mesh, mc, arch, attention_tp, ep, tokens_global
+
+
+def _build_hybrid_attn_and_pools(mc, mesh, attention_tp, dp, page_size, runner, max_num_reqs):
+    """Hybrid recurrent attention (KDA/GDN/... linear + MLA/full): build the MLA
+    full-attn backend, wrap it via ``attn_backend_wrapper`` (which adds the matching
+    linear sub-backend), and build the recurrent-state + MLA-latent memory pools.
+    Mirrors ``model_runner._get_attention_backend`` + ``_build_hybrid_pools``."""
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+        attn_backend_wrapper,
+    )
+    from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+        _build_hybrid_pools,
+    )
+
+    hf = mc.hf_config
+    full_attn_ids = list(hf.full_attention_layer_ids)
+    full_attn_backend = MLAAttentionBackend(
+        num_attn_heads=mc.num_attention_heads,
+        kv_lora_rank=hf.kv_lora_rank,
+        qk_nope_head_dim=hf.qk_nope_head_dim,
+        qk_rope_head_dim=hf.qk_rope_head_dim,
+        v_head_dim=hf.v_head_dim,
+        page_size=page_size,
+        mesh=mesh,
+        attention_data_partition_axis="data",
+    )
+    # Gate the wrapper's linear sub-backend (mirror the runner's config properties).
+    from sgl_jax.srt.configs.bailing_moe_v3 import BailingMoeV3Config
+
+    if isinstance(hf, BailingMoeV3Config):
+        runner.bailing_moe_v3_config = hf
+    runner.linear_recurrent_config = hf  # has full_attention_layer_ids / linear_layer_ids
+    attn_backend = attn_backend_wrapper(runner, full_attn_backend)
+
+    pages = int(os.environ.get("RL_KV_PAGES", "16"))
+    size = pages * page_size * dp
+    mla_pool = MLATokenToKVPool(
+        size=size,
+        page_size=page_size,
+        dtype=jnp.bfloat16,
+        kv_lora_rank=hf.kv_lora_rank,
+        qk_rope_head_dim=hf.qk_rope_head_dim,
+        layer_num=len(full_attn_ids),
+        mesh=mesh,
+        dp_size=dp,
+    )
+    _, _, mp = _build_hybrid_pools(
+        cfg=hf,
+        max_num_reqs=max_num_reqs,
+        max_context_len=4 * page_size * dp,
+        tp_size=attention_tp,
+        token_to_kv_pool=mla_pool,
+        mesh=mesh,
+        dp_size=dp,
+        state_size=max_num_reqs,
+    )
+    return attn_backend, mp
 
 
 def compile_forward_hlo(
