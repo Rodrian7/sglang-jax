@@ -1619,22 +1619,34 @@ def _fused_ep_moe_kernel(
                 if disable_expert_x_load:
                     return
                 load_tile_start = load_bts_id * bts
-                dst_ref = b_x_vmem[load_slot] if expert_input_double_buffer else b_x_vmem
-                pltpu.make_async_copy(
-                    src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, load_tile_start, bts),
-                    dst_ref=dst_ref,
-                    sem=x_stage_sem.at[load_slot],
-                ).start(priority=1)
+                if expert_input_double_buffer:
+                    pltpu.make_async_copy(
+                        src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, load_tile_start, bts),
+                        dst_ref=b_x_vmem.at[load_slot],
+                        sem=x_stage_sem.at[load_slot],
+                    ).start(priority=1)
+                else:
+                    pltpu.make_async_copy(
+                        src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, load_tile_start, bts),
+                        dst_ref=b_x_vmem,
+                        sem=x_stage_sem.at[0],
+                    ).start(priority=1)
 
             def wait_input_load(load_slot):
                 if disable_expert_x_load:
                     return
-                ref = b_x_vmem[load_slot] if expert_input_double_buffer else b_x_vmem
-                pltpu.make_async_copy(
-                    src_ref=ref,
-                    dst_ref=ref,
-                    sem=x_stage_sem.at[load_slot],
-                ).wait()
+                if expert_input_double_buffer:
+                    pltpu.make_async_copy(
+                        src_ref=b_x_vmem.at[load_slot],
+                        dst_ref=b_x_vmem.at[load_slot],
+                        sem=x_stage_sem.at[load_slot],
+                    ).wait()
+                else:
+                    pltpu.make_async_copy(
+                        src_ref=b_x_vmem,
+                        dst_ref=b_x_vmem,
+                        sem=x_stage_sem.at[0],
+                    ).wait()
 
             if expert_input_double_buffer:
                 with jax.named_scope("expert/input/load"):
