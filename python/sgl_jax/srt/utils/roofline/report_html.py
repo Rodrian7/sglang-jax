@@ -1132,6 +1132,51 @@ MODULES.fused_moe_v2.card = function(ctx,dims,R){
     });
 };
 
+MODULES.mla.card = function(ctx,dims,R){
+  const t=ctx.t, tokens=ctx.tokens, d=dims;
+  const nq=Math.max(1,Math.floor(d.nh/t)), lat=d.kv_lora+d.qk_rope;
+  const cl=R.decode?ctx.seq_len:tokens, inter=tokens*(R.decode?cl:cl/2);
+  const o=attention(nq,1,lat,d.kv_lora,tokens,inter,R.decode?1:32,true), flops=o.flops;
+  const kvB=Math.floor(inter/(R.decode?1:32))*1*1*lat*2, qoB=o.hbm-kvB;   // single shared latent (kvShare)
+  const bq=R.decode?1:32, bkv=512, vmem=bq*lat*2 + bkv*lat*2 + bq*bkv*4;  // rough; no tuned MLA table
+  return tuneCard("MLA attention — latent KV (per device, "+(R.decode?"decode":"prefill")+")",
+    "bq="+bq+" bkv="+bkv+" (theory; latent dim "+lat+", v "+d.kv_lora+")", kvB, qoB, flops, [], "bf16", vmem,
+    (bound,x)=>{
+      if(bound==="HBM") return "<b>latent-KV-read-bound.</b> the absorbed cache stores ONE shared latent ("+lat+" = kv_lora "+d.kv_lora+" + rope "+d.qk_rope+") per token, MQA across all "+nq+" q-heads/device — read ≈ "+fmt(x.wB/1e9)+" GB. This compression IS the MLA win (vs "+d.nh+"-head MHA). Levers: ① fp8 latent cache (½); ② shorter context. Already MQA (nkv=1) + low-rank.";
+      return "<b>compute-bound.</b> absorbed Q·W_UK + score·W_UV folds dominate; cheap at decode.";
+    });
+};
+
+MODULES.kda.card = function(ctx,dims,R){
+  const t=ctx.t, tokens=ctx.tokens, nh=dims.nh, hd=dims.hd, nqh=Math.max(1,Math.floor(nh/t));
+  const flops=tokens*nqh*4*hd*hd;
+  const stB=(R.decode?tokens:1)*nqh*hd*hd*4*2;   // recurrent state read+write (fp32)
+  const actB=tokens*nqh*hd*2*5;
+  const vmem=nqh*hd*hd*4 + tokens*nqh*hd*2;       // state + activation working set
+  return tuneCard("KDA recurrent — gated-delta (per device, "+(R.decode?"decode":"prefill")+")",
+    "chunk scan (prefill) / recurrent (decode); state d_k×d_v="+hd+"×"+hd+"/head, "+nqh+" heads/dev", stB, actB, flops, [], "bf16", vmem,
+    (bound,x)=>{
+      if(bound==="HBM") return "<b>recurrent-state-bound.</b> reads+writes the "+nqh+"×"+hd+"×"+hd+" fp32 state per request ≈ "+fmt(x.wB/1e9)+" GB"+(R.decode?" (×"+tokens+" decode requests)":"")+". FIXED per token — no growing KV cache (the linear-attention win for long context). Levers: ① bf16 state; ② fewer heads; ③ larger chunk (prefill) keeps state in VMEM.";
+      return "<b>compute-bound.</b> the O(d_k·d_v) delta-rule update per token; small vs the q/k/v/f/g projections (see the linear rows).";
+    });
+};
+
+MODULES.ep_moe.card = function(ctx,dims,R){
+  const t=ctx.t, ep=ctx.ep, L=ctx.L, tokens=ctx.tokens;
+  const E=dims.NEXP/ep, d=D.H, f=dims.MOEF, mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*dims.TOPK/ep)), q=Q.wq!=="bf16";
+  const wB=E*(q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d)), aB=2*tpd*d*2 + 2*mt*d*2, flops=2*tpd*3*d*f;
+  const arB=allreduce(mt*d*2,ep), reshardB=rowReduce(tokens,d,L);
+  const iciParts=[["EP all-reduce (psum, full output)",arB,"#ec4899"],["output all-reduce (TP)",reshardB,"#db2777"]];
+  const vmem=f*d*(q?1:2)+tpd*d*2;
+  return tuneCard("EPMoE experts (per device, per layer)",
+    "replicated tokens (reshard P(None)); no token a2a — expert-axis all-reduce of the full output", wB, aB, flops, iciParts, wpeak(), vmem,
+    (bound,x)=>{
+      if(bound==="ICI") return "<b>comm-bound (ICI).</b> EPMoE replicates ALL "+mt+" tokens and combines via an expert-axis all-reduce of the FULL [mt,H] output ("+(arB/ICIBW*1e3).toFixed(3)+" ms) + the TP all-reduce ("+(reshardB/ICIBW*1e3).toFixed(3)+" ms) = "+x.ims.toFixed(3)+" ms. That is ≈ ep/topk = "+(ep/dims.TOPK).toFixed(0)+"× heavier than fused-v2's routed-token a2a. Lever: <b>switch to the fused-v2 backend</b> (in-kernel routed a2a), or fewer EP / better topology.";
+      if(bound==="HBM") return "<b>weight-HBM-bound.</b> experts "+fmt(x.wB/1e9)+" GB read once + the full replicated [mt,H] output materialised for the psum. Levers: ① fp8 weights; ② more EP (↓ local experts E="+E.toFixed(0)+"); ③ fused-v2 avoids the full-token replication.";
+      return "<b>compute-bound.</b> ↑ MXU rate (non-block W8A8) or ↓ flops.";
+    });
+};
+
 function kernelTune(s,R){
   let h="<div class='lh' style='margin-top:14px'>Pallas kernel tuning — per kernel/layer-type</div>";
   h+="<div class='note'>Each kernel's time split into the three engines (HBM = weight+act, same bandwidth → they sum; compute on MXU; comm on ICI → parallel axes). <b>ideal = max(HBM, compute, comm)</b> and the longest bar is the bound. Theory gives this ceiling + the VMEM-fit; whether the kernel hits it (tiling / MXU util / pipelining) needs a device trace.</div>";
