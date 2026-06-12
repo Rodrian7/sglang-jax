@@ -292,6 +292,40 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         vhd=_cfg(config, "swa_v_head_dim", default=full["vhd"]),
         window=_cfg(config, "sliding_window_size", default=4096),
     )
+    # Generic per-layer-type composition (module id + count + dims). The JS
+    # generator iterates this and dispatches to its MODULES registry, instead of
+    # hardcoding MiMo's full/swa + moe/dense. P1 derives it from the same config
+    # logic as the legacy n_* fields below (which are kept for cards/buildChain).
+    _NEXP = _cfg(config, "n_routed_experts", "num_experts", default=8)
+    _TOPK = _cfg(config, "num_experts_per_tok", default=2)
+    _MOEF = _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size"))
+    _DENSE_F = _cfg(config, "intermediate_size")
+    n_full = combo[(False, True)] + combo[(False, False)]
+    n_swa = combo[(True, True)] + combo[(True, False)]
+    n_moe = combo[(False, True)] + combo[(True, True)]
+    n_dense = combo[(False, False)] + combo[(True, False)]
+    composition = {
+        "attn": [
+            x
+            for x in [
+                {"m": "rpa", "count": n_full, "dims": {**full, "variant": "full"}},
+                {"m": "rpa", "count": n_swa, "dims": {**swa, "variant": "swa"}},
+            ]
+            if x["count"] > 0
+        ],
+        "ffn": [
+            x
+            for x in [
+                {
+                    "m": "fused_moe_v2",
+                    "count": n_moe,
+                    "dims": {"NEXP": _NEXP, "TOPK": _TOPK, "MOEF": _MOEF},
+                },
+                {"m": "dense", "count": n_dense, "dims": {"DENSE_F": _DENSE_F}},
+            ]
+            if x["count"] > 0
+        ],
+    }
     return {
         "arch": arch,
         "H": H,
@@ -307,6 +341,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "n_swa": combo[(True, True)] + combo[(True, False)],
         "n_moe": combo[(False, True)] + combo[(True, True)],
         "n_dense": combo[(False, False)] + combo[(True, False)],
+        "composition": composition,
         "jaxpr": _bake_jaxpr(arch, config),
         "moe_blocks": _bake_moe_block_table(config),
         "rpa_blocks": _bake_rpa_block_table(config),
@@ -471,36 +506,70 @@ function spGather(tokens,H,L){const g=tokens*L.dp;
   const on = L.sp && L.t>1 && g>=L.devices*D.defaults.scatter_min && g%L.devices===0;
   return on ? (L.t-1)/L.t*tokens*H*2 : 0;}
 
+// ---- module registry (model-agnostic): each kernel/layer-type's cost ----
+// costRows(ctx,dims) -> [{cat, o:{flops,hbm,ici,peak}, mult?, shard?}] replicating the
+// legacy add() calls; ctx={tokens,ctxlen,decode,t,ep,L}. compute() sums MODULES[m].costRows
+// x layer-count over D.composition.{attn,ffn}, so the generator is not tied to any model.
+const MODULES = {
+  rpa: {
+    kind:"attn",
+    label(dims){return "RPA attention (per device, %PH%) — "+(dims.window?("SWA (window="+dims.window+")"):"full");},
+    costRows(ctx,dims){
+      const nh=dims.nh,nkv=dims.nkv,hd=dims.hd,vhd=dims.vhd,window=dims.window;
+      const qs=nh*hd, ks=nkv*hd, vs=nkv*vhd, ao=nh*vhd;
+      const eff=window?Math.min(ctx.ctxlen,window):ctx.ctxlen;
+      const inter=ctx.tokens*(ctx.decode?eff:eff/2);
+      return [
+        {cat:"linear", o:gemm(ctx.tokens,D.H,qs+ks+vs,"qkv"), shard:ctx.t},
+        {cat:"rope", o:rope(ctx.tokens,qs,ks), shard:ctx.t},
+        {cat:"attention", o:attention(Math.max(1,Math.floor(nh/ctx.t)),kvpd(nkv,ctx.t),hd,vhd,ctx.tokens,inter,ctx.decode?1:32)},
+        {cat:"o_proj", o:gemm(ctx.tokens,ao,D.H,"o_proj"), shard:ctx.t},
+        {cat:"o_proj", o:{flops:0,hbm:0,ici:rowReduce(ctx.tokens,D.H,ctx.L),peak:"bf16"}},
+        {cat:"norm", o:rms(ctx.tokens,D.H), mult:2},
+        {cat:"other", o:elt(ctx.tokens,D.H,2), mult:2},
+      ];
+    },
+  },
+  fused_moe_v2: {
+    kind:"ffn",
+    label(){return "fused-MoE-v2 experts (per device, per layer)";},
+    costRows(ctx,dims){
+      const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const e=moe(tpd, NEXP/ctx.ep, D.H, MOEF, "experts");
+      e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote + rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {cat:"router", o:router(ctx.tokens,D.H,NEXP)}, {cat:"moe", o:e} ];
+    },
+  },
+  dense: {
+    kind:"ffn",
+    label(){return "dense MLP";},
+    costRows(ctx,dims){
+      const F=dims.DENSE_F;
+      return [
+        {cat:"linear", o:gemm(ctx.tokens,D.H,2*F,"mlp"), shard:ctx.t},
+        {cat:"linear", o:gemm(ctx.tokens,F,D.H,"mlp"), shard:ctx.t},
+        {cat:"other", o:elt(ctx.tokens,F,1)},
+      ];
+    },
+  },
+};
+
 function compute(s){
   const L=resolve(s); L.sp=s.enable_sp;
   const decode = s.phase==="decode";
   const tokens = decode? s.batch : s.chunk;
-  const ctx = decode? s.seq_len : s.chunk;
+  const ctxlen = decode? s.seq_len : s.chunk;
   const t=L.t, ep=L.ep;
+  const ctx={tokens, ctxlen, decode, t, ep, L};
   const cat={};
   const add=(c,o,cnt,shard)=>{cnt=cnt||1;shard=shard||1; const e=cat[c]||(cat[c]={flops:0,hbm:0,ici:0,cnt:0,peak:o.peak});
-    e.flops+=o.flops*cnt/shard; e.hbm+=o.hbm*cnt/shard; e.ici+=o.ici*cnt/shard; e.cnt+=cnt; if(o.peak==="fp8")e.peak="fp8";};
-  function attn(d,count){ if(count<=0)return;
-    const qs=d.nh*d.hd, ks=d.nkv*d.hd, vs=d.nkv*d.vhd, ao=d.nh*d.vhd;
-    const effctx = d.window? Math.min(ctx,d.window):ctx;
-    const inter = tokens*(decode? effctx : effctx/2);
-    add("linear", gemm(tokens,D.H,qs+ks+vs,"qkv"), count, t);
-    add("rope", rope(tokens,qs,ks), count, t);
-    add("attention", attention(Math.max(1,Math.floor(d.nh/t)),kvpd(d.nkv,t),d.hd,d.vhd,tokens,inter,decode?1:32), count, 1);
-    add("o_proj", gemm(tokens,ao,D.H,"o_proj"), count, t);
-    cat.o_proj.ici += rowReduce(tokens,D.H,L)*count;
-    add("norm", rms(tokens,D.H), 2*count); add("other", elt(tokens,D.H,2), 2*count);
-  }
-  attn(D.full, D.n_full); attn(D.swa, D.n_swa);
-  if(D.n_moe>0){ add("router", router(tokens,D.H,D.NEXP), D.n_moe);
-    const moe_tokens=tokens*L.dp;
-    const tpd=Math.max(1,Math.floor(moe_tokens*D.TOPK/ep)); const remote=ep>1?(ep-1)/ep:0;
-    let e=moe(tpd, D.NEXP/ep, D.H, D.MOEF, "experts"); e.ici=2*(moe_tokens*D.TOPK/ep)*D.H*2*remote + rowReduce(tokens,D.H,L);
-    add("moe", e, D.n_moe, 1);
-  }
-  if(D.n_dense>0){ add("linear", gemm(tokens,D.H,2*D.DENSE_F,"mlp"), D.n_dense, t);
-    add("linear", gemm(tokens,D.DENSE_F,D.H,"mlp"), D.n_dense, t);
-    add("other", elt(tokens,D.DENSE_F,1), D.n_dense); }
+    e.flops+=o.flops*cnt/shard; e.hbm+=o.hbm*cnt/shard; e.ici+=(o.ici||0)*cnt/shard; e.cnt+=cnt; if(o.peak==="fp8")e.peak="fp8";};
+  const emit=(rows,count)=>{ if(count<=0)return; for(const r of rows) add(r.cat, r.o, (r.mult||1)*count, r.shard||1); };
+  const comp=D.composition||{attn:[],ffn:[]};
+  for(const a of (comp.attn||[])) emit(MODULES[a.m].costRows(ctx,a.dims), a.count);
+  for(const f of (comp.ffn||[])) emit(MODULES[f.m].costRows(ctx,f.dims), f.count);
+  // model head: embedding + final norm + lm_head (universal, not per-layer modules)
   add("embedding", elt(tokens,D.H,0), 1);
   add("norm", rms(tokens,D.H), 1);
   add("lm_head", gemm(s.batch,D.H,D.VOCAB,"lm_head"), 1, t);
