@@ -277,17 +277,40 @@ def register_composer(*names):
     return deco
 
 
-def _compose(arch, config) -> dict:
+_MOE_BACKENDS = {
+    "fused_v2": "fused_moe_v2",  # in-kernel a2a on SparseCore (FusedEPMoE / MiMo)
+    "fused": "fused_moe_v2",
+    "fused_ep": "fused_moe_v2",
+    "epmoe": "ep_moe",  # expert-parallel MoE with explicit XLA all-to-all
+    "ep": "ep_moe",
+    "ep_moe": "ep_moe",
+    "fused_v1": "fused_moe_v1",
+    "v1": "fused_moe_v1",
+}
+
+
+def _moe_module(config, defaults) -> str:
+    """Resolve which MoE-kernel module to model. Priority: explicit generation-time
+    override (``defaults['moe_backend']``, e.g. trace_roofline ``--moe-backend``) >
+    checkpoint/runtime (``config.moe_backend``) > ``fused_moe_v2`` (the default we
+    model). The roofline is a what-if tool, so the backend is a free knob — pass
+    ``--moe-backend epmoe`` to compare EPMoE against the fused-v2 kernel."""
+    bk = (defaults or {}).get("moe_backend") or _cfg(config, "moe_backend") or "fused_v2"
+    return _MOE_BACKENDS.get(str(bk).lower(), "fused_moe_v2")
+
+
+def _compose(arch, config, defaults=None) -> dict:
     """Detect which kernel/layer-type modules a model uses, and how many layers of
     each, as ``{"attn":[{m,count,dims}], "ffn":[{m,count,dims}]}``. The JS generator
     iterates this and dispatches to its MODULES registry, so the report is not tied
     to any one model. Per-arch composers register below; the generic fallback covers
-    RPA(full/SWA) attention + fused-MoE-v2 / dense FFN models."""
-    return _COMPOSERS.get(arch, _compose_generic)(config)
+    RPA(full/SWA) attention + MoE / dense FFN models. The MoE-kernel module is a
+    configurable knob (see ``_moe_module``)."""
+    return _COMPOSERS.get(arch, _compose_generic)(config, _moe_module(config, defaults))
 
 
 @register_composer("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM", "MiMoV2ForCausalLM")
-def _compose_generic(config) -> dict:
+def _compose_generic(config, moe_m="fused_moe_v2") -> dict:
     """RPA attention (full + sliding-window) + fused-MoE-v2 / dense FFN, keyed off
     ``hybrid_layer_pattern`` (SWA layers) and ``moe_layer_freq`` (MoE vs dense).
     Covers the MiMo-V2 family and dense / all-MoE RPA models (e.g. Qwen3-MoE,
@@ -338,7 +361,7 @@ def _compose_generic(config) -> dict:
             x
             for x in [
                 {
-                    "m": "fused_moe_v2",
+                    "m": moe_m,
                     "count": n_moe,
                     "dims": {"NEXP": NEXP, "TOPK": TOPK, "MOEF": MOEF},
                 },
@@ -350,7 +373,7 @@ def _compose_generic(config) -> dict:
 
 
 @register_composer("Qwen3MoeForCausalLM")
-def _compose_qwen3_moe(config) -> dict:
+def _compose_qwen3_moe(config, moe_m="fused_moe_v2") -> dict:
     """Qwen3-MoE: GQA full attention (no sliding window) + per-layer MoE/dense.
     A layer is MoE when it is not in ``mlp_only_layers`` and (i+1) is a multiple of
     ``decoder_sparse_step`` (HF Qwen3Moe rule); the rest are dense. Qwen3-MoE has no
@@ -383,9 +406,68 @@ def _compose_qwen3_moe(config) -> dict:
             x
             for x in [
                 {
-                    "m": "fused_moe_v2",
+                    "m": moe_m,
                     "count": n_moe,
                     "dims": {"NEXP": NEXP, "TOPK": TOPK, "MOEF": MOEF},
+                },
+                {"m": "dense", "count": n_dense, "dims": {"DENSE_F": DENSE_F}},
+            ]
+            if x["count"] > 0
+        ],
+    }
+
+
+@register_composer("BailingMoeV3ForCausalLM")
+def _compose_bailing_moe_v3(config, moe_m="fused_moe_v2") -> dict:
+    """Ling3 / BailingMoeV3: hybrid KDA (linear/recurrent) + MLA (latent) attention
+    + MoE with an always-on shared expert. The LAST layer of every
+    ``layer_group_size`` group is MLA (full attention); the rest are KDA. The first
+    ``first_k_dense_replace`` layers are dense MLP, the rest MoE (each MoE layer also
+    runs the shared expert). MoE-kernel module is configurable (default fused-v2)."""
+    L = _cfg(config, "num_hidden_layers")
+    gsz = _cfg(config, "layer_group_size", default=1)
+    n_mla = sum(1 for i in range(L) if (i + 1) % gsz == 0)
+    n_kda = L - n_mla
+    nh = _cfg(config, "num_attention_heads")
+    mla = {
+        "nh": nh,
+        "qk_nope": _cfg(config, "qk_nope_head_dim"),
+        "qk_rope": _cfg(config, "qk_rope_head_dim"),
+        "v_head": _cfg(config, "v_head_dim"),
+        "kv_lora": _cfg(config, "kv_lora_rank"),
+        "q_lora": _cfg(config, "q_lora_rank") or 0,
+    }
+    kda = {
+        "nh": nh,
+        "hd": _cfg(config, "head_dim"),
+        "conv": _cfg(config, "short_conv_kernel_size", default=4),
+    }
+    NEXP = _cfg(config, "num_experts", "n_routed_experts", default=0)
+    TOPK = _cfg(config, "num_experts_per_tok", default=8)
+    MOEF = _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size"))
+    DENSE_F = _cfg(config, "intermediate_size")
+    fkd = _cfg(config, "first_k_dense_replace", default=0)
+    n_shared = _cfg(config, "num_shared_experts", default=0)
+    SHF = _cfg(config, "moe_shared_expert_intermediate_size", default=MOEF) * max(1, n_shared)
+    n_moe = max(0, L - fkd)
+    n_dense = fkd
+    return {
+        "attn": [
+            x
+            for x in [
+                {"m": "kda", "count": n_kda, "dims": kda},
+                {"m": "mla", "count": n_mla, "dims": mla},
+            ]
+            if x["count"] > 0
+        ],
+        "ffn": [
+            x
+            for x in [
+                {"m": moe_m, "count": n_moe, "dims": {"NEXP": NEXP, "TOPK": TOPK, "MOEF": MOEF}},
+                {
+                    "m": "shared_expert",
+                    "count": n_moe if n_shared > 0 else 0,
+                    "dims": {"SHF": SHF},
                 },
                 {"m": "dense", "count": n_dense, "dims": {"DENSE_F": DENSE_F}},
             ]
@@ -406,7 +488,7 @@ def _bake(arch, config, peaks: HardwarePeaks, defaults: dict) -> dict:
         "TOPK": _cfg(config, "num_experts_per_tok", default=2),
         "MOEF": _cfg(config, "moe_intermediate_size", default=_cfg(config, "intermediate_size")),
         "DENSE_F": _cfg(config, "intermediate_size"),
-        "composition": _compose(arch, config),
+        "composition": _compose(arch, config, defaults),
         "jaxpr": _bake_jaxpr(arch, config),
         "moe_blocks": _bake_moe_block_table(config),
         "rpa_blocks": _bake_rpa_block_table(config),
@@ -649,6 +731,149 @@ const MODULES = {
         {name:"silu",cat:"other",o:elt(ctx.tokens,F,1)},
         {name:"down_proj",cat:"linear",o:gemm(ctx.tokens,F,D.H,"mlp"),shard:ctx.t},
       ];
+    },
+  },
+  // ---- MLA (DeepSeek latent attention, absorbed/MQA-over-latent) ----
+  mla: {
+    kind:"attn",
+    label(){return "MLA attention (per device, %PH%) — latent KV";},
+    flow(){return "MLA";},
+    headDiv(dims){return dims.nh;},
+    costRows(ctx,dims){
+      const nh=dims.nh, qkn=dims.qk_nope, qkr=dims.qk_rope, qkh=qkn+qkr, vh=dims.v_head, kvl=dims.kv_lora, ql=dims.q_lora||0, t=ctx.t;
+      const rows=[];
+      // Q projection: flat (q_lora=0) or LoRA down/up + norm
+      if(ql>0){ rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,ql,"qkv"), shard:t});
+        rows.push({cat:"norm", o:rms(ctx.tokens,ql)});
+        rows.push({cat:"linear", o:gemm(ctx.tokens,ql,nh*qkh,"qkv"), shard:t}); }
+      else rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,nh*qkh,"qkv"), shard:t});
+      // KV-A compress (latent kv_lora + rope), shared across heads (replicated); + norm
+      rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,kvl+qkr,"qkv")});
+      rows.push({cat:"norm", o:rms(ctx.tokens,kvl)});
+      // KV-B up-proj (absorbed W_UK/W_UV), per-head, head-sharded
+      rows.push({cat:"linear", o:gemm(ctx.tokens,kvl,nh*(qkn+vh),"qkv"), shard:t});
+      // rope on q_rope (nh*qkr) + k_rope (qkr, 1 latent head)
+      rows.push({cat:"rope", o:rope(ctx.tokens,nh*qkr,qkr), shard:t});
+      // absorbed attention: MQA over the latent (qk dim = kvl+qkr, v dim = kvl, nkv=1)
+      const eff=ctx.ctxlen, inter=ctx.tokens*(ctx.decode?eff:eff/2);
+      rows.push({cat:"attention", o:attention(Math.max(1,Math.floor(nh/t)),1,kvl+qkr,kvl,ctx.tokens,inter,ctx.decode?1:32)});
+      // head-wise output gate g_proj (H->nh), then o_proj + TP reduce
+      rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,nh,"qkv"), shard:t});
+      rows.push({cat:"o_proj", o:gemm(ctx.tokens,nh*vh,D.H,"o_proj"), shard:t});
+      rows.push({cat:"o_proj", o:{flops:0,hbm:0,ici:rowReduce(ctx.tokens,D.H,ctx.L),peak:"bf16"}});
+      rows.push({cat:"norm", o:rms(ctx.tokens,D.H), mult:2});
+      rows.push({cat:"other", o:elt(ctx.tokens,D.H,2), mult:2});
+      return rows;
+    },
+    chain(ctx,dims){
+      const nh=dims.nh, qkn=dims.qk_nope, qkr=dims.qk_rope, qkh=qkn+qkr, vh=dims.v_head, kvl=dims.kv_lora, ql=dims.q_lora||0, t=ctx.t;
+      const eff=ctx.ctxlen, inter=ctx.tokens*(ctx.decode?eff:eff/2);
+      const oproj=gemm(ctx.tokens,nh*vh,D.H,"o_proj"); oproj.ici=rowReduce(ctx.tokens,D.H,ctx.L);
+      return [
+        {name:"q_proj",cat:"linear",o:ql>0?gemm(ctx.tokens,ql,nh*qkh,"qkv"):gemm(ctx.tokens,D.H,nh*qkh,"qkv"),shard:t},
+        {name:"kv_a_proj (latent)",cat:"linear",o:gemm(ctx.tokens,D.H,kvl+qkr,"qkv")},
+        {name:"kv_b_proj (W_UK/W_UV)",cat:"linear",o:gemm(ctx.tokens,kvl,nh*(qkn+vh),"qkv"),shard:t},
+        {name:"rope",cat:"rope",o:rope(ctx.tokens,nh*qkr,qkr),shard:t},
+        {name:"attention (latent MQA)",cat:"attention",o:attention(Math.max(1,Math.floor(nh/t)),1,kvl+qkr,kvl,ctx.tokens,inter)},
+        {name:"o_proj +reduce",cat:"o_proj",o:oproj,shard:t},
+      ];
+    },
+  },
+  // ---- KDA (Kimi delta / gated-delta linear attention; recurrent state, no growing KV) ----
+  kda: {
+    kind:"attn",
+    label(){return "KDA linear attention (per device, %PH%) — recurrent state";},
+    flow(){return "KDA";},
+    headDiv(dims){return dims.nh;},
+    costRows(ctx,dims){
+      const nh=dims.nh, hd=dims.hd, proj=nh*hd, conv=dims.conv, t=ctx.t, nqh=Math.max(1,Math.floor(nh/t));
+      const rows=[];
+      // q,k,v,f,g projections (H -> proj), head-sharded; b_proj (H -> nh) tiny gate
+      for(let i=0;i<5;i++) rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,proj,"qkv"), shard:t});
+      rows.push({cat:"linear", o:gemm(ctx.tokens,D.H,nh,"qkv"), shard:t});
+      // short causal depthwise conv on q,k,v (kernel=conv): ~elementwise
+      rows.push({cat:"other", o:{flops:3*ctx.tokens*proj*conv*2, hbm:3*ctx.tokens*proj*2*2, ici:0, peak:"bf16"}});
+      // gated delta recurrent: per token/head state d_k x d_v (=hd x hd); ~4 ops/tok/head.
+      // HBM driver = recurrent state read+write (fp32), FIXED per token (no growing KV).
+      rows.push({cat:"attention", o:{flops:ctx.tokens*nqh*4*hd*hd, hbm:ctx.tokens*nqh*hd*2*3 + nqh*hd*hd*4*2, ici:0, peak:"bf16"}});
+      // o_norm (gated rms) + o_proj + TP reduce
+      rows.push({cat:"norm", o:rms(ctx.tokens,proj)});
+      rows.push({cat:"o_proj", o:gemm(ctx.tokens,proj,D.H,"o_proj"), shard:t});
+      rows.push({cat:"o_proj", o:{flops:0,hbm:0,ici:rowReduce(ctx.tokens,D.H,ctx.L),peak:"bf16"}});
+      rows.push({cat:"norm", o:rms(ctx.tokens,D.H), mult:2});
+      rows.push({cat:"other", o:elt(ctx.tokens,D.H,2), mult:2});
+      return rows;
+    },
+    chain(ctx,dims){
+      const nh=dims.nh, hd=dims.hd, proj=nh*hd, t=ctx.t, nqh=Math.max(1,Math.floor(nh/t));
+      const oproj=gemm(ctx.tokens,proj,D.H,"o_proj"); oproj.ici=rowReduce(ctx.tokens,D.H,ctx.L);
+      return [
+        {name:"qkv+fg proj (×5)",cat:"linear",o:{flops:5*2*ctx.tokens*D.H*proj, hbm:5*(2*D.H*proj+2*ctx.tokens*D.H+2*ctx.tokens*proj), ici:0, peak:"bf16"},shard:t},
+        {name:"short conv (q,k,v)",cat:"other",o:{flops:3*ctx.tokens*proj*dims.conv*2, hbm:3*ctx.tokens*proj*2*2, ici:0, peak:"bf16"}},
+        {name:"gated-delta recurrent",cat:"attention",o:{flops:ctx.tokens*nqh*4*hd*hd, hbm:ctx.tokens*nqh*hd*2*3+nqh*hd*hd*4*2, ici:0, peak:"bf16"}},
+        {name:"o_norm",cat:"norm",o:rms(ctx.tokens,proj)},
+        {name:"o_proj +reduce",cat:"o_proj",o:oproj,shard:t},
+      ];
+    },
+  },
+  // ---- EPMoE (expert-parallel MoE with explicit XLA all-to-all; Ling3 default backend) ----
+  ep_moe: {
+    kind:"ffn",
+    label(){return "EPMoE experts (per device, per layer)";},
+    flow(){return "MoE";},
+    costRows(ctx,dims){
+      const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const e=moe(tpd, NEXP/ctx.ep, D.H, MOEF, "experts");
+      e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote + rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {cat:"router", o:router(ctx.tokens,D.H,NEXP)}, {cat:"moe", o:e} ];
+    },
+    chain(ctx,dims){
+      const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const e=moe(tpd,NEXP/ctx.ep,D.H,MOEF,"experts"); e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote+rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {name:"router_gate",cat:"router",o:router(ctx.tokens,D.H,NEXP)}, {name:"experts +a2a (XLA)",cat:"moe",o:e} ];
+    },
+  },
+  // ---- shared expert (always-on dense MLP that runs alongside the routed experts) ----
+  shared_expert: {
+    kind:"ffn",
+    label(){return "shared expert (dense MLP, per MoE layer)";},
+    flow(){return "shared";},
+    costRows(ctx,dims){
+      const F=dims.SHF;
+      return [
+        {cat:"linear", o:gemm(ctx.tokens,D.H,2*F,"mlp"), shard:ctx.t},
+        {cat:"linear", o:gemm(ctx.tokens,F,D.H,"mlp"), shard:ctx.t},
+        {cat:"other", o:elt(ctx.tokens,F,1)},
+      ];
+    },
+    chain(ctx,dims){
+      const F=dims.SHF;
+      return [
+        {name:"shared gate_up",cat:"linear",o:gemm(ctx.tokens,D.H,2*F,"mlp"),shard:ctx.t},
+        {name:"shared silu",cat:"other",o:elt(ctx.tokens,F,1)},
+        {name:"shared down",cat:"linear",o:gemm(ctx.tokens,F,D.H,"mlp"),shard:ctx.t},
+      ];
+    },
+  },
+  // ---- fused-MoE-v1 (older fused MoE; same expert math as v2, explicit a2a) ----
+  fused_moe_v1: {
+    kind:"ffn",
+    label(){return "fused-MoE-v1 experts (per device, per layer)";},
+    flow(){return "MoE";},
+    costRows(ctx,dims){
+      const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const e=moe(tpd, NEXP/ctx.ep, D.H, MOEF, "experts");
+      e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote + rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {cat:"router", o:router(ctx.tokens,D.H,NEXP)}, {cat:"moe", o:e} ];
+    },
+    chain(ctx,dims){
+      const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+      const mt=ctx.tokens*ctx.L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ctx.ep)), remote=ctx.ep>1?(ctx.ep-1)/ctx.ep:0;
+      const e=moe(tpd,NEXP/ctx.ep,D.H,MOEF,"experts"); e.ici=2*(mt*TOPK/ctx.ep)*D.H*2*remote+rowReduce(ctx.tokens,D.H,ctx.L);
+      return [ {name:"router_gate",cat:"router",o:router(ctx.tokens,D.H,NEXP)}, {name:"experts +a2a",cat:"moe",o:e} ];
     },
   },
 };
