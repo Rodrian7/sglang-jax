@@ -367,6 +367,7 @@ def _fused_ep_moe_kernel(
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
     same_expert_w13_early_start: bool = False,
+    same_expert_after_use_start: bool = False,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     direct_scaled_dot: bool = False,
@@ -1658,6 +1659,12 @@ def _fused_ep_moe_kernel(
                     slot = bf_id % 2
 
                     next_bf_id = bf_id + 2
+                    can_same_expert_after_use_start = (
+                        same_expert_after_use_start
+                        and direct_scaled_dot_ffn1
+                        and w1_scale_hbm is not None
+                        and bt <= 16
+                    )
 
                     if direct_scaled_dot_ffn1 and w1_scale_hbm is not None and bt <= 16:
                         wait_fetch_w1(slot)
@@ -1695,6 +1702,9 @@ def _fused_ep_moe_kernel(
                         with jax.named_scope("expert/ffn1/gate"):
                             lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
 
+                        if can_same_expert_after_use_start and next_bf_id < num_bf:
+                            start_fetch_w1(local_e_id, slot, next_bf_id, priority=1)
+
                         wait_fetch_w3(slot)
 
                         def _up_only_btc(btc_id, ___):
@@ -1729,6 +1739,9 @@ def _fused_ep_moe_kernel(
 
                         with jax.named_scope("expert/ffn1/up"):
                             lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
+
+                        if can_same_expert_after_use_start and next_bf_id < num_bf:
+                            start_fetch_w3(local_e_id, slot, next_bf_id, priority=1)
 
                     elif direct_scaled_dot_ffn1 and w1_scale_hbm is not None:
                         wait_fetch_w1(slot)
@@ -2024,6 +2037,7 @@ def _fused_ep_moe_kernel(
 
                     if (
                         same_expert_w13_early_start
+                        and not can_same_expert_after_use_start
                         and not ffn1_stream_chunked_down
                         and next_bf_id < num_bf
                     ):
@@ -2114,7 +2128,9 @@ def _fused_ep_moe_kernel(
 
                     # W2 still waits until down has consumed the current slot.
                     if next_bf_id < num_bf:
-                        if ffn1_stream_chunked_down or not same_expert_w13_early_start:
+                        if ffn1_stream_chunked_down or (
+                            not same_expert_w13_early_start and not can_same_expert_after_use_start
+                        ):
                             start_fetch_w13_w2(local_e_id, slot, next_bf_id)
                         else:
                             start_fetch_w2(
@@ -2775,6 +2791,7 @@ def jax_allreduce_metadata_by_bt(
         "w2_fetch_order",
         "w2_fetch_priority",
         "same_expert_w13_early_start",
+        "same_expert_after_use_start",
         "skip_inter_bt_sync",
         "interleave_bt",
         "metadata_window_prefetch_first_expert",
@@ -2857,6 +2874,7 @@ def fused_ep_moe_v2(
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
     same_expert_w13_early_start: bool = False,
+    same_expert_after_use_start: bool = False,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
     metadata_window_prefetch_first_expert: bool = False,
@@ -3035,6 +3053,8 @@ def fused_ep_moe_v2(
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
     if same_expert_w13_early_start:
         scope_name += "-same_expert_w13_early"
+    if same_expert_after_use_start:
+        scope_name += "-same_expert_after_use"
     if not pad_topk_to_128:
         scope_name += "-topk_no_pad"
     if route_smem_topk_only:
@@ -3266,6 +3286,7 @@ def fused_ep_moe_v2(
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
                 same_expert_w13_early_start=same_expert_w13_early_start,
+                same_expert_after_use_start=same_expert_after_use_start,
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 direct_scaled_dot=direct_scaled_dot,

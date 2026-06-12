@@ -120,6 +120,7 @@ class FusedEPMoE(nnx.Module):
         w2_fetch_order: str = "after_w13",
         w2_fetch_priority: int = 1,
         same_expert_w13_early_start: bool = False,
+        same_expert_after_use_start: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -195,6 +196,7 @@ class FusedEPMoE(nnx.Module):
         self.w2_fetch_order = w2_fetch_order
         self.w2_fetch_priority = w2_fetch_priority
         self.same_expert_w13_early_start = same_expert_w13_early_start
+        self.same_expert_after_use_start = same_expert_after_use_start
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -722,6 +724,7 @@ class FusedEPMoEV2(FusedEPMoE):
             w2_fetch_order=self.w2_fetch_order,
             w2_fetch_priority=self.w2_fetch_priority,
             same_expert_w13_early_start=self.same_expert_w13_early_start,
+            same_expert_after_use_start=self.same_expert_after_use_start,
             skip_inter_bt_sync=True,
             dp_axis_name="data",
             tp_axis_name="tensor",

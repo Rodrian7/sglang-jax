@@ -632,6 +632,7 @@ def run_all(
     w2_fetch_order: str = "after_w13",
     w2_fetch_priority: int = 1,
     same_expert_w13_early_start: bool = False,
+    same_expert_after_use_start: bool = False,
     return_results: bool = False,
 ) -> list[dict[str, object]] | None:
     use_shared_expert = False  # lean decode tuner: omitted
@@ -904,6 +905,7 @@ def run_all(
                 w2_fetch_order=w2_fetch_order,
                 w2_fetch_priority=w2_fetch_priority,
                 same_expert_w13_early_start=same_expert_w13_early_start,
+                same_expert_after_use_start=same_expert_after_use_start,
             )
             if quantization_config is not None:
                 if quant_block_k is not None:
@@ -1510,6 +1512,11 @@ def parse_args() -> argparse.Namespace:
         help="Start same-expert next-bf W1/W3 before current W2 wait/down; W2 stays after down.",
     )
     parser.add_argument(
+        "--same-expert-after-use-start",
+        action="store_true",
+        help="Start same-expert next-bf W1 after gate and W3 after up; W2 stays after down.",
+    )
+    parser.add_argument(
         "--tpu-vmem-budget-mb",
         type=int,
         default=DEFAULT_TPU_VMEM_BUDGET_MB,
@@ -1647,6 +1654,7 @@ if __name__ == "__main__":
             w2_fetch_order=args.w2_fetch_order,
             w2_fetch_priority=args.w2_fetch_priority,
             same_expert_w13_early_start=args.same_expert_w13_early_start,
+            same_expert_after_use_start=args.same_expert_after_use_start,
             return_results=True,
         )
     except BaseException as e:
