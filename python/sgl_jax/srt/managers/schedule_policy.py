@@ -418,6 +418,7 @@ class PrefillAdder:
             )
         if _rem_tokens <= 0:
             if self.is_hybrid:
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices)]
                 return req
             _rem_tokens = self.rem_chunk_tokens_list[dp_rank]
         truncated = req.extend_input_len > _rem_tokens
