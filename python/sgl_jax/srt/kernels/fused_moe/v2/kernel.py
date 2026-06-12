@@ -1655,7 +1655,12 @@ def _fused_ep_moe_kernel(
             def bts_body(bts_id, next_bf0_prefetched):
                 tile_start = bts_id * bts
                 x_slot = bts_id % jnp.int32(2) if expert_input_double_buffer else jnp.int32(0)
-                x_vmem = b_x_vmem[x_slot] if expert_input_double_buffer else b_x_vmem
+
+                def get_x_slice(btc_id, p_id, k_slice):
+                    row_slice = pl.ds(btc_id * btc, btc)
+                    if expert_input_double_buffer:
+                        return b_x_vmem[x_slot, row_slice, p_id, k_slice]
+                    return b_x_vmem[row_slice, p_id, k_slice]
 
                 with jax.named_scope("expert/input/load"):
                     if expert_input_double_buffer:
@@ -1715,11 +1720,9 @@ def _fused_ep_moe_kernel(
 
                                     def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
                                         sg_off = sg_id * quant_block_k
-                                        x_slice = x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            _pid,
-                                            pl.ds(sg_off, quant_block_k),
-                                        ]
+                                        x_slice = get_x_slice(
+                                            btc_id, _pid, pl.ds(sg_off, quant_block_k)
+                                        )
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[
                                             slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)
@@ -1753,11 +1756,9 @@ def _fused_ep_moe_kernel(
 
                                     def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
                                         sg_off = sg_id * quant_block_k
-                                        x_slice = x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            _pid,
-                                            pl.ds(sg_off, quant_block_k),
-                                        ]
+                                        x_slice = get_x_slice(
+                                            btc_id, _pid, pl.ds(sg_off, quant_block_k)
+                                        )
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w3_tile = b_w3_x2_vmem[
                                             slot, _pid, pl.ds(sg_off, quant_block_k), pl.ds(0, bf)
@@ -1795,11 +1796,9 @@ def _fused_ep_moe_kernel(
                                     def _ffn1_sg_body(sg_id, carry):
                                         gate_acc, up_acc = carry
                                         sg_off = sg_id * quant_block_k
-                                        x_slice = x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            p_id,
-                                            pl.ds(sg_off, quant_block_k),
-                                        ]
+                                        x_slice = get_x_slice(
+                                            btc_id, p_id, pl.ds(sg_off, quant_block_k)
+                                        )
                                         x_slice = maybe_cast_ffn1_input(x_slice)
                                         w1_tile = b_w1_x2_vmem[
                                             slot,
@@ -1878,11 +1877,7 @@ def _fused_ep_moe_kernel(
                                     )
                                     if not disable_dynamic_ffn1:
                                         for p_id in range(t_packing):
-                                            x_slice = x_vmem[
-                                                pl.ds(btc_id * btc, btc),
-                                                p_id,
-                                                pl.ds(0, h_per_t),
-                                            ]
+                                            x_slice = get_x_slice(btc_id, p_id, pl.ds(0, h_per_t))
                                             w1_tile = b_w1_dq_vmem[
                                                 p_id,
                                                 pl.ds(0, h_per_t),
@@ -1925,11 +1920,7 @@ def _fused_ep_moe_kernel(
                                     )
                                 if not disable_dynamic_ffn1:
                                     for p_id in range(t_packing):
-                                        x_slice = x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            p_id,
-                                            pl.ds(0, h_per_t),
-                                        ]
+                                        x_slice = get_x_slice(btc_id, p_id, pl.ds(0, h_per_t))
                                         if ffn1_stream_chunked_down:
                                             w3_tile = b_w1_dq_vmem[
                                                 p_id,
@@ -2033,9 +2024,7 @@ def _fused_ep_moe_kernel(
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
                             if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
-                                    x_slice = x_vmem[
-                                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                    ]
+                                    x_slice = get_x_slice(btc_id, p_id, pl.ds(0, h_per_t))
                                     x_slice = maybe_cast_ffn1_input(x_slice)
                                     w1_tile = (
                                         b_w1_dq_vmem[p_id]
