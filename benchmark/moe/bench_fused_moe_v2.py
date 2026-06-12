@@ -610,6 +610,7 @@ def run_all(
     disable_w3_scale_apply: bool = False,
     disable_w2_scale_apply: bool = False,
     disable_expert_x_load: bool = False,
+    expert_input_double_buffer: bool = False,
     disable_expert_ffn: bool = False,
     disable_expert_store: bool = False,
     disable_expert_stage_writeback: bool = False,
@@ -739,6 +740,7 @@ def run_all(
             "disable_w3_scale_apply": disable_w3_scale_apply,
             "disable_w2_scale_apply": disable_w2_scale_apply,
             "disable_expert_x_load": disable_expert_x_load,
+            "expert_input_double_buffer": expert_input_double_buffer,
             "disable_expert_ffn": disable_expert_ffn,
             "disable_expert_store": disable_expert_store,
             "disable_expert_stage_writeback": disable_expert_stage_writeback,
@@ -876,6 +878,7 @@ def run_all(
                 disable_w3_scale_apply=disable_w3_scale_apply,
                 disable_w2_scale_apply=disable_w2_scale_apply,
                 disable_expert_x_load=disable_expert_x_load,
+                expert_input_double_buffer=expert_input_double_buffer,
                 disable_expert_ffn=disable_expert_ffn,
                 disable_expert_store=disable_expert_store,
                 disable_expert_stage_writeback=disable_expert_stage_writeback,
@@ -1407,6 +1410,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-w3-scale-apply", action="store_true")
     parser.add_argument("--disable-w2-scale-apply", action="store_true")
     parser.add_argument("--disable-expert-x-load", action="store_true")
+    parser.add_argument(
+        "--expert-input-double-buffer",
+        action="store_true",
+        help="Double-buffer expert input token staging across bts tiles.",
+    )
     parser.add_argument("--disable-expert-ffn", action="store_true")
     parser.add_argument("--disable-expert-store", action="store_true")
     parser.add_argument("--disable-expert-stage-writeback", action="store_true")
@@ -1632,6 +1640,7 @@ if __name__ == "__main__":
             or args.disable_scale_apply
             or args.disable_w2_scale_apply,
             disable_expert_x_load=disable_all or args.disable_expert_x_load,
+            expert_input_double_buffer=args.expert_input_double_buffer,
             disable_expert_ffn=args.disable_expert_ffn,
             disable_expert_store=disable_all or args.disable_expert_store,
             disable_expert_stage_writeback=disable_all or args.disable_expert_stage_writeback,

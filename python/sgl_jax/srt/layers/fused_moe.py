@@ -92,6 +92,7 @@ class FusedEPMoE(nnx.Module):
         disable_w3_scale_apply: bool = False,
         disable_w2_scale_apply: bool = False,
         disable_expert_x_load: bool = False,
+        expert_input_double_buffer: bool = False,
         disable_expert_ffn: bool = False,
         disable_expert_store: bool = False,
         disable_expert_stage_writeback: bool = False,
@@ -164,6 +165,7 @@ class FusedEPMoE(nnx.Module):
         self.disable_w3_scale_apply = disable_w3_scale_apply
         self.disable_w2_scale_apply = disable_w2_scale_apply
         self.disable_expert_x_load = disable_expert_x_load
+        self.expert_input_double_buffer = expert_input_double_buffer
         self.disable_expert_ffn = disable_expert_ffn
         self.disable_expert_store = disable_expert_store
         self.disable_expert_stage_writeback = disable_expert_stage_writeback
@@ -683,6 +685,7 @@ class FusedEPMoEV2(FusedEPMoE):
             disable_w3_scale_apply=self.disable_w3_scale_apply,
             disable_w2_scale_apply=self.disable_w2_scale_apply,
             disable_expert_x_load=self.disable_expert_x_load,
+            expert_input_double_buffer=self.expert_input_double_buffer,
             disable_expert_ffn=self.disable_expert_ffn,
             disable_expert_store=self.disable_expert_store,
             disable_expert_stage_writeback=self.disable_expert_stage_writeback,

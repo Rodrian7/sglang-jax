@@ -287,7 +287,7 @@ def _fused_ep_moe_kernel(
     b_gate_acc_vmem,  # None | (bts, bf|ffn1_dequant_chunk) f32
     b_up_acc_vmem,  # None | (bts, bf) f32
     # Token staging per bts tile
-    b_x_vmem,  # (bts, t_packing, h_per_t) bf16
+    b_x_vmem,  # (bts, t_packing, h_per_t) bf16 or (2, bts, t_packing, h_per_t)
     # Output accumulator per bts tile
     b_y_acc_vmem,  # (bts, t_packing, h_per_t) f32
     # Output staging for HBM read-modify-write per bts tile
@@ -299,7 +299,7 @@ def _fused_ep_moe_kernel(
     b_se_w2_x2_vmem,  # None | (2, t_packing, bse, h_per_t)
     b_se_acc_vmem,  # None | (2, bt, hidden_size) f32
     # --- Semaphores ---
-    x_stage_sem,  # DMA(1,) — token staging
+    x_stage_sem,  # DMA(1|2,) — token staging
     y_store_sem,  # DMA(1,) — output store from y_acc
     local_sems,  # DMA(2, 10) — weight + topk + output + metadata
     send_x2_sems,  # DMA(expert_buffer_count,) or DMA(2, expert_buffer_count)
@@ -342,6 +342,7 @@ def _fused_ep_moe_kernel(
     disable_w3_scale_apply: bool = False,
     disable_w2_scale_apply: bool = False,
     disable_expert_x_load: bool = False,
+    expert_input_double_buffer: bool = False,
     disable_expert_ffn: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
@@ -1614,22 +1615,48 @@ def _fused_ep_moe_kernel(
             # Tokens load once per bts tile, reused across all bf tiles.
             # Weights re-prefetch per bts tile (redundant when num_bts_tiles=1,
             # which is the common case — avg ~20 tokens per expert).
+            def start_input_load(load_slot, load_bts_id):
+                if disable_expert_x_load:
+                    return
+                load_tile_start = load_bts_id * bts
+                dst_ref = b_x_vmem[load_slot] if expert_input_double_buffer else b_x_vmem
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, load_tile_start, bts),
+                    dst_ref=dst_ref,
+                    sem=x_stage_sem.at[load_slot],
+                ).start(priority=1)
+
+            def wait_input_load(load_slot):
+                if disable_expert_x_load:
+                    return
+                ref = b_x_vmem[load_slot] if expert_input_double_buffer else b_x_vmem
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=x_stage_sem.at[load_slot],
+                ).wait()
+
+            if expert_input_double_buffer:
+                with jax.named_scope("expert/input/load"):
+                    start_input_load(jnp.int32(0), jnp.int32(0))
+
             def bts_body(bts_id, next_bf0_prefetched):
                 tile_start = bts_id * bts
+                x_slot = bts_id % jnp.int32(2) if expert_input_double_buffer else jnp.int32(0)
+                x_vmem = b_x_vmem[x_slot] if expert_input_double_buffer else b_x_vmem
 
-                if not disable_expert_x_load:
-                    with jax.named_scope("expert/input/load"):
-                        # Load tokens for this bts tile once; weights reuse it across bf tiles.
-                        pltpu.make_async_copy(
-                            src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
-                            dst_ref=b_x_vmem,
-                            sem=x_stage_sem.at[0],
-                        ).start(priority=1)
-                        pltpu.make_async_copy(
-                            src_ref=b_x_vmem,
-                            dst_ref=b_x_vmem,
-                            sem=x_stage_sem.at[0],
-                        ).wait()
+                with jax.named_scope("expert/input/load"):
+                    if expert_input_double_buffer:
+                        wait_input_load(x_slot)
+                        next_bts_id = bts_id + jnp.int32(1)
+
+                        @pl.when(next_bts_id < num_bts_tiles)
+                        def _start_next_input_load():
+                            start_input_load(next_bts_id % jnp.int32(2), next_bts_id)
+
+                    else:
+                        start_input_load(jnp.int32(0), bts_id)
+                        wait_input_load(jnp.int32(0))
 
                 if can_cross_expert_prefetch:
                     use_prefetched_bf0 = jnp.logical_and(bf0_prefetched, bts_id == jnp.int32(0))
@@ -1676,7 +1703,7 @@ def _fused_ep_moe_kernel(
 
                                     def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
                                         sg_off = sg_id * quant_block_k
-                                        x_slice = b_x_vmem[
+                                        x_slice = x_vmem[
                                             pl.ds(btc_id * btc, btc),
                                             _pid,
                                             pl.ds(sg_off, quant_block_k),
@@ -1714,7 +1741,7 @@ def _fused_ep_moe_kernel(
 
                                     def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
                                         sg_off = sg_id * quant_block_k
-                                        x_slice = b_x_vmem[
+                                        x_slice = x_vmem[
                                             pl.ds(btc_id * btc, btc),
                                             _pid,
                                             pl.ds(sg_off, quant_block_k),
@@ -1756,7 +1783,7 @@ def _fused_ep_moe_kernel(
                                     def _ffn1_sg_body(sg_id, carry):
                                         gate_acc, up_acc = carry
                                         sg_off = sg_id * quant_block_k
-                                        x_slice = b_x_vmem[
+                                        x_slice = x_vmem[
                                             pl.ds(btc_id * btc, btc),
                                             p_id,
                                             pl.ds(sg_off, quant_block_k),
@@ -1839,7 +1866,7 @@ def _fused_ep_moe_kernel(
                                     )
                                     if not disable_dynamic_ffn1:
                                         for p_id in range(t_packing):
-                                            x_slice = b_x_vmem[
+                                            x_slice = x_vmem[
                                                 pl.ds(btc_id * btc, btc),
                                                 p_id,
                                                 pl.ds(0, h_per_t),
@@ -1886,7 +1913,7 @@ def _fused_ep_moe_kernel(
                                     )
                                 if not disable_dynamic_ffn1:
                                     for p_id in range(t_packing):
-                                        x_slice = b_x_vmem[
+                                        x_slice = x_vmem[
                                             pl.ds(btc_id * btc, btc),
                                             p_id,
                                             pl.ds(0, h_per_t),
@@ -1994,7 +2021,7 @@ def _fused_ep_moe_kernel(
                             up = jnp.zeros((btc, bf), dtype=jnp.float32)
                             if not disable_dynamic_ffn1:
                                 for p_id in range(t_packing):
-                                    x_slice = b_x_vmem[
+                                    x_slice = x_vmem[
                                         pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
                                     ]
                                     x_slice = maybe_cast_ffn1_input(x_slice)
@@ -2755,6 +2782,7 @@ def jax_allreduce_metadata_by_bt(
         "disable_w3_scale_apply",
         "disable_w2_scale_apply",
         "disable_expert_x_load",
+        "expert_input_double_buffer",
         "disable_expert_ffn",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
@@ -2834,6 +2862,7 @@ def fused_ep_moe_v2(
     disable_w3_scale_apply: bool = False,
     disable_w2_scale_apply: bool = False,
     disable_expert_x_load: bool = False,
+    expert_input_double_buffer: bool = False,
     disable_expert_ffn: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
@@ -3050,6 +3079,8 @@ def fused_ep_moe_v2(
         scope_name += f"-ffn1_fchunk_{ffn1_dequant_chunk}"
     if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
         scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
+    if expert_input_double_buffer:
+        scope_name += "-x2input"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
     if same_expert_w13_early_start:
         scope_name += "-same_expert_w13_early"
@@ -3176,7 +3207,11 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, gate_acc_scratch_bf), jnp.float32),  # gate_acc
         (None if use_ffn1_stream_chunked_down else pltpu.VMEM((bts, bf), jnp.float32)),  # up_acc
         # VMEM: token staging per bts tile
-        pltpu.VMEM((bts, t_packing, h_per_t), t_dtype),  # x
+        (
+            pltpu.VMEM((2, bts, t_packing, h_per_t), t_dtype)
+            if expert_input_double_buffer
+            else pltpu.VMEM((bts, t_packing, h_per_t), t_dtype)
+        ),  # x
         # VMEM: output accumulator per bts tile (fp32)
         pltpu.VMEM((bts, t_packing, h_per_t), jnp.float32),  # y_acc
         # VMEM: output staging for HBM writeback per bts tile
@@ -3200,7 +3235,7 @@ def fused_ep_moe_v2(
             None if w1_shared is None else pltpu.VMEM((smem_banks, bt, hidden_size), jnp.float32)
         ),  # se_acc
         # Semaphores
-        pltpu.SemaphoreType.DMA((1,)),  # x_stage
+        pltpu.SemaphoreType.DMA((2 if expert_input_double_buffer else 1,)),  # x_stage
         pltpu.SemaphoreType.DMA((1,)),  # y_store
         pltpu.SemaphoreType.DMA((smem_banks, 10)),  # local_sems
         (
@@ -3261,6 +3296,7 @@ def fused_ep_moe_v2(
                 disable_w3_scale_apply=disable_w3_scale_apply,
                 disable_w2_scale_apply=disable_w2_scale_apply,
                 disable_expert_x_load=disable_expert_x_load,
+                expert_input_double_buffer=expert_input_double_buffer,
                 disable_expert_ffn=disable_expert_ffn,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,
