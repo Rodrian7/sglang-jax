@@ -594,7 +594,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
  </div>
  <div id="right">
   <div class="scennav" id="scennav">
-   <button data-sc="overview" class="on">Overview</button><button data-sc="overlap">Overlap</button><button data-sc="kernel">Kernel</button><button data-sc="fusion">Fusion</button><button data-sc="trace">Trace</button>
+   <button data-sc="overview" class="on">Overview</button><button data-sc="overlap">Overlap</button><button data-sc="kernel">Kernel</button><button data-sc="pipeline">Pipeline</button><button data-sc="fusion">Fusion</button><button data-sc="trace">Trace</button>
   </div>
   <div id="scenhelp" class="scenhelp"></div>
   <div id="body"></div>
@@ -1226,6 +1226,64 @@ function lensFusion(s,R){
   h+="</tbody></table>";
   h+="<div class='verdict v-go'>Theory upper bound ≈ <b>"+fmt(totGB)+" GB</b> ≈ "+(R.tot>0?(totMs/R.tot*100).toFixed(0):0)+"% of step. But per the HLO: the <b>epilogue</b> + in-<b>kernel</b> fusions are <b>already done</b> by XLA; the only unrealised ones are <b>matmul prologues</b>, which TPU's MXU does not fuse anyway (the normed activation must materialise before the matmul). → <b>fusion is not a lever here.</b></div>";
   return h;}
+// ---------- Pipeline lens (fused-MoE-v2 Strix double-buffer kernel) ----------
+// Engine-occupancy lanes (cost-driven, live) + the verified 3-layer overlap
+// schematic. The kernel is ONE Pallas program/device; six engines run concurrently
+// and the design makes wall ≈ max(engine) via nested double-buffering.
+function pgRow(name, cells){
+  let r="<div style='display:flex;align-items:center;margin:3px 0'>"
+    +"<div style='flex:0 0 120px;color:#445;font-size:11px;font-weight:600'>"+name+"</div>"
+    +"<div style='flex:1 1 auto;display:flex;gap:2px'>";
+  for(const c of cells){const w=c[2]||1; r+="<div style='flex:"+w+" "+w+" 0;min-width:0;background:"+c[1]+";color:#fff;border-radius:3px;padding:2px 4px;text-align:center;white-space:nowrap;overflow:hidden;font-size:10px'>"+c[0]+"</div>";}
+  return r+"</div></div>";
+}
+function lensPipeline(s,R){
+  const comp=D.composition||{ffn:[]};
+  const m=(comp.ffn||[]).find(f=>/^fused_moe_v2$/.test(f.m));
+  if(!m) return "<div class='lh'>Pipeline — fused-MoE-v2 kernel</div><div class='note'>This view models the <b>fused-MoE-v2</b> Strix double-buffer kernel. This model's MoE backend is <b>"+((comp.ffn||[]).map(f=>f.m).join(", ")||"none")+"</b> — regenerate with <span class='mono'>--moe-backend fused_v2</span> (or pick a fused-v2 model) to see the pipeline.</div>";
+  const dims=m.dims, ep=R.L.ep, L=R.L, tokens=R.tokens, decode=R.decode;
+  const NEXP=dims.NEXP,TOPK=dims.TOPK,MOEF=dims.MOEF;
+  const E=NEXP/ep, d=D.H, f=MOEF, mt=tokens*L.dp, tpd=Math.max(1,Math.floor(mt*TOPK/ep)), q=Q.wq!=="bf16", remote=ep>1?(ep-1)/ep:0;
+  const wB=E*(q?(2*wbytes(d,f)+wbytes(f,d)):(2*2*d*f+2*f*d));
+  const flops=2*tpd*3*d*f, a2aB=2*(mt*TOPK/ep)*d*2*remote, peak=wpeak();
+  // the three roofline engines the kernel overlaps (per device, one MoE layer)
+  const tW=wB/HBMBW*1e3, tM=flops/flops_per_s(peak)*1e3, tS=(a2aB/2)/ICIBW*1e3, tG=(a2aB/2)/ICIBW*1e3, tICI=tS+tG;
+  const wall=Math.max(tW,tM,tICI), serial=tW+tM+tICI;
+  const bk= wall===tICI&&tICI>0?"ICI":(wall===tM?"compute":"HBM");
+  const bound= bk==="ICI"?"ICI · a2a":(bk==="compute"?"compute · MXU":"HBM · weights");
+  const mx=Math.max(wall,1e-9);
+  let h="<div class='lh'>Pipeline — fused-MoE-v2 (per device · one MoE layer · "+(decode?"decode":"prefill")+")</div>";
+  h+="<div class='note'>One Pallas program per EP device; six engines run concurrently, hand-scheduled by semaphores. The kernel's job is to drive wall-time → <b>max(engine)</b> (perfect overlap) via three nested double-buffer layers — so below, the <b>longest lane is the floor</b> and the rest should hide under it.</div>";
+  h+=kbar("DMA · weight-load (W1/W3/W2, ×2 buf)", tW, mx, "#d62728");
+  h+=kbar("MXU · GMM1 gate/up + GMM2 down", tM, mx, "#22c55e");
+  h+=kbar("DMA · a2a scatter (dispatch)", tS, mx, "#ec4899");
+  h+=kbar("DMA · a2a gather (combine)", tG, mx, "#db2777");
+  h+="<div class='note'>perfect-overlap floor = max = <b>"+fms(wall)+"</b> → <span class='tag b-"+bk+"'>"+bound+"-bound</span> · serial (no overlap) = "+fms(serial)+". The pipeline targets the floor; the gap to serial is what double-buffering hides.</div>";
+  // ---- structural overlap schematic (verified against the kernel) ----
+  const SC="#ec4899", GA="#db2777", WL="#d62728", MU="#22c55e", VP="#a16207", SY="#64748b";
+  h+="<div class='lh' style='font-size:13px;margin-top:14px'>① steady state — expert loop (one bt-block)</div>";
+  h+="<div class='note'>SE-first runs the shared expert during the scatter-recv/metadata window; gather(e) overlaps FFN(e+1); next-bt scatter is prefetched one block ahead; output store is deferred 2 blocks.</div>";
+  h+=pgRow("MXU", [["SE",MU],["FFN e0",MU],["FFN e1",MU],["FFN e2",MU],["acc",VP]]);
+  h+=pgRow("VPU", [["SE-act",VP],["act0",VP],["act1",VP],["act2",VP],["topk-acc",VP]]);
+  h+=pgRow("DMA scatter", [["scatter bt",SC,2],["remote sends in flight →",SC,2],["storeOut(i-2)",SY]]);
+  h+=pgRow("DMA gather", [["topk(i+1)",GA],["recv e0",GA],["gather e0",GA],["gather e1",GA],["acc-load",GA]]);
+  h+=pgRow("DMA wload", [["W e0",WL],["W e1",WL],["W e2",WL],["W e0(i+1)",WL],["—",SY]]);
+  h+="<div class='note'><span style='color:"+MU+"'>■</span>MXU <span style='color:"+VP+"'>■</span>VPU <span style='color:"+SC+"'>■</span>scatter <span style='color:"+GA+"'>■</span>gather <span style='color:"+WL+"'>■</span>weight-load &nbsp;·&nbsp; ↑ SE hides scatter-recv+metadata; gather(e) rides under FFN(e+1); next-bt scatter prefetched a block ahead.</div>";
+  h+="<div class='lh' style='font-size:13px;margin-top:12px'>② inside one expert — bf-tile loop (deferred-W2 double buffer, slot=bf%2)</div>";
+  h+="<div class='note'>W1/W3 stream in at priority 1; the <b>wait for W2 is deferred past the gate/up matmuls</b>, so W2's HBM→VMEM transfer flies concurrently with GMM1 — legal because GMM1 parks results in f32 VMEM accumulators.</div>";
+  h+=pgRow("MXU", [["GMM1 bf0",MU],["GMM2 bf0",MU],["GMM1 bf1",MU],["GMM2 bf1",MU]]);
+  h+=pgRow("VPU", [["—",SY],["silu bf0",VP],["—",SY],["silu bf1",VP]]);
+  h+=pgRow("DMA wload", [["W2 bf0 (slot0)",WL],["W bf2 →slot0",WL],["W2 bf1 (slot1)",WL],["W bf3 →slot1",WL]]);
+  h+="<div class='note'>↑ W2(bf0) DMA hidden behind GMM1(bf0) MXU; the freed slot is refilled by the bf+2 rolling fetch; at the last bf tile the next expert's bf0 is cross-prefetched.</div>";
+  // ---- verdict ----
+  let v;
+  if(bk==="ICI") v="<b>a2a-bound (the prefill regime).</b> The all-to-all dispatch+combine ("+fms(tICI)+") is the long pole — pure inter-chip DMA at the torus floor. The kernel attacks it with SE-first (hide scatter-recv), one-bt-ahead scatter, and deferring the scatter-<i>send</i> join to the bt epilogue so sends overlap the whole FFN — but cross-host dispatch stays exposed. Lever: EP locality / topology / fewer cross-host hops; smaller chunk shrinks a2a.";
+  else if(bk==="HBM") v="<b>weight-load-bound (the decode regime).</b> Streaming all "+E.toFixed(0)+" local experts' weights ("+fms(tW)+") dominates at small M. The deferred-W2 double-buffer fully hides the W2 DMA behind GMM1, but at decode there isn't enough MXU work to hide the whole weight stream. Lever: fp8 weights (½), more EP (↓ local experts), bigger batch (↑ tpd="+tpd+" → more MXU to hide behind).";
+  else v="<b>compute-bound (MXU) — the pipeline is working.</b> GMM1/GMM2 ("+fms(tM)+") is the long pole; weight DMA and a2a are hidden by the double-buffer + SE-first overlap. This is the target regime. Lever: ↑ MXU rate (non-block W8A8) or ↓ flops.";
+  h+="<div class='verdict "+(bk==="compute"?"v-go":"v-warn")+"'>"+v+"</div>";
+  h+="<div class='note'>Theory: overlap structure from the kernel (verified) + per-engine ceilings from the cost model. Whether the kernel actually hits max(engine) — true semaphore stalls, DMA queue contention, expert imbalance — needs a device trace.</div>";
+  return h;
+}
 function dataflowHTML(s){const ch=buildChain(s); const mx=Math.max(...ch.map(o=>o.ms))||1;
   const BCOL={HBM:"#3b82f6",ICI:"#ec4899",compute:"#22c55e"};
   const comp=D.composition||{attn:[],ffn:[]}, ra=(comp.attn||[])[0], rf=(comp.ffn||[])[0];
@@ -1258,6 +1316,7 @@ const HELP={
   overview:"Overall roofline · per-category cost · one-layer dataflow.",
   overlap:"Can comm (ICI) hide behind compute/HBM — drag tp / tokens to see when it gets exposed.",
   kernel:"Ops ranked by cost; each tells you whether to cut bytes or raise compute.",
+  pipeline:"fused-MoE-v2 kernel pipeline — which engine is the long pole, and what the double-buffer / SE-first / a2a overlap hides behind it (live with the knobs).",
   fusion:"Which intermediate-activation HBM round-trips to fold away, ranked by step saved.",
   trace:"This model's real forward: code-path + Pallas kernels (from the trace)."};
 function card(inner){return "<div class='panel' style='margin-bottom:12px'>"+inner+"</div>";}
@@ -1269,6 +1328,7 @@ function render(){const s=state(); const R=compute(s);
     if(SCEN==="overview") html=chartHTML()+card(legendHTML()+costTableHTML(R))+card(dataflowHTML(s));
     else if(SCEN==="overlap") html=chartHTML()+card(lensOverlap(s,R));
     else if(SCEN==="kernel") html=chartHTML()+card(lensKernel(s,R));
+    else if(SCEN==="pipeline") html=card(lensPipeline(s,R));
     else if(SCEN==="fusion") html=card(lensFusion(s,R));
     else if(SCEN==="trace") html=card(codepathHTML())+card(kernelsHTML());
   }catch(e){html="<div class='panel' style='color:#a33'>render error in '"+SCEN+"': "+e.message+"</div>";}
