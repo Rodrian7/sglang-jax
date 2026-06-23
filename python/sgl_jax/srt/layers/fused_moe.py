@@ -66,16 +66,6 @@ class FusedEPMoE(nnx.Module):
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
         enable_act_quant: bool = True,
-        # Profiling / ablation flags (primarily for microbenching).
-        disable_a2a: bool = False,
-        disable_dynamic_ffn1: bool = False,
-        disable_dynamic_ffn2: bool = False,
-        disable_weight_load: bool = False,
-        disable_a2a_s_tile_read: bool = False,
-        disable_a2a_s_acc_tile_write: bool = False,
-        disable_shared_expert: bool = False,
-        disable_all_reduce_metadata: bool = False,
-        disable_sync_barrier: bool = False,
         use_jax_allreduce_metadata: bool = True,
     ):
         self.hidden_size = hidden_size
@@ -96,15 +86,6 @@ class FusedEPMoE(nnx.Module):
             moe_shared_expert_intermediate_size or intermediate_dim
         )
         self.mesh = mesh
-        self.disable_a2a = disable_a2a
-        self.disable_dynamic_ffn1 = disable_dynamic_ffn1
-        self.disable_dynamic_ffn2 = disable_dynamic_ffn2
-        self.disable_weight_load = disable_weight_load
-        self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
-        self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
-        self.disable_shared_expert = disable_shared_expert
-        self.disable_all_reduce_metadata = disable_all_reduce_metadata
-        self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
 
         metadata = get_global_expert_location_metadata()
@@ -498,15 +479,6 @@ class FusedEPMoE(nnx.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             act_fn=self.activation,
             block_config=block_config,
-            disable_a2a=self.disable_a2a,
-            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
-            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
-            disable_weight_load=self.disable_weight_load,
-            disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
-            disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
-            disable_shared_expert=self.disable_shared_expert,
-            disable_all_reduce_metadata=self.disable_all_reduce_metadata,
-            disable_sync_barrier=self.disable_sync_barrier,
             use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
@@ -536,7 +508,7 @@ class FusedEPMoEV2(FusedEPMoE):
     """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
 
     Inherits weight init and quantization from FusedEPMoE. Overrides __call__
-    to dispatch to fused_ep_moe_v2 with v2-specific flags.
+    to dispatch to fused_ep_moe_v2.
     """
 
     def __call__(
