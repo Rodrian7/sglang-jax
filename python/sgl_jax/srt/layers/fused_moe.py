@@ -1,13 +1,20 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import logging
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe,
+    get_dtype_packing,
+    get_ep_size,
+)
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
@@ -557,6 +564,30 @@ class FusedEPMoEV2(FusedEPMoE):
 
         assert hidden_states.ndim == 2
 
+        # ── Same ep_size * t_packing padding as FusedEPMoE.__call__ ──
+        # The v2 kernel requires num_tokens divisible by ep_size*t_packing
+        # (kernel.py:59-60 assert num_tokens % ep_size == 0). Without this
+        # bs=1 with ep=4 produces local_num_tokens=0 and the kernel raises.
+        # Pad with zero-weight rows, run the kernel, then slice back.
+        num_tokens = hidden_states.shape[0]
+        t_packing = get_dtype_packing(self.dtype)
+        kernel_ep_size = get_ep_size(self.mesh, "data", "tensor")
+        token_multiple = kernel_ep_size * t_packing
+        pad = (-num_tokens) % token_multiple
+        if pad:
+            hidden_states = jnp.concatenate(
+                [hidden_states, jnp.zeros((pad, hidden_states.shape[1]), hidden_states.dtype)],
+                axis=0,
+            )
+            topk_weights = jnp.concatenate(
+                [topk_weights, jnp.zeros((pad, topk_weights.shape[1]), topk_weights.dtype)],
+                axis=0,
+            )
+            topk_ids = jnp.concatenate(
+                [topk_ids, jnp.zeros((pad, topk_ids.shape[1]), topk_ids.dtype)],
+                axis=0,
+            )
+
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
         w2_scale = self.w2_scale.value if self.w2_scale is not None else None
@@ -628,6 +659,22 @@ class FusedEPMoEV2(FusedEPMoE):
             direct_scaled_dot=direct_scaled_dot,
             dp_axis_name="data",
             tp_axis_name="tensor",
+            # When local_num_experts >= 64, the v2 kernel's sflag budget
+            # (16 KB) overflows because bt_scatter_overlap and interleave_bt
+            # allocate semaphores that scale with num_bt and expert count.
+            # Disable these optimizations for large-expert models.
+            # See: sflag allocation 32KB > 16KB with 512/4=128 local experts.
+            cross_expert_prefetch_mode=(
+                "none"
+                if self.num_experts // self.ep_size >= 64
+                else "full"
+            ),
+            enable_bt_scatter_overlap=(
+                False if self.num_experts // self.ep_size >= 64 else True
+            ),
+            interleave_bt=(
+                False if self.num_experts // self.ep_size >= 64 else True
+            ),
         )
 
         # Reshard the MoE output to the caller-requested layout. Under sequence
@@ -635,6 +682,268 @@ class FusedEPMoEV2(FusedEPMoE):
         # (('data','tensor') on the scatter dim); without it we fall back to the
         # plain DP layout P('data', None). b79f9951 dropped this arg and hardcoded
         # the DP layout, which silently broke SP for MoE layers — restored here.
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
+        else:
+            output = jax.sharding.reshard(
+                output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+            )
+        if pad:
+            output = output[:num_tokens]
+        return output
+
+
+class FusedTPMoEV4(FusedEPMoE):
+    """Tensor-Parallel MoE layer (v4 kernel).
+
+    Holds ALL experts on every chip but with the intermediate dim TP-sharded
+    1/tp. Replaces the EP a2a / barrier with a single psum across the tp axis.
+    bf16-only; no quantization, no in-kernel shared expert, incompatible with
+    EPLB (TP replicates every expert).
+
+    Weight load reuses the FusedEPMoE EP-sharded layout. After
+    ``WeightLoader.load_weights_from_safetensors`` completes, the model's
+    ``_post_load_weights`` hook must call ``reshape_weights_for_tp()`` on each
+    instance — this performs a one-time EP -> TP reshard and drops the EP-layout
+    tensors. The kernel reads ``w1_tp / w2_tp / w3_tp`` thereafter.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        num_experts_per_tok: int,
+        ep_size: int,
+        mesh: Mesh,
+        *,
+        intermediate_dim: int = 2048,
+        weight_dtype: jnp.dtype = jnp.bfloat16,
+        dtype: jnp.dtype = jnp.bfloat16,
+        activation: str = "silu",
+        layer_id: int = 0,
+        use_grouped_topk: bool = False,
+        num_groups: int = 1,
+        top_k_groups: int = 1,
+        renormalize_topk_logits: bool = False,
+        routed_scaling_factor: float | None = None,
+        num_shared_experts: int = 0,
+        moe_shared_expert_intermediate_size: int | None = None,
+        quantization_config=None,
+        **kwargs,
+    ) -> None:
+        # Guard 1: EPLB metadata is incompatible — TP holds every expert on every
+        # chip; physical->logical mapping would silently mis-route. Hard-fail at
+        # init so the error surfaces before weight load instead of as numerical
+        # garbage at runtime.
+        if get_global_expert_location_metadata() is not None:
+            raise NotImplementedError(
+                "MoEBackend.FUSED_V4 is incompatible with EPLB. "
+                "TP replicates every expert on every chip; physical->logical "
+                "expert remapping has no meaning under this backend. Disable "
+                "EPLB before selecting fused_v4."
+            )
+        # Guard 2: shared expert must be external (matches sglang-jax bailing_moe_v3
+        # convention; AInfer v4's decode top_k+1-slot fusion is not ported).
+        if num_shared_experts > 0:
+            raise NotImplementedError(
+                "FUSED_V4 expects external shared expert (num_shared_experts=0). "
+                f"Got num_shared_experts={num_shared_experts}. The caller "
+                "(e.g. BailingMoeV3 decoder layer) must compute the shared "
+                "expert separately and add it after the MoE call."
+            )
+        # Guard 3: bf16-only. Reject any quantization config that asks for
+        # quantized weights or activations.
+        if quantization_config is not None and (
+            quantization_config.get_moe_weight_dtype() is not None
+            or quantization_config.get_moe_activation_dtype() is not None
+        ):
+            raise NotImplementedError(
+                "FUSED_V4 is bf16-only; quantization is not supported. "
+                f"Got weight_dtype={quantization_config.get_moe_weight_dtype()}, "
+                f"activation_dtype={quantization_config.get_moe_activation_dtype()}."
+            )
+        super().__init__(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            ep_size=ep_size,
+            mesh=mesh,
+            intermediate_dim=intermediate_dim,
+            weight_dtype=weight_dtype,
+            dtype=dtype,
+            activation=activation,
+            layer_id=layer_id,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
+            renormalize_topk_logits=renormalize_topk_logits,
+            routed_scaling_factor=routed_scaling_factor,
+            num_shared_experts=0,  # enforced by Guard 2
+            moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+            quantization_config=quantization_config,
+            **kwargs,
+        )
+        self._tp_weights_ready = False
+
+    def quantize_weights(self, is_static: bool = False) -> None:
+        # Defensive: the inherited path is a no-op when quantized_dtype is None
+        # (Guard 3 already enforces that), but make doubly sure quantize is never
+        # invoked silently on v4 weights — caller bugs surface as a clear error
+        # instead of corrupted bf16 storage.
+        if self.quantized_dtype is not None:
+            raise RuntimeError(
+                "FusedTPMoEV4.quantize_weights called with quantized_dtype="
+                f"{self.quantized_dtype}; FUSED_V4 must remain bf16."
+            )
+
+    def reshape_weights_for_tp(self) -> None:
+        """One-time EP -> TP reshard. Called from the model's _post_load_weights.
+
+        Per AInfer prepare_v4_weights (ainfer/layers/tpu/moe.py:883-945) the path
+        is EP-sharded -> fully replicated -> TP-sharded. The transient replicated
+        intermediate is ~1 GiB/weight for ling_v3_flash (E=256-512, H=2560, I=768);
+        on a 4-chip v7x the HBM headroom is tight, so strictly free the
+        intermediate AND the old EP buffer before allocating the next layer's
+        weights:
+
+          full = device_put(self.wX.value, replicated)
+          full.block_until_ready()
+          tp   = device_put(full, tp_sharding)
+          full.delete()           # release the replicated intermediate
+          self.wX_tp = nnx.Param(tp)
+          delattr(self, "wX")     # drop the old EP-sharded buffer
+
+        Skipping any of these three steps doubles the HBM peak.
+        """
+        if self._tp_weights_ready:
+            return
+
+        logger.info(
+            "FusedTPMoEV4 layer %d EP->TP reshard starting (E=%d, H=%d, I=%d, mesh=%s)",
+            self.layer_id, self.num_experts, self.hidden_size, self.intermediate_dim,
+            self.mesh.shape,
+        )
+
+        rep_sharding = NamedSharding(self.mesh, P(None, None, None))
+        w13_sharding = NamedSharding(self.mesh, P(None, None, "tensor"))
+        w2_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
+
+        for src_name, tgt_name, target_sharding in (
+            ("w1", "w1_tp", w13_sharding),
+            ("w3", "w3_tp", w13_sharding),
+            ("w2", "w2_tp", w2_sharding),
+        ):
+            src_param = getattr(self, src_name)
+            full = jax.device_put(src_param.value, rep_sharding)
+            full.block_until_ready()
+            tp = jax.device_put(full, target_sharding)
+            tp.block_until_ready()
+            try:
+                full.delete()
+            except Exception:
+                # Some JAX builds raise if delete() runs after the buffer was
+                # consumed by the next device_put. Best-effort; the GC will
+                # collect when references drop.
+                pass
+            setattr(self, tgt_name, nnx.Param(tp))
+            try:
+                # Drop the old EP-sharded buffer aggressively. Without this the
+                # 40+ layer model peaks at 2x weight bytes during reshard.
+                getattr(self, src_name).value.delete()
+            except Exception:
+                pass
+            delattr(self, src_name)
+
+        self._tp_weights_ready = True
+        logger.info("FusedTPMoEV4 layer %d EP->TP reshard done", self.layer_id)
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        block_config: FusedMoEBlockConfig | None = None,  # accepted, unused
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        """TP MoE forward.
+
+        v4 does NOT pad tokens on EP boundaries (the FusedEPMoE input padding is
+        skipped). Tokens are conceptually replicated across the tp axis and the
+        kernel does a final psum to combine partial down-projections.
+        """
+        try:
+            from jax import shard_map
+        except ImportError:
+            from jax.experimental.shard_map import shard_map
+
+        from sgl_jax.srt.kernels.fused_moe.v4.kernel import tp_moe_per_device
+
+        assert hidden_states.ndim == 2, hidden_states.shape
+        if not self._tp_weights_ready:
+            raise RuntimeError(
+                f"FusedTPMoEV4 layer {self.layer_id}: reshape_weights_for_tp() "
+                "must be called from the model's _post_load_weights hook before "
+                "forward."
+            )
+
+        # Sanity-check the kernel's TP slicing assumption up front so a bad
+        # config fails with a readable message instead of a downstream shape
+        # error inside ragged_dot. The kernel still works when I/tp is not a
+        # multiple of 128 (it just wastes MXU cycles), so this is a soft warn
+        # rather than a hard error.
+        i_local = self.w2_tp.value.shape[1]
+        if i_local % 128 != 0:
+            logger.warning(
+                "FusedTPMoEV4 layer %d: I_local=%d is not a multiple of 128; "
+                "expect ~%.0f%% MXU padding waste in prefill.",
+                self.layer_id, i_local, 100.0 * (1 - i_local / (((i_local + 127) // 128) * 128)),
+            )
+
+        topk_ids = topk_ids.astype(jnp.int32)
+        num_experts = self.num_experts
+
+        def _body(toks, w1l, w2l, w3l, ids, wts):
+            return tp_moe_per_device(
+                toks, w1l, w2l, w3l, ids, wts,
+                num_experts=num_experts, tp_axis_name="tensor",
+            )
+
+        in_specs = (
+            P("data", None),            # tokens (replicated across tensor axis)
+            P(None, None, "tensor"),    # w1 [E, H, I/tp]
+            P(None, "tensor", None),    # w2 [E, I/tp, H]
+            P(None, None, "tensor"),    # w3 [E, H, I/tp]
+            P("data", None),            # topk_ids
+            P("data", None),            # topk_weights
+        )
+        out_specs = P("data", None)
+
+        try:
+            output = shard_map(
+                _body, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
+                check_rep=False,
+            )(
+                hidden_states,
+                self.w1_tp.value,
+                self.w2_tp.value,
+                self.w3_tp.value,
+                topk_ids,
+                topk_weights,
+            )
+        except TypeError:
+            output = shard_map(
+                _body, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
+            )(
+                hidden_states,
+                self.w1_tp.value,
+                self.w2_tp.value,
+                self.w3_tp.value,
+                topk_ids,
+                topk_weights,
+            )
+
+        # Same output contract as FusedEPMoE.
         if out_sharding is not None:
             output = jax.sharding.reshard(output, out_sharding)
         else:

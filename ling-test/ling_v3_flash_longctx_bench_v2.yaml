@@ -1,0 +1,111 @@
+# Long-context decode benchmark for ling_v3_flash: bs=1, in=16K, out=2K.
+# Compares MoE backends head-to-head. ONE job per backend; set MOE_BACKEND
+# below before kubectl apply.
+#
+# Backends to run (sequentially, since one TPU node serves one job at a time):
+#   1) MOE_BACKEND=fused      (v1 EP — baseline)
+#   2) MOE_BACKEND=fused_v4   (v4 TP — the port under test)
+#
+# Deploy:  kubectl apply -f ling_v3_flash_longctx_bench.yaml
+# Monitor: kubectl logs -f job/ling-v3-flash-longctx-bench-<backend>
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ling-v3-flash-longctx-bench-v2
+  namespace: default
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    spec:
+      containers:
+      - name: bench
+        image: python:3.12-slim
+        command: ["/bin/bash","-c"]
+        args:
+        - |
+          set -e
+          export PIP_DEFAULT_TIMEOUT=120; export PIP_RETRIES=10
+          pipi() { for n in 1 2 3 4 5; do pip install -q "$@" && return 0; echo "pip retry $n"; sleep 5; done; return 1; }
+          apt-get update -qq
+          apt-get install -y -qq git curl gnupg lsb-release fuse >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+          echo "deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main" > /etc/apt/sources.list.d/gcsfuse.list
+          curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg 2>/dev/null
+          sed -i 's|deb |deb [signed-by=/usr/share/keyrings/cloud.google.gpg] |' /etc/apt/sources.list.d/gcsfuse.list
+          apt-get update -qq && apt-get install -y -qq gcsfuse >/dev/null
+          pipi "numpy>=1.26"
+          pipi torch --index-url https://download.pytorch.org/whl/cpu
+          pipi transformers huggingface_hub safetensors tokenizers gcsfs einops
+          # fla-core needs triton (Python package only on TPU, no CUDA kernels
+          # needed — the KDA/MoE paths don't use triton).
+          pipi fla-core triton
+          python3 -c "import fla; print('fla import: OK')"
+          # ── Anonymous curl works (bucket has allUsers viewer), gcsfs/gcsfuse
+          # in this pod consistently fail with HTTP 412 or I/O error. Use the
+          # public-read endpoint directly.
+          curl -fsSL -o /tmp/sglang-jax.tar.gz "https://storage.googleapis.com/ainfer-tpu-bench-code/sglang-jax-v4.tar.gz"
+          mkdir -p /app/sglang-jax
+          mkdir -p /app
+          curl -fsSL -o /app/bench.py "https://storage.googleapis.com/ainfer-tpu-bench-code/ling_v3_flash_longctx_bench.py"
+          ls -la /tmp/sglang-jax.tar.gz /app/bench.py
+          # ── Install sglang-jax (with TPU deps) ──
+          mkdir -p /app/sglang-jax && cd /app/sglang-jax && tar xzf /tmp/sglang-jax.tar.gz && rm /tmp/sglang-jax.tar.gz
+          cd /app/sglang-jax/sglang-jax/python && pipi -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip cache purge 2>/dev/null || true
+          # Hard guard: v4 path present even when running v1 baseline.
+          python3 -c "from sgl_jax.srt.kernels.fused_moe.v4.kernel import tp_moe_per_device; print('v4 kernel: OK')"
+          python3 -c "from sgl_jax.srt.configs.model_config import MoEBackend; assert 'fused_v4' in [b.value for b in MoEBackend]; print('MoEBackend.FUSED_V4: OK')"
+          python3 -c "import jax; print('TPU devices:', jax.device_count()); assert jax.device_count()>=4"
+          mkdir -p ${MODEL_DIR}
+          gcsfuse --implicit-dirs -o ro --only-dir ${WEIGHTS_SUBDIR} --metadata-cache-ttl-secs=-1 ${WEIGHTS_BUCKET} ${MODEL_DIR}
+          [ -f "${MODEL_DIR}/config.json" ] || { echo FATAL-noconfig; exit 2; }
+          python3 -u /app/bench.py
+        env:
+        - {name: SGLANG_GCS_PATH, value: "gs://ainfer-tpu-bench-code/sglang-jax-v4.tar.gz"}
+        - {name: WEIGHTS_BUCKET, value: "ant_asystem"}
+        - {name: WEIGHTS_SUBDIR, value: "models/ling_v3_flash"}
+        - {name: SCRIPT_GCS_PATH, value: "gs://ainfer-tpu-bench-code/ling_v3_flash_longctx_bench.py"}
+        - {name: MODEL_DIR, value: "/tmp/models/ling_v3_flash"}
+        - {name: TP_SIZE, value: "4"}
+        # Set to "fused" for v1 baseline, "fused_v4" for the TP-MoE under test.
+        - {name: MOE_BACKEND, value: "fused_v2"}
+        - {name: TARGET_IN, value: "4096"}
+        - {name: TARGET_OUT, value: "2048"}
+        - {name: WARMUP_ROUNDS, value: "1"}
+        - {name: TIMED_ROUNDS, value: "3"}
+        # fused_v2 kernel asserts num_tokens % ep_size == 0; bs=1 with ep=4
+        # crashes at decode precompile. Compile only the bs=8 graph so the engine
+        # routes single-stream bs=1 requests through it (auto-padded 7 zero rows,
+        # same effective cost as v1's wrapper self-padding).
+        - {name: BS_PADDINGS, value: "8"}
+        # Separate caches per backend so v1 and v4 don't poison each other's
+        # JIT artifacts. Append the backend name to the cache key.
+        - {name: JAX_COMPILATION_CACHE_DIR, value: "gs://ant_asystem/compile_cache/ling_v3_flash_longctx_v2"}
+        # Switches weight loader from gcsfuse FUSE to gcsfs direct HTTP reads —
+        # weight_utils.py:1710-1716 notes "229→581 MB/s observed on ling_v3_flash".
+        # Without this, MoE load runs ~2.5x slower; CRITICAL for any sub-10min cold start.
+        - {name: GCS_WEIGHTS_PREFIX, value: "gs://ant_asystem/models/ling_v3_flash"}
+        # Push parallelism past the conservative defaults. Comment in
+        # weight_utils.py:37-40 says GCS single-bucket egress saturates at
+        # ~8 concurrent streams; we go 16 since GCS_RANGE_WORKERS adds another
+        # 16-way inner fan-out per group. With one pod alone these settings hit
+        # GCS limits; under contention they at least don't underuse the pipe.
+        - {name: MOE_PARALLEL_GROUPS, value: "8"}
+        - {name: SGLANG_MOE_LOAD_WORKERS, value: "32"}
+        - {name: PALLAS_COMPILER_PARAMS, value: "--disable_sparse_core_dma_merging=true"}
+        - {name: TPU_MIN_LOG_LEVEL, value: "1"}
+        - {name: TF_CPP_MIN_LOG_LEVEL, value: "1"}
+        resources:
+          limits: {ephemeral-storage: 40Gi, google.com/tpu: "4"}
+          requests: {ephemeral-storage: 30Gi, google.com/tpu: "4"}
+        securityContext: {privileged: true}
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v7-4-b
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      restartPolicy: Never
+      tolerations:
+      - {effect: NoSchedule, key: google.com/tpu, operator: Equal, value: present}

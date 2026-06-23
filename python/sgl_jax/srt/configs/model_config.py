@@ -37,6 +37,7 @@ class MoEBackend(str, Enum):
     EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
     FUSED = "fused"  # Fused Kernel (TPU-optimized)
     FUSED_V2 = "fused_v2"  # Fused Kernel V2 (Strix-style double-buffer)
+    FUSED_V4 = "fused_v4"  # TP-MoE (v4 kernel ported from AInfer; bf16-only)
     AUTO = "auto"  # Automatically select based on ep_size
 
 
@@ -46,20 +47,29 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
 )
 
 
-def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
-    if moe_backend != MoEBackend.FUSED_V2:
+def _assert_fused_moe_v2_v4_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
+    """Both fused_v2 (Strix double-buffer) and fused_v4 (TP-MoE) inherit the
+    FusedEPMoE weight layout and assume a Bailing/MiMo-style checkpoint. Keep
+    the whitelist shared.
+    """
+    if moe_backend not in (MoEBackend.FUSED_V2, MoEBackend.FUSED_V4):
         return
 
     assert any(arch in _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES for arch in architectures), (
-        "moe_backend='fused_v2' only supports Bailing/MiMo model architectures for now; "
-        f"got architectures={architectures}"
+        f"moe_backend={moe_backend.value!r} only supports Bailing/MiMo model "
+        f"architectures for now; got architectures={architectures}"
     )
+
+
+# Backwards-compatible alias.
+_assert_fused_moe_v2_supported = _assert_fused_moe_v2_v4_supported
 
 
 class ModelConfig:

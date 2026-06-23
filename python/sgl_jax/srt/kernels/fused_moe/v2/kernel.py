@@ -45,7 +45,15 @@ class FusedMoEBlockConfig:
         *,
         num_tokens: int,
         ep_size: int,
+        intermediate_size: int | None = None,
     ) -> FusedMoEBlockConfig:
+        """Return the *effective* config after applying kernel override rules.
+
+        If *intermediate_size* is given and ``self.bf`` does not divide it,
+        ``bf`` is reduced to the largest multiple of 128 that divides
+        ``intermediate_size``. ``bse`` is also clamped if it would exceed the
+        reduced ``bf`` (required by the in-kernel shared expert path).
+        """
         if ep_size <= 0:
             raise ValueError(f"Expected {ep_size=} > 0.")
         if num_tokens % ep_size != 0:
@@ -60,7 +68,22 @@ class FusedMoEBlockConfig:
         if bts % btc != 0:
             raise ValueError(f"Expected {bts=} divisible by {btc=}.")
         bse = self.bf if self.bse is None else self.bse
-        return FusedMoEBlockConfig(bt=bt, bf=self.bf, btc=btc, bse=bse, bts=bts)
+
+        bf = self.bf
+        if intermediate_size is not None and intermediate_size % bf != 0:
+            for candidate in range(bf - 128, 0, -128):
+                if intermediate_size % candidate == 0:
+                    bf = candidate
+                    break
+            else:
+                raise ValueError(
+                    f"Cannot find a bf divisor of {intermediate_size=} "
+                    f"(searched from {bf} down by -128)."
+                )
+            if bse > bf:
+                bse = bf
+
+        return FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
 
     def tree_flatten(self):
         bts = 0 if self.bts is None else int(self.bts)
@@ -227,7 +250,7 @@ def validate_fused_moe_block_config(
     ep_size: int,
     block_config: FusedMoEBlockConfig,
 ):
-    bc = block_config.effective_for(num_tokens=num_tokens, ep_size=ep_size)
+    bc = block_config.effective_for(num_tokens=num_tokens, ep_size=ep_size, intermediate_size=intermediate_size)
     bt, bf, btc, bse = bc.bt, bc.bf, bc.btc, bc.bse
     bts = bc.bts
 
@@ -2389,6 +2412,7 @@ def fused_ep_moe_v2(
     block_config = block_config.effective_for(
         num_tokens=num_tokens,
         ep_size=ep_size,
+        intermediate_size=intermediate_size,
     )
     bt = block_config.bt
     bts = block_config.bts

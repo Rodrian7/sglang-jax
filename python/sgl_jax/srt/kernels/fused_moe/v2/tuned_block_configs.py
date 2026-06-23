@@ -115,6 +115,32 @@ def get_simplified_key(
     )
 
 
+def _large_expert_default(
+    num_tokens: int,
+    intermediate_size: int,
+) -> FusedMoEBlockConfig:
+    """Block config for models with ≥64 local experts per device.
+
+    Uses large bt/btc/bts values (512) and lets effective_for scale them
+    down to the actual token count.  The v2 tune sweep on ling dims
+    (D=2560,F=768,E=512,ep=8) confirmed:
+      - bf=256 is always optimal (never 128)
+      - bt = btc = bts is the best pattern (btc should track bt, not be
+        pinned at 8)
+
+    The DEFAULT_V2_BLOCK_CONFIG (bt=32, bf=512) overflows the 1 MB SMEM
+    budget when local_num_experts >= 64 (DMA descriptor explosion).
+    """
+    # Choose bf ≤ 256 (the v2 tune confirmed 256 is optimal;
+    # 384 overflows SMEM with 128 local experts).
+    for bf in (256, 128):
+        if intermediate_size % bf == 0:
+            break
+    else:
+        bf = 256
+    return FusedMoEBlockConfig(bt=512, bf=bf, btc=512, bse=256)
+
+
 def get_tuned_fused_moe_v2_block_config(
     *,
     num_tokens: int,
@@ -161,6 +187,14 @@ def get_tuned_fused_moe_v2_block_config(
         cfg_tuple = _lookup(table_key_legacy)
 
     if cfg_tuple is None:
+        # When local_num_experts >= 64 (e.g. ling_v3_flash: 512 experts / ep=4),
+        # the DEFAULT_V2_BLOCK_CONFIG (bt=32, bf=512) produces too many DMA
+        # descriptors for the 1 MB SMEM budget. Use a smaller default to keep
+        # descriptor count bounded.
+        local_experts = num_experts // ep_size
+        if local_experts >= 64:
+            return _large_expert_default(num_tokens, intermediate_size)
+
         return DEFAULT_V2_BLOCK_CONFIG
 
     if len(cfg_tuple) != 5:
