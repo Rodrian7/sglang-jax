@@ -17,6 +17,8 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
 )
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
+logger = logging.getLogger(__name__)
+
 
 def _expand_moe_block_scale(scale_3d: jax.Array, n_out: int, block_n: int) -> jax.Array:
     """Expand compact 2D MoE block scales to the kernel's fast 1D-ready layout."""
