@@ -1216,181 +1216,189 @@ def _fused_ep_moe_kernel(
             w2_shared_scale_copy.wait()
 
     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
-        for p in range(t_packing):
-            offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
-            pltpu.make_async_copy(
-                src_ref=w1_hbm.at[
-                    local_e_id,
-                    pl.ds(offset, bd1_per_t_packing),
-                    pl.ds(bf_id * bf, bf),
-                ],
-                dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
-                sem=local_sems.at[bw1_sem_id, 1],
-            ).start()
-            if w1_scale_hbm is not None:
-                assert quant_block_k is not None
-                scale_dim2 = pl.ds(0, 1)
-                scale_dim3 = pl.ds(bf_id * bf, bf)
+        with jax.named_scope("v1_w1_load"):
+            for p in range(t_packing):
+                offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_hbm.at[
+                    src_ref=w1_hbm.at[
                         local_e_id,
-                        pl.ds(
-                            offset // quant_block_k,
-                            bd1_per_t_packing // quant_block_k,
-                        ),
-                        scale_dim2,
-                        scale_dim3,
+                        pl.ds(offset, bd1_per_t_packing),
+                        pl.ds(bf_id * bf, bf),
                     ],
-                    dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
+                    dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
                     sem=local_sems.at[bw1_sem_id, 1],
                 ).start()
-        if b1_hbm is not None:
+                if w1_scale_hbm is not None:
+                    assert quant_block_k is not None
+                    scale_dim2 = pl.ds(0, 1)
+                    scale_dim3 = pl.ds(bf_id * bf, bf)
+                    pltpu.make_async_copy(
+                        src_ref=w1_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(
+                                offset // quant_block_k,
+                                bd1_per_t_packing // quant_block_k,
+                            ),
+                            scale_dim2,
+                            scale_dim3,
+                        ],
+                        dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
+                        sem=local_sems.at[bw1_sem_id, 1],
+                    ).start()
+            if b1_hbm is not None:
 
-            @pl.when(bd1_id == 0)
-            def _():
-                pltpu.make_async_copy(
-                    src_ref=b1_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
-                    dst_ref=b_b1_x2_vmem.at[bf_id % 2],
-                    sem=local_sems.at[bw1_sem_id, 1],
-                ).start()
+                @pl.when(bd1_id == 0)
+                def _():
+                    pltpu.make_async_copy(
+                        src_ref=b1_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
+                        dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                        sem=local_sems.at[bw1_sem_id, 1],
+                    ).start()
 
     def start_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
-        for p in range(t_packing):
-            offset = p * h_per_t_packing + bd2_id * bd2_per_t_packing
-            pltpu.make_async_copy(
-                src_ref=w2_hbm.at[
-                    local_e_id,
-                    pl.ds(bf_id * bf, bf),
-                    pl.ds(offset, bd2_per_t_packing),
-                ],
-                dst_ref=b_w2_x2_vmem.at[bw2_sem_id, p],
-                sem=local_sems.at[bw2_sem_id, 2],
-            ).start()
-            if w2_scale_hbm is not None:
-                assert quant_block_k is not None
-                w2_scale_dim2 = pl.ds(0, 1)
-                w2_scale_dim3 = pl.ds(offset, bd2_per_t_packing)
+        with jax.named_scope("v1_w2_load"):
+            for p in range(t_packing):
+                offset = p * h_per_t_packing + bd2_id * bd2_per_t_packing
                 pltpu.make_async_copy(
-                    src_ref=w2_scale_hbm.at[
+                    src_ref=w2_hbm.at[
                         local_e_id,
-                        pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
-                        w2_scale_dim2,
-                        w2_scale_dim3,
+                        pl.ds(bf_id * bf, bf),
+                        pl.ds(offset, bd2_per_t_packing),
                     ],
-                    dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
+                    dst_ref=b_w2_x2_vmem.at[bw2_sem_id, p],
                     sem=local_sems.at[bw2_sem_id, 2],
                 ).start()
-            if b2_hbm is not None and bf_id == 0:
-                pltpu.make_async_copy(
-                    src_ref=b2_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(offset, bd2_per_t_packing)],
-                    dst_ref=b_b2_x2_vmem.at[bd2_id % 2, p],
-                    sem=local_sems.at[bw2_sem_id, 2],
-                ).start()
+                if w2_scale_hbm is not None:
+                    assert quant_block_k is not None
+                    w2_scale_dim2 = pl.ds(0, 1)
+                    w2_scale_dim3 = pl.ds(offset, bd2_per_t_packing)
+                    pltpu.make_async_copy(
+                        src_ref=w2_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(bf_id * bf // quant_block_k, bf // quant_block_k),
+                            w2_scale_dim2,
+                            w2_scale_dim3,
+                        ],
+                        dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id, p],
+                        sem=local_sems.at[bw2_sem_id, 2],
+                    ).start()
+                if b2_hbm is not None and bf_id == 0:
+                    pltpu.make_async_copy(
+                        src_ref=b2_hbm.at[
+                            local_e_id, pl.ds(0, 1), pl.ds(offset, bd2_per_t_packing)
+                        ],
+                        dst_ref=b_b2_x2_vmem.at[bd2_id % 2, p],
+                        sem=local_sems.at[bw2_sem_id, 2],
+                    ).start()
 
     def start_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
-        for p in range(t_packing):
-            offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
-            pltpu.make_async_copy(
-                src_ref=w3_hbm.at[
-                    local_e_id,
-                    pl.ds(offset, bd1_per_t_packing),
-                    pl.ds(bf_id * bf, bf),
-                ],
-                dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
-                sem=local_sems.at[bw3_sem_id, 3],
-            ).start()
-            if w3_scale_hbm is not None:
-                assert quant_block_k is not None
-                w3_scale_dim2 = pl.ds(0, 1)
-                w3_scale_dim3 = pl.ds(bf_id * bf, bf)
+        with jax.named_scope("v1_w3_load"):
+            for p in range(t_packing):
+                offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
                 pltpu.make_async_copy(
-                    src_ref=w3_scale_hbm.at[
+                    src_ref=w3_hbm.at[
                         local_e_id,
-                        pl.ds(
-                            offset // quant_block_k,
-                            bd1_per_t_packing // quant_block_k,
-                        ),
-                        w3_scale_dim2,
-                        w3_scale_dim3,
+                        pl.ds(offset, bd1_per_t_packing),
+                        pl.ds(bf_id * bf, bf),
                     ],
-                    dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
+                    dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).start()
-        if b3_hbm is not None:
+                if w3_scale_hbm is not None:
+                    assert quant_block_k is not None
+                    w3_scale_dim2 = pl.ds(0, 1)
+                    w3_scale_dim3 = pl.ds(bf_id * bf, bf)
+                    pltpu.make_async_copy(
+                        src_ref=w3_scale_hbm.at[
+                            local_e_id,
+                            pl.ds(
+                                offset // quant_block_k,
+                                bd1_per_t_packing // quant_block_k,
+                            ),
+                            w3_scale_dim2,
+                            w3_scale_dim3,
+                        ],
+                        dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
+                        sem=local_sems.at[bw3_sem_id, 3],
+                    ).start()
+            if b3_hbm is not None:
 
-            @pl.when(bd3_id == 0)
-            def _():
-                pltpu.make_async_copy(
-                    src_ref=b3_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
-                    dst_ref=b_b3_x2_vmem.at[bf_id % 2],
-                    sem=local_sems.at[bw3_sem_id, 3],
-                ).start()
+                @pl.when(bd3_id == 0)
+                def _():
+                    pltpu.make_async_copy(
+                        src_ref=b3_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
+                        dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                        sem=local_sems.at[bw3_sem_id, 3],
+                    ).start()
 
     def wait_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         del local_e_id
-        pltpu.make_async_copy(
-            src_ref=b_w1_x2_vmem.at[bw1_sem_id],
-            dst_ref=b_w1_x2_vmem.at[bw1_sem_id],
-            sem=local_sems.at[bw1_sem_id, 1],
-        ).wait()
-        if w1_scale_hbm is not None:
+        with jax.named_scope("v1_w1_load_wait"):
             pltpu.make_async_copy(
-                src_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
-                dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
+                src_ref=b_w1_x2_vmem.at[bw1_sem_id],
+                dst_ref=b_w1_x2_vmem.at[bw1_sem_id],
                 sem=local_sems.at[bw1_sem_id, 1],
             ).wait()
-        if b1_hbm is not None:
-
-            @pl.when(bd1_id == 0)
-            def _():
+            if w1_scale_hbm is not None:
                 pltpu.make_async_copy(
-                    src_ref=b_b1_x2_vmem.at[bf_id % 2],
-                    dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    src_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
+                    dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
                     sem=local_sems.at[bw1_sem_id, 1],
                 ).wait()
+            if b1_hbm is not None:
+
+                @pl.when(bd1_id == 0)
+                def _():
+                    pltpu.make_async_copy(
+                        src_ref=b_b1_x2_vmem.at[bf_id % 2],
+                        dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                        sem=local_sems.at[bw1_sem_id, 1],
+                    ).wait()
 
     def wait_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
         del local_e_id
-        pltpu.make_async_copy(
-            src_ref=b_w2_x2_vmem.at[bw2_sem_id],
-            dst_ref=b_w2_x2_vmem.at[bw2_sem_id],
-            sem=local_sems.at[bw2_sem_id, 2],
-        ).wait()
-        if w2_scale_hbm is not None:
+        with jax.named_scope("v1_w2_load_wait"):
             pltpu.make_async_copy(
-                src_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
-                dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
+                src_ref=b_w2_x2_vmem.at[bw2_sem_id],
+                dst_ref=b_w2_x2_vmem.at[bw2_sem_id],
                 sem=local_sems.at[bw2_sem_id, 2],
             ).wait()
-        if b2_hbm is not None and bf_id == 0:
-            pltpu.make_async_copy(
-                src_ref=b_b2_x2_vmem.at[bd2_id % 2],
-                dst_ref=b_b2_x2_vmem.at[bd2_id % 2],
-                sem=local_sems.at[bw2_sem_id, 2],
-            ).wait()
+            if w2_scale_hbm is not None:
+                pltpu.make_async_copy(
+                    src_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
+                    dst_ref=b_w2_scale_x2_vmem.at[bw2_sem_id],
+                    sem=local_sems.at[bw2_sem_id, 2],
+                ).wait()
+            if b2_hbm is not None and bf_id == 0:
+                pltpu.make_async_copy(
+                    src_ref=b_b2_x2_vmem.at[bd2_id % 2],
+                    dst_ref=b_b2_x2_vmem.at[bd2_id % 2],
+                    sem=local_sems.at[bw2_sem_id, 2],
+                ).wait()
 
     def wait_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
         del local_e_id
-        pltpu.make_async_copy(
-            src_ref=b_w3_x2_vmem.at[bw3_sem_id],
-            dst_ref=b_w3_x2_vmem.at[bw3_sem_id],
-            sem=local_sems.at[bw3_sem_id, 3],
-        ).wait()
-        if w3_scale_hbm is not None:
+        with jax.named_scope("v1_w3_load_wait"):
             pltpu.make_async_copy(
-                src_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
-                dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
+                src_ref=b_w3_x2_vmem.at[bw3_sem_id],
+                dst_ref=b_w3_x2_vmem.at[bw3_sem_id],
                 sem=local_sems.at[bw3_sem_id, 3],
             ).wait()
-        if b3_hbm is not None:
-
-            @pl.when(bd3_id == 0)
-            def _():
+            if w3_scale_hbm is not None:
                 pltpu.make_async_copy(
-                    src_ref=b_b3_x2_vmem.at[bf_id % 2],
-                    dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    src_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
+                    dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).wait()
+            if b3_hbm is not None:
+
+                @pl.when(bd3_id == 0)
+                def _():
+                    pltpu.make_async_copy(
+                        src_ref=b_b3_x2_vmem.at[bf_id % 2],
+                        dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                        sem=local_sems.at[bw3_sem_id, 3],
+                    ).wait()
 
     def start_fetch_se_tokens_slice(*, bt_start, bt_sem_id, bd1_idx, buf_id):
         if w1_shared_hbm is None:
@@ -1949,75 +1957,80 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd1_per_t_packing),
-                ],
-                dst_ref=b_stage_x2_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd1_per_t_packing),
-                ],
-                sem=token_stage_x2_sems.at[buf_id],
-            ).start()
+            with jax.named_scope("v1_token_stage_load"):
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_x2_hbm.at[
+                        e_sem_id,
+                        pl.ds(tile_start, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd1_per_t_packing),
+                    ],
+                    dst_ref=b_stage_x2_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd1_per_t_packing),
+                    ],
+                    sem=token_stage_x2_sems.at[buf_id],
+                ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
-            pltpu.make_async_copy(
-                src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                sem=token_stage_x2_sems.at[buf_id],
-            ).wait()
+            with jax.named_scope("v1_token_stage_load_wait"):
+                pltpu.make_async_copy(
+                    src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                    dst_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                    sem=token_stage_x2_sems.at[buf_id],
+                ).wait()
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                dst_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                sem=acc_stage_x3_sems.at[buf_id],
-            ).start()
+            with jax.named_scope("v1_acc_hbm_load"):
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_acc_x2_hbm.at[
+                        e_sem_id,
+                        pl.ds(tile_start, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd2_per_t_packing),
+                    ],
+                    dst_ref=a2a_s_acc_stage_x3_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd2_per_t_packing),
+                    ],
+                    sem=acc_stage_x3_sems.at[buf_id],
+                ).start()
 
         def wait_stage_a2a_s_acc_tile(buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                ],
-                dst_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                ],
-                sem=acc_stage_x3_sems.at[buf_id],
-            ).wait()
+            with jax.named_scope("v1_acc_hbm_wait"):
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_acc_stage_x3_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                    ],
+                    dst_ref=a2a_s_acc_stage_x3_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                    ],
+                    sem=acc_stage_x3_sems.at[buf_id],
+                ).wait()
 
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                dst_ref=a2a_s_acc_x2_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                sem=acc_stage_x3_sems.at[buf_id],
-            ).start()
+            with jax.named_scope("v1_acc_hbm_store"):
+                pltpu.make_async_copy(
+                    src_ref=a2a_s_acc_stage_x3_vmem.at[
+                        buf_id,
+                        pl.ds(0, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd2_per_t_packing),
+                    ],
+                    dst_ref=a2a_s_acc_x2_hbm.at[
+                        e_sem_id,
+                        pl.ds(tile_start, token_tile),
+                        pl.ds(0, t_packing),
+                        pl.ds(0, bd2_per_t_packing),
+                    ],
+                    sem=acc_stage_x3_sems.at[buf_id],
+                ).start()
 
         def with_static_bw(bw_sem_id, body):
             return lax.cond(
@@ -2037,8 +2050,9 @@ def _fused_ep_moe_kernel(
 
                 @pl.when(next_sz != 0)
                 def _():
-                    start_fetch_bw1(next_local_e_id, jnp.int32(0), jnp.int32(0), jnp.int32(0))
-                    start_fetch_bw3(next_local_e_id, jnp.int32(0), jnp.int32(0), jnp.int32(0))
+                    with jax.named_scope("v1_next_expert_prefetch"):
+                        start_fetch_bw1(next_local_e_id, jnp.int32(0), jnp.int32(0), jnp.int32(0))
+                        start_fetch_bw3(next_local_e_id, jnp.int32(0), jnp.int32(0), jnp.int32(0))
 
         def run_bf_no_bd(*, bf_id: int, bw_sem_id):
             def body(bw_sem_id: int):
@@ -2092,37 +2106,39 @@ def _fused_ep_moe_kernel(
 
                     wait_stage_a2a_s_tile(token_buf_id)
 
-                    dynamic_ffn1(
-                        t_vmem=b_stage_x2_vmem.at[token_buf_id],
-                        w1_vmem=w1_vmem,
-                        w1_scale_vmem=w1_scale_vmem,
-                        b1_vmem=b1_vmem,
-                        w3_vmem=w3_vmem,
-                        w3_scale_vmem=w3_scale_vmem,
-                        b3_vmem=b3_vmem,
-                        acc1_vmem=b_acc1_vmem,
-                        acc3_vmem=b_acc3_vmem,
-                        dyn_sz=tile_sz,
-                        should_init=True,
-                        bf_id=bf_id,
-                    )
+                    with jax.named_scope("v1_ffn1_gate_up"):
+                        dynamic_ffn1(
+                            t_vmem=b_stage_x2_vmem.at[token_buf_id],
+                            w1_vmem=w1_vmem,
+                            w1_scale_vmem=w1_scale_vmem,
+                            b1_vmem=b1_vmem,
+                            w3_vmem=w3_vmem,
+                            w3_scale_vmem=w3_scale_vmem,
+                            b3_vmem=b3_vmem,
+                            acc1_vmem=b_acc1_vmem,
+                            acc3_vmem=b_acc3_vmem,
+                            dyn_sz=tile_sz,
+                            should_init=True,
+                            bf_id=bf_id,
+                        )
 
                     @pl.when(bf_id != 0)
                     def _():
                         start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, jnp.int32(0))
                         wait_stage_a2a_s_acc_tile(jnp.int32(0))
 
-                    dynamic_ffn2(
-                        acc1_vmem=b_acc1_vmem,
-                        acc3_vmem=b_acc3_vmem,
-                        w2_vmem=w2_vmem,
-                        w2_scale_vmem=w2_scale_vmem,
-                        b2_vmem=b2_vmem,
-                        res_vmem=a2a_s_acc_stage_x3_vmem.at[0],
-                        dyn_sz=tile_sz,
-                        should_init=should_init_ffn2,
-                        bd2_id=jnp.int32(0),
-                    )
+                    with jax.named_scope("v1_ffn2_down"):
+                        dynamic_ffn2(
+                            acc1_vmem=b_acc1_vmem,
+                            acc3_vmem=b_acc3_vmem,
+                            w2_vmem=w2_vmem,
+                            w2_scale_vmem=w2_scale_vmem,
+                            b2_vmem=b2_vmem,
+                            res_vmem=a2a_s_acc_stage_x3_vmem.at[0],
+                            dyn_sz=tile_sz,
+                            should_init=should_init_ffn2,
+                            bd2_id=jnp.int32(0),
+                        )
                     start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, jnp.int32(0))
                     wait_stage_a2a_s_acc_tile(jnp.int32(0))
                     return next_buf_id
@@ -2133,8 +2149,9 @@ def _fused_ep_moe_kernel(
 
                     @pl.when(has_tokens)
                     def _():
-                        start_fetch_bw1(local_e_id, w13_sem_id, bf_id + 1, jnp.int32(0))
-                        start_fetch_bw3(local_e_id, w13_sem_id, bf_id + 1, jnp.int32(0))
+                        with jax.named_scope("v1_next_bf_prefetch"):
+                            start_fetch_bw1(local_e_id, w13_sem_id, bf_id + 1, jnp.int32(0))
+                            start_fetch_bw3(local_e_id, w13_sem_id, bf_id + 1, jnp.int32(0))
 
                 else:
                     _prefetch_next_expert_if_needed()
