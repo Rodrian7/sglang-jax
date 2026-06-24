@@ -15,6 +15,7 @@ This module mirrors the approach used by
 from __future__ import annotations
 
 import logging
+import os
 
 import jax.numpy as jnp
 
@@ -324,6 +325,29 @@ def get_tuned_fused_moe_block_config(
         cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
     if cfg_tuple is None:
         cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
+
+    # EXPERIMENT (AINFER_LING_SINGLE_TILE=1): force ling_v3_flash
+    # (hidden=2560, intermediate=768) to a single full-width tile, mirroring
+    # AInfer's tuned config (bf=768, bd1=bd2=2560).  Bypasses table-key matching
+    # (sglang folds the shared expert into the kernel -> use_shared_expert=True,
+    # which would not match AInfer's use_shared_expert=False ling entry).
+    # effective_for() shrinks bt to gcd(bt, local_num_tokens) so one config
+    # covers every num_tokens bucket.  Isolates the SINGLE variable "no hidden
+    # tiling" to test whether v2's decode advantage over v1 is just the v1
+    # default (bf=512/bd=1024 multi-tile) hidden-split overhead.
+    if (
+        os.environ.get("AINFER_LING_SINGLE_TILE") == "1"
+        and hidden_size == 2560
+        and intermediate_size == 768
+    ):
+        logger.info(
+            "AINFER_LING_SINGLE_TILE: forcing single full-width tile "
+            "(bf=768, bd1=bd2=2560) for ling_v3_flash"
+        )
+        return FusedMoEBlockConfig(
+            bt=512, bf=768, bd1=2560, bd2=2560,
+            btc=512, bfc=768, bd1c=2560, bd2c=2560, bse=768,
+        )
 
     if cfg_tuple is None:
         return DEFAULT_FUSED_MOE_BLOCK_CONFIG

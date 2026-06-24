@@ -33,6 +33,32 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
+# Shared, bounded thread pool for parallel GCS range reads. A single global
+# pool caps *total* concurrent HTTP streams across all MoE groups loading at
+# once (the outer MOE_PARALLEL_GROUPS loop × inner per-chunk fan-out would
+# otherwise multiply into hundreds of sockets). Probe on tpu-v7 showed GCS
+# single-bucket egress saturates at ~800 MB/s with 8 concurrent streams
+# (3.4× over the 238 MB/s gcsfuse single-stream path), so 16 is comfortably
+# past the knee while leaving headroom.
+_GCS_RANGE_WORKERS = int(os.environ.get("GCS_RANGE_WORKERS", "16"))
+_GCS_RANGE_CHUNK = int(os.environ.get("GCS_RANGE_CHUNK_MB", "64")) << 20
+_GCS_RANGE_POOL = None
+_GCS_RANGE_POOL_LOCK = __import__("threading").Lock()
+
+
+def _get_gcs_range_pool():
+    """Lazily create the shared range-read pool (only when gcsfs is used)."""
+    global _GCS_RANGE_POOL
+    if _GCS_RANGE_POOL is None:
+        with _GCS_RANGE_POOL_LOCK:
+            if _GCS_RANGE_POOL is None:
+                _GCS_RANGE_POOL = ThreadPoolExecutor(
+                    max_workers=_GCS_RANGE_WORKERS,
+                    thread_name_prefix="gcs-range",
+                )
+    return _GCS_RANGE_POOL
+
+
 if not hasattr(np, "float8_e4m3fn"):
     np.float8_e4m3fn = ml_dtypes.float8_e4m3fn
 if not hasattr(np, "float8_e5m2"):
@@ -1688,6 +1714,78 @@ class WeightLoader:
             # Read all expert data from files (parallel across files)
             expert_data_map = {}  # log_idx -> np.ndarray
 
+            # When GCS_WEIGHTS_PREFIX is set (e.g. gs://bucket/path), use
+            # gcsfs direct HTTP reads instead of going through gcsfuse FUSE.
+            # This avoids kernel round-trips and typically doubles throughput
+            # (229→581 MB/s observed on ling_v3_flash).
+            # The env var maps MODEL_DIR to its GCS equivalent:
+            #   /tmp/models/ling_v3_flash → gs://ant_asystem/models/ling_v3_flash
+            _gcs_prefix = os.environ.get("GCS_WEIGHTS_PREFIX", "")
+            _model_dir = os.environ.get("MODEL_DIR", "")
+
+            # Resolve a gcsfs-backed opener. When GCS_WEIGHTS_PREFIX is set
+            # (e.g. gs://ant_asystem/models/ling_v3_flash), use gcsfs direct
+            # HTTP reads instead of going through gcsfuse FUSE. This avoids
+            # kernel round-trips and typically doubles throughput.
+            _gcsfs_fs = None
+            if _gcs_prefix and _model_dir:
+                try:
+                    import gcsfs
+                    _gcsfs_fs = gcsfs.GCSFileSystem()
+                except Exception:
+                    pass
+
+            def _maybe_gcsfs_open(fname):
+                """Open *fname* via gcsfs if it lives under MODEL_DIR, else local."""
+                if _gcsfs_fs is not None and fname.startswith(_model_dir):
+                    rel = fname[len(_model_dir):].lstrip("/")
+                    gcs_path = f"{_gcs_prefix.rstrip('/')}/{rel}"
+                    try:
+                        return _gcsfs_fs.open(gcs_path, "rb")
+                    except Exception:
+                        pass  # fall through to local open
+                return open(fname, "rb")
+
+            def _use_gcsfs_for(fname):
+                return _gcsfs_fs is not None and fname.startswith(_model_dir)
+
+            def _gcs_path_for(fname):
+                rel = fname[len(_model_dir):].lstrip("/")
+                return f"{_gcs_prefix.rstrip('/')}/{rel}"
+
+            def _parallel_range_read(gcs_path, start, length):
+                """Read [start, start+length) via concurrent 64MB range GETs.
+
+                Returns a single bytes object. Each chunk opens its own gcsfs
+                handle (gcsfs file objects are not thread-safe to share) and
+                seeks to its slice; the shared bounded pool caps total sockets.
+                """
+                if length <= _GCS_RANGE_CHUNK:
+                    with _gcsfs_fs.open(gcs_path, "rb") as f:
+                        f.seek(start)
+                        return f.read(length)
+
+                chunks = []
+                off = 0
+                while off < length:
+                    clen = min(_GCS_RANGE_CHUNK, length - off)
+                    chunks.append((off, clen))
+                    off += clen
+
+                buf = bytearray(length)
+
+                def _read_chunk(c):
+                    coff, clen = c
+                    with _gcsfs_fs.open(gcs_path, "rb") as f:
+                        f.seek(start + coff)
+                        data = f.read(clen)
+                    buf[coff:coff + len(data)] = data
+                    return len(data)
+
+                pool = _get_gcs_range_pool()
+                list(pool.map(_read_chunk, chunks))
+                return bytes(buf)
+
             def _bulk_read_file(fname, entries):
                 entries.sort(key=lambda e: e[1])
                 min_off = entries[0][1]
@@ -1695,10 +1793,19 @@ class WeightLoader:
                 rng = max_end - min_off
                 actual = len(entries) * expert_nbytes
                 result = {}
+
                 if rng <= actual * 2 and len(entries) > 1:
-                    with open(fname, "rb") as f:
-                        f.seek(min_off)
-                        bulk = f.read(rng)
+                    # Contiguous (or near-contiguous) block: one big read.
+                    # On gcsfs, split it into parallel range GETs (3.4× over
+                    # single-stream); on local/gcsfuse, plain sequential read.
+                    if _use_gcsfs_for(fname):
+                        bulk = _parallel_range_read(
+                            _gcs_path_for(fname), min_off, rng
+                        )
+                    else:
+                        with open(fname, "rb") as f:
+                            f.seek(min_off)
+                            bulk = f.read(rng)
                     for log_idx, byte_off, hf_key in entries:
                         local_off = byte_off - min_off
                         arr = np.frombuffer(
@@ -1709,7 +1816,7 @@ class WeightLoader:
                         ).reshape(single_expert_shape)
                         result[log_idx] = arr.copy()
                 else:
-                    with open(fname, "rb") as f:
+                    with _maybe_gcsfs_open(fname) as f:
                         for log_idx, byte_off, hf_key in entries:
                             f.seek(byte_off)
                             raw = f.read(expert_nbytes)
@@ -2038,8 +2145,12 @@ class WeightLoader:
 
                 self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
 
-            # 3. Process MoE Weights (Lazy Pull)
-            for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
+            # 3. Process MoE Weights — validation + collect I/O tasks, then
+            #    execute them in parallel via ThreadPoolExecutor.
+            _moe_parallel = int(os.environ.get("MOE_PARALLEL_GROUPS", "4"))
+            _moe_io_tasks = []  # (moe_key, task_dict)
+
+            for moe_key, mapping in moe_mappings.items():
                 expected_hf_keys = mapping.target_path[1:]
 
                 group_complete = True
@@ -2101,98 +2212,25 @@ class WeightLoader:
                         # Standard Sharding
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
-                    # 2. Call creator
-                    _t_load_start = time.monotonic()
-                    stacked_weight = self._create_stacked_moe_lazy_tensor(
-                        expected_hf_keys,
-                        weight_info,
-                        file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
-                        physical_to_logical_map=mapping.physical_to_logical_map,
-                    )
-                    _t_load = time.monotonic() - _t_load_start
-                    loaded_shape = stacked_weight.shape
-
-                    if mapping.reshape is not None:
-                        stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
-
-                    if mapping.repeat is not None:
-                        axis, times = mapping.repeat
-                        stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
-
-                    # 3. Direct assignment
-                    target_path = mapping.target_path[0]
-                    model_param = self._get_param(params, target_path)
-                    stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
-                        stacked_weight,
-                        model_param,
-                        target_path,
-                    )
-
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.debug(
-                            "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            stacked_weight.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                        )
-
-                    try:
-                        _t_assign_start = time.monotonic()
-                        if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = stacked_weight
-                        else:
-                            model_param.value = stacked_weight.astype(model_param.value.dtype)
-                        _t_assign = time.monotonic() - _t_assign_start
-                        logger.debug(
-                            "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
-                            "shape=%s sharding=%s",
-                            moe_key,
-                            _t_load,
-                            _t_assign,
-                            _t_load + _t_assign,
-                            loaded_shape,
-                            mapping.sharding,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            stacked_weight.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                            str(e),
-                        )
-                        raise
-
-                    if mapping.physical_to_logical_map is not None:
-                        num_logical = len(expected_hf_keys)
-                        num_physical = len(mapping.physical_to_logical_map)
-                        logger.info(
-                            "Assigned MoE group %s with redundant experts: %d logical -> %d physical, shape: %s",
-                            moe_key,
-                            num_logical,
-                            num_physical,
-                            stacked_weight.shape,
-                        )
-                    else:
-                        logger.info(
-                            "Assigned MoE group %s, shape: %s",
-                            moe_key,
-                            stacked_weight.shape,
-                        )
+                    # Collect I/O task for parallel execution below.
+                    _moe_io_tasks.append({
+                        "moe_key": moe_key,
+                        "fn": self._create_stacked_moe_lazy_tensor,
+                        "args": (
+                            expected_hf_keys,
+                            weight_info,
+                            file_manager,
+                            mapping.transpose,
+                            final_sharding,
+                            mapping.physical_to_logical_map,
+                        ),
+                        "reshape": mapping.reshape,
+                        "repeat": mapping.repeat,
+                        "target_path": mapping.target_path[0],
+                        "sharding": mapping.sharding,
+                        "physical_to_logical_map": mapping.physical_to_logical_map,
+                        "is_stacked": True,
+                    })
                 else:
                     ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                     if "expert" in mapping.sharding:
@@ -2209,77 +2247,97 @@ class WeightLoader:
                                 jax.sharding.AxisType.Explicit,
                             ),
                         )
-                        # Use regular mesh for loading individual expert weights (TP sharding only)
                         final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
                     else:
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
-                    expert_weights = self._create_stacked_split_moe_lazy_tensor(
-                        expected_hf_keys,
-                        weight_info,
-                        file_manager,
-                        concat_axis=mapping.concat_axis,
-                        do_transpose=mapping.transpose,
-                        target_sharding=final_sharding,
-                        physical_to_logical_map=mapping.physical_to_logical_map,
-                    )
-                    loaded_shape = expert_weights.shape
+                    _moe_io_tasks.append({
+                        "moe_key": moe_key,
+                        "fn": self._create_stacked_split_moe_lazy_tensor,
+                        "args": (
+                            expected_hf_keys,
+                            weight_info,
+                            file_manager,
+                            mapping.concat_axis,
+                            mapping.transpose,
+                            final_sharding,
+                            mapping.physical_to_logical_map,
+                        ),
+                        "reshape": mapping.reshape,
+                        "repeat": mapping.repeat,
+                        "target_path": mapping.target_path[0],
+                        "sharding": mapping.sharding,
+                        "physical_to_logical_map": None,
+                        "is_stacked": False,
+                    })
 
-                    if mapping.reshape is not None:
-                        expert_weights = jnp.reshape(expert_weights, mapping.reshape)
+            # ── Phase 2: parallel I/O ──────────────────────────────
+            if _moe_io_tasks:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                    if mapping.repeat is not None:
-                        axis, times = mapping.repeat
-                        expert_weights = jnp.repeat(expert_weights, times, axis=axis)
+                logger.info(
+                    "Dispatching %d MoE groups across %d I/O workers…",
+                    len(_moe_io_tasks),
+                    _moe_parallel,
+                )
+                _t_moe_parallel_start = time.monotonic()
 
-                    target_path = mapping.target_path[0]
-                    model_param = self._get_param(params, target_path)
-                    expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
-                        expert_weights,
-                        model_param,
-                        target_path,
-                    )
+                def _run_one_task(task):
+                    fn = task["fn"]
+                    result = fn(*task["args"])
+                    if task["reshape"] is not None:
+                        result = jnp.reshape(result, task["reshape"])
+                    if task["repeat"] is not None:
+                        axis, times = task["repeat"]
+                        result = jnp.repeat(result, times, axis=axis)
+                    return task, result
 
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.debug(
-                            "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            expert_weights.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
+                with ThreadPoolExecutor(max_workers=_moe_parallel) as ex:
+                    futures = {
+                        ex.submit(_run_one_task, t): t for t in _moe_io_tasks
+                    }
+                    for fut in tqdm(
+                        as_completed(futures),
+                        total=len(futures),
+                        desc="Loading MoE Weights",
+                    ):
+                        task, weight = fut.result()
+                        moe_key = task["moe_key"]
+                        target_path = task["target_path"]
+                        model_param = self._get_param(params, target_path)
+                        weight = self._maybe_convert_epmoe_scale_for_kernel(
+                            weight, model_param, target_path
                         )
 
-                    try:
-                        if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = expert_weights
+                        if weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                            model_param.value = weight
                         else:
-                            model_param.value = expert_weights.astype(model_param.value.dtype)
-                    except Exception as e:
-                        logger.error(
-                            "Failed Split-MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            expert_weights.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                            str(e),
-                        )
-                        raise
+                            model_param.value = weight.astype(model_param.value.dtype)
 
-                    logger.info(
-                        "Assigned MoE group %s (Grok Split-Stitch), shape: %s",
-                        moe_key,
-                        expert_weights.shape,
-                    )
+                        if task["is_stacked"]:
+                            if task.get("physical_to_logical_map") is not None:
+                                logger.debug(
+                                    "Assigned MoE group %s (redundant experts), shape: %s",
+                                    moe_key, weight.shape,
+                                )
+                            else:
+                                logger.debug(
+                                    "Assigned MoE group %s, shape: %s",
+                                    moe_key, weight.shape,
+                                )
+                        else:
+                            logger.debug(
+                                "Assigned MoE group %s (Split-Stitch), shape: %s",
+                                moe_key, weight.shape,
+                            )
+
+                _t_moe_parallel = time.monotonic() - _t_moe_parallel_start
+                logger.info(
+                    "MoE parallel load complete: %d groups in %.1fs (%.1f groups/s)",
+                    len(_moe_io_tasks),
+                    _t_moe_parallel,
+                    len(_moe_io_tasks) / _t_moe_parallel if _t_moe_parallel > 0 else 0,
+                )
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
