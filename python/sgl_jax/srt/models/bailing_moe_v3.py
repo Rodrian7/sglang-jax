@@ -984,7 +984,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 )
                 phy_to_log = physical_to_logical_map[layer_idx]
 
-            if moe_backend == "fused":
+            if moe_backend in ("fused", "fused_v2", "fused_v4"):
+                # v1/v2/v4 all inherit FusedEPMoE's w1/w3/w2 EP weight layout.
+                # v4 reshards EP->TP after load (reshape_weights_for_tp), so at
+                # load time it uses the same ("data","tensor") expert sharding.
                 expert_target_map = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
                 fused_sharding = (("data", "tensor"), None, None)
             else:  # epmoe
