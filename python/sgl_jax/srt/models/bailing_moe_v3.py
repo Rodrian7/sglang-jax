@@ -460,12 +460,17 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     num_shared_experts=0,
                     moe_shared_expert_intermediate_size=config.moe_shared_expert_intermediate_size,
                 )
-                if fused_cls is FusedEPMoEV2:
-                    fused_kwargs["swiglu_limit"] = config.expert_swiglu_limit(layer_idx)
-                    fused_kwargs["shared_swiglu_limit"] = config.shared_expert_swiglu_limit(
-                        layer_idx
-                    )
                 self.experts = fused_cls(**fused_kwargs)
+                # FusedEPMoEV2 takes the per-layer SwiGLU clamp at CALL time (it is
+                # a __call__ kwarg, not __init__). v1/v4/EPMoE take no extra kwargs.
+                self._moe_call_kwargs = (
+                    dict(
+                        swiglu_limit=config.expert_swiglu_limit(layer_idx),
+                        shared_swiglu_limit=config.shared_expert_swiglu_limit(layer_idx),
+                    )
+                    if fused_cls is FusedEPMoEV2
+                    else {}
+                )
                 if config.num_shared_experts > 0:
                     self.shared_experts = BailingMoeV3MLP(
                         hidden_size=config.hidden_size,
@@ -564,7 +569,9 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 )
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-            hidden_states = self.experts(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.experts(
+                hidden_states, topk_weights, topk_ids, **getattr(self, "_moe_call_kwargs", {})
+            )
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
