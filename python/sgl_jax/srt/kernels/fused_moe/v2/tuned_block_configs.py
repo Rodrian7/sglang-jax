@@ -67,9 +67,15 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # Ling3-flash: E=512, H=2560, I=768, top_k=8, bf16, ep=8, in-kernel shared
         # expert (se_inter=768), grouped topk (n_group=8). Tuned on bench-4 v7x
         # (8 dev) against the #1387 optimized v2 (compact loop + num_bf==1 rolling
-        # weight double-buffer). bf=768 (num_bf=1) beats bf=256: decode 0.117->
-        # 0.090ms (bs=1 real/1-valid 0.046ms), prefill 2.240->1.679ms.
+        # weight double-buffer). bf=768 (num_bf=1) beats bf=256.
+        # NOTE on num_tokens: bf16 t_packing=2, so a decode step (bs=1) pads to
+        # ep_size*t_packing. At ep=8 that is 16 (not 8) -> the 16-token entry is
+        # the one the e2e decode actually hits; the legacy 8-token entry below is
+        # kept for the microbench but is dead for the tp=8 e2e path.
+        # tokens=16 tuned 2026-06-24 (ep=8, in-kernel shared): bf=768 0.114ms vs
+        # bf=256 0.153ms.
         ('bfloat16', 'bfloat16', 8, 512, 8, 2560, 768, 8, True, True): (8, 768, 8, 128, 8),
+        ('bfloat16', 'bfloat16', 16, 512, 8, 2560, 768, 8, True, True): (8, 768, 8, 128, 8),
         ('bfloat16', 'bfloat16', 4096, 512, 8, 2560, 768, 8, True, True): (256, 768, 256, 768, 256),
     },
     "*": {},
