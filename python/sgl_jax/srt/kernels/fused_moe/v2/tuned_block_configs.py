@@ -64,6 +64,13 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, True, True, True): (16, 1024, 32, 1024, 32),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, True, True, True): (128, 512, 80, 512, 160),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, True, True, True): (128, 512, 80, 512, 160),
+        # Ling3-flash: E=512, H=2560, I=768, top_k=8, bf16, ep=8, in-kernel shared
+        # expert (se_inter=768), grouped topk (n_group=8). Tuned on bench-4 v7x
+        # (8 dev) against the #1387 optimized v2 (compact loop + num_bf==1 rolling
+        # weight double-buffer). bf=768 (num_bf=1) beats bf=256: decode 0.117->
+        # 0.090ms (bs=1 real/1-valid 0.046ms), prefill 2.240->1.679ms.
+        ('bfloat16', 'bfloat16', 8, 512, 8, 2560, 768, 8, True, True): (8, 768, 8, 128, 8),
+        ('bfloat16', 'bfloat16', 4096, 512, 8, 2560, 768, 8, True, True): (256, 768, 256, 768, 256),
     },
     "*": {},
 }
