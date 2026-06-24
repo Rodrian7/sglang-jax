@@ -626,7 +626,14 @@ class FusedEPMoEV2(FusedEPMoE):
                 intermediate_size=self.intermediate_dim,
                 dtype=hidden_states.dtype,
                 weight_dtype=self.w1.value.dtype,
-                ep_size=self.ep_size,
+                # Tune lookup must key on the ACTUAL EP (full mesh = data*tensor),
+                # not self.ep_size: the fused kernel always treats the whole 2D
+                # mesh as its EP group, but self.ep_size comes from config.ep_size
+                # (often left at 1, e.g. Ling3 via the long-ctx bench), which made
+                # the lookup miss every tuned entry and silently fall back to the
+                # untuned _large_expert_default. For models that set config.ep_size
+                # == mesh size (e.g. MiMo) this is a no-op.
+                ep_size=get_ep_size(self.mesh, "data", "tensor"),
                 use_shared_expert=self.w1_shared is not None,
                 use_grouped_topk=self.use_grouped_topk,
                 enable_act_quant=enable_act_quant,
