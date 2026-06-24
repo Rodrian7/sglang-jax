@@ -31,7 +31,7 @@ from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBack
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.attention.fla.gated_rmsnorm import GatedRMSNorm
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2, FusedTPMoEV4
 from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -397,7 +397,11 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         # MLP — layer 0 dense, layers 1..23 MoE.
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        self.use_fused = self.moe_backend == "fused"
+        self.use_fused = self.moe_backend in (
+            MoEBackend.FUSED,
+            MoEBackend.FUSED_V2,
+            MoEBackend.FUSED_V4,
+        )
 
         if not self.is_moe_layer:
             self.mlp = BailingMoeV3MLP(
@@ -427,17 +431,18 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
-                if (
-                    config.expert_swiglu_limit(layer_idx) is not None
-                    or config.shared_expert_swiglu_limit(layer_idx) is not None
-                ):
-                    raise NotImplementedError(
-                        f"layer {layer_idx}: FusedEPMoE path does not yet implement "
-                        "SwiGLU clamp; fused kernel folds silu*up inside its fused "
-                        "moe op. Use the EPMoE backend (default) for Flash, or "
-                        "extend fused_moe to plumb the clamp before enabling fused."
-                    )
-                self.experts = FusedEPMoE(
+                # v2/v4 dispatch (current-main FusedEPMoE/V2/V4 signature). Shared
+                # expert kept EXTERNAL (num_shared_experts=0) for both so the routed
+                # MoE kernels compare apples-to-apples. FusedEPMoEV2 supports the
+                # per-layer SwiGLU clamp; FusedTPMoEV4 (bf16-only) does not, so its
+                # late-layer clamp is skipped (perf comparison, not bit-exact).
+                if self.moe_backend == MoEBackend.FUSED_V4:
+                    fused_cls = FusedTPMoEV4
+                elif self.moe_backend == MoEBackend.FUSED_V2:
+                    fused_cls = FusedEPMoEV2
+                else:
+                    fused_cls = FusedEPMoE
+                fused_kwargs = dict(
                     hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
@@ -447,16 +452,31 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_idx,
                     ep_size=getattr(config, "ep_size", 1),
-                    activation_fn=config.score_function,
                     renormalize_topk_logits=config.norm_topk_prob,
                     routed_scaling_factor=config.routed_scaling_factor,
                     use_grouped_topk=config.n_group > 0,
                     num_groups=config.n_group,
                     top_k_groups=config.topk_group,
-                    num_shared_experts=config.num_shared_experts,
+                    num_shared_experts=0,
                     moe_shared_expert_intermediate_size=config.moe_shared_expert_intermediate_size,
                 )
-                self.shared_experts = None
+                if fused_cls is FusedEPMoEV2:
+                    fused_kwargs["swiglu_limit"] = config.expert_swiglu_limit(layer_idx)
+                    fused_kwargs["shared_swiglu_limit"] = config.shared_expert_swiglu_limit(
+                        layer_idx
+                    )
+                self.experts = fused_cls(**fused_kwargs)
+                if config.num_shared_experts > 0:
+                    self.shared_experts = BailingMoeV3MLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=config.moe_shared_expert_intermediate_size
+                        * config.num_shared_experts,
+                        mesh=mesh,
+                        dtype=dtype,
+                        swiglu_limit=config.shared_expert_swiglu_limit(layer_idx),
+                    )
+                else:
+                    self.shared_experts = None
             else:
                 self.experts = EPMoE(
                     hidden_size=config.hidden_size,
@@ -713,6 +733,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
+            # FUSED_V4: one-time EP->TP reshard per MoE layer (no-op for v1/v2/EPMoE).
+            experts = getattr(layer, "experts", None)
+            if isinstance(experts, FusedTPMoEV4):
+                experts.reshape_weights_for_tp()
         logger.info("Ling3 weights loaded successfully.")
 
     def _assert_full_ckpt_coverage(
