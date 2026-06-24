@@ -431,17 +431,20 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
-                # v2/v4 dispatch (current-main FusedEPMoE/V2/V4 signature). Shared
-                # expert kept EXTERNAL (num_shared_experts=0) for both so the routed
-                # MoE kernels compare apples-to-apples. FusedEPMoEV2 supports the
-                # per-layer SwiGLU clamp; FusedTPMoEV4 (bf16-only) does not, so its
-                # late-layer clamp is skipped (perf comparison, not bit-exact).
+                # v2/v4 dispatch (current-main FusedEPMoE/V2/V4 signature).
+                # Shared-expert placement is per-backend (each in its best config):
+                #   - FusedEPMoEV2 computes the shared expert IN-KERNEL (its native
+                #     fused fast path) — num_shared_experts>0, no external MLP.
+                #   - FusedTPMoEV4 (TP, no in-kernel shared) and v1 keep an EXTERNAL
+                #     BailingMoeV3MLP shared expert.
+                # FusedEPMoEV2 also takes the per-layer SwiGLU clamp at call time.
                 if self.moe_backend == MoEBackend.FUSED_V4:
                     fused_cls = FusedTPMoEV4
                 elif self.moe_backend == MoEBackend.FUSED_V2:
                     fused_cls = FusedEPMoEV2
                 else:
                     fused_cls = FusedEPMoE
+                inkernel_shared = fused_cls is FusedEPMoEV2
                 fused_kwargs = dict(
                     hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
@@ -457,7 +460,9 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     use_grouped_topk=config.n_group > 0,
                     num_groups=config.n_group,
                     top_k_groups=config.topk_group,
-                    num_shared_experts=0,
+                    num_shared_experts=(
+                        config.num_shared_experts if inkernel_shared else 0
+                    ),
                     moe_shared_expert_intermediate_size=config.moe_shared_expert_intermediate_size,
                 )
                 self.experts = fused_cls(**fused_kwargs)
@@ -471,7 +476,8 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     if fused_cls is FusedEPMoEV2
                     else {}
                 )
-                if config.num_shared_experts > 0:
+                # External shared expert ONLY when not computed in-kernel (v4/v1).
+                if config.num_shared_experts > 0 and not inkernel_shared:
                     self.shared_experts = BailingMoeV3MLP(
                         hidden_size=config.hidden_size,
                         intermediate_size=config.moe_shared_expert_intermediate_size
@@ -1013,20 +1019,37 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     physical_to_logical_map=phy_to_log,
                 )
 
-            # Shared experts.
+            # Shared experts. fused_v2 computes the shared expert IN-KERNEL, so its
+            # weights load into the FusedEPMoEV2 shared Params (experts.w{1,3,2}_shared,
+            # fully replicated). All other backends (fused_v4/v1/epmoe) use an EXTERNAL
+            # BailingMoeV3MLP at {target_prefix}.shared_experts.
             if self.config.num_shared_experts > 0:
-                for proj_name, sharding in [
-                    ("gate_proj", (None, "tensor")),
-                    ("up_proj", (None, "tensor")),
-                    ("down_proj", ("tensor", None)),
-                ]:
-                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = (
-                        WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
-                            sharding=sharding,
-                            transpose=True,
+                if moe_backend == "fused_v2":
+                    for hf_name, target_name in [
+                        ("gate_proj", "w1_shared"),
+                        ("up_proj", "w3_shared"),
+                        ("down_proj", "w2_shared"),
+                    ]:
+                        mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight"] = (
+                            WeightMapping(
+                                target_path=f"{target_prefix}.experts.{target_name}",
+                                sharding=(None, None),
+                                transpose=True,
+                            )
                         )
-                    )
+                else:
+                    for proj_name, sharding in [
+                        ("gate_proj", (None, "tensor")),
+                        ("up_proj", (None, "tensor")),
+                        ("down_proj", ("tensor", None)),
+                    ]:
+                        mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = (
+                            WeightMapping(
+                                target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
+                                sharding=sharding,
+                                transpose=True,
+                            )
+                        )
 
         return mappings
 
