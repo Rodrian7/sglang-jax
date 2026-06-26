@@ -48,7 +48,8 @@ NEG_INF = -jnp.inf
 
 # Largest BT the multi-block (grid>1) path is known to fit in v7x VMEM (double-buffered [BT,E]
 # inputs; see tuned_block_sizes / analysis-zh.md). The "auto" path never tiles above this without
-# warning.
+# warning. The kernel's per-block working set is ~independent of topk (the final-select runs as a
+# fori_loop carrying a single [BT,E], not an unrolled O(topk) chain), so this bound holds for any k.
 SAFE_AUTO_BT = 2048
 
 
@@ -127,33 +128,37 @@ def _grouped_topk_kernel(
         masked = jnp.concatenate(masked_slices, axis=1)  # [BT, E]
 
     # ③ select `topk` experts, lowest-index tie-break (matches jax.lax.top_k); weight is taken from
-    #    the PRE-bias logits at the selected id (matches gate.py).
+    #    the PRE-bias logits at the selected id (matches gate.py). Run as a fori_loop that carries a
+    #    single [BT,E] working array `cur` and writes each pick into column k of the [BT,padded_topk]
+    #    output buffers via a masked update, so per-block VMEM is O(BT*E) — independent of topk. (A
+    #    Python unroll kept O(topk) live [BT,E] temporaries and OOM'd VMEM for large k, e.g. k=128.)
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
-        cur = masked
-        id_cols, w_cols = [], []
-        for k in range(topk):
+        col_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, padded_topk), 1)
+        # The output minor (lane) dim is padded topk -> padded_topk (multiple of 128) so the VMEM
+        # tile is lane-aligned on TPU. Columns >= topk are never written by the loop, so they keep
+        # these fillers (ids = -1, weights = 0.0); the wrapper slices [:, :topk] outside the kernel.
+        ids_init = jnp.full((bt, padded_topk), -1, dtype=jnp.int32)
+        w_init = jnp.zeros((bt, padded_topk), dtype=jnp.float32)
+
+        def _pick(k, carry):
+            cur, ids_buf, w_buf = carry
             cmax = jnp.max(cur, axis=1, keepdims=True)
             idx = jnp.min(
                 jnp.where(cur == cmax, e_iota, num_experts), axis=1, keepdims=True
-            )  # [BT,1]
+            )  # [BT,1] lowest-index tie-break
             sel = e_iota == idx  # [BT, E]
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=1, keepdims=True)  # [BT, 1]
-            id_cols.append(idx.astype(jnp.int32))
-            w_cols.append(wval.astype(jnp.float32))
-            if k != topk - 1:
-                cur = jnp.where(sel, NEG_INF, cur)
+            write = col_iota == k  # [BT, padded_topk] one-hot on column k (loop index)
+            ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
+            w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
+            cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
+            return cur, ids_buf, w_buf
 
-    # Pad the minor (lane) dim topk -> padded_topk (multiple of 128) so the output VMEM tile is
-    # lane-aligned on TPU. Filler ids = -1, filler weights = 0.0; the wrapper slices [:, :topk]
-    # outside the kernel, so the padding is transparent to callers.
-    n_pad = padded_topk - topk
-    if n_pad > 0:
-        id_cols.append(jnp.full((bt, n_pad), -1, dtype=jnp.int32))
-        w_cols.append(jnp.zeros((bt, n_pad), dtype=jnp.float32))
+        _, ids_out, w_out = jax.lax.fori_loop(0, topk, _pick, (masked, ids_init, w_init))
 
-    ids_ref[...] = jnp.concatenate(id_cols, axis=1)  # [BT, padded_topk]
-    w_ref[...] = jnp.concatenate(w_cols, axis=1)  # [BT, padded_topk]
+    ids_ref[...] = ids_out  # [BT, padded_topk]
+    w_ref[...] = w_out  # [BT, padded_topk]
 
 
 def grouped_topk_pallas(
