@@ -94,6 +94,7 @@ def _grouped_topk_kernel(
     topk: int,
     num_experts: int,
     padded_topk: int,
+    full_unroll: bool,
 ):
     S = num_experts // n_group
     logits = logits_ref[...].astype(jnp.float32)  # pre-bias
@@ -165,7 +166,8 @@ def _grouped_topk_kernel(
 
         # Full-unroll (overlap all picks) when the working set fits VMEM, else roll (1 live [BT,E]).
         # bt, num_experts, topk are all static here, so this is a compile-time choice.
-        full_unroll = topk * bt * num_experts <= FULL_UNROLL_ELEM_BUDGET
+        # `full_unroll` is decided in the wrapper (knows bt, E, topk). Full unroll overlaps all picks
+        # (fast) but keeps O(topk) live [BT,E]; rolled keeps one (safe, allows a larger BT).
         _, ids_out, w_out = jax.lax.fori_loop(
             0, topk, _pick, (masked, ids_init, w_init), unroll=topk if full_unroll else 1
         )
@@ -182,6 +184,7 @@ def grouped_topk_pallas(
     topk_group: int,
     topk: int,
     block_tokens: int | str = "auto",
+    unroll: bool | None = None,
     interpret: bool | None = None,
 ):
     """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
@@ -191,6 +194,10 @@ def grouped_topk_pallas(
 
     `block_tokens="auto"` (default) looks up the tuned BT for this device + (BS, E, G, Gtop, k)
     and falls back to a safe default on a miss; an explicit int forces that block size.
+
+    `unroll` selects the final-select loop form: None (default) full-unrolls when the working set
+    `topk*BT*E` fits VMEM (`FULL_UNROLL_ELEM_BUDGET`) else rolls; True/False force the choice. Full
+    unroll is faster but keeps O(topk) live [BT,E] (needs a smaller BT); rolling allows a larger BT.
     """
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
@@ -224,6 +231,10 @@ def grouped_topk_pallas(
         interpret = get_interpret()
 
     padded_topk = _align_to(topk, 128)  # TPU VMEM output tile needs a 128-multiple minor dim
+    if unroll is None:
+        full_unroll = topk * bt * e <= FULL_UNROLL_ELEM_BUDGET
+    else:
+        full_unroll = bool(unroll)
     kernel = functools.partial(
         _grouped_topk_kernel,
         n_group=num_expert_group,
@@ -231,6 +242,7 @@ def grouped_topk_pallas(
         topk=topk,
         num_experts=e,
         padded_topk=padded_topk,
+        full_unroll=full_unroll,
     )
     weights, ids = pl.pallas_call(
         kernel,
