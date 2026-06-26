@@ -235,10 +235,8 @@ def grouped_topk_pallas(
         interpret = get_interpret()
 
     padded_topk = _align_to(topk, 128)  # TPU VMEM output tile needs a 128-multiple minor dim
-    if unroll is None:
-        full_unroll = topk * bt * e <= FULL_UNROLL_ELEM_BUDGET
-    else:
-        full_unroll = bool(unroll)
+    
+    full_unroll = topk * bt * e <= FULL_UNROLL_ELEM_BUDGET if unroll is None else bool(unroll)
     kernel = functools.partial(
         _grouped_topk_kernel,
         n_group=num_expert_group,

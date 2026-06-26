@@ -189,7 +189,7 @@ disable_error_code = [
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
 explicit = true
 
 [tool.uv.sources]

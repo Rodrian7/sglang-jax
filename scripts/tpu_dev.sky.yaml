@@ -1,0 +1,30 @@
+# Minimal single-chip TPU v6e dev box for iterating on the grouped-topk kernel / profiling.
+# Clones the primatrix branch and installs deps, then stays idle (no run command) so you can
+# ssh in and run things interactively. Local WIP (uncommitted edits) is rsync'd over after launch.
+#
+#   sky launch -c tpu-dev scripts/tpu_dev.sky.yaml -y
+#   ssh tpu-dev
+#
+# Tear down when done:
+#   sky down tpu-dev -y
+name: tpu-dev
+
+resources:
+  accelerators: tpu-v6e-1
+  accelerator_args:
+    runtime_version: v2-alpha-tpuv6e
+  use_spot: false  # on-demand so a dev box isn't preempted mid-session; pass --use-spot to override
+
+envs:
+  REPO: https://github.com/primatrix/sglang-jax.git
+  REF: bench/grouped-topk-tpu
+
+setup: |
+  set -e
+  if [ -d sglang-jax ]; then rm -rf sglang-jax; fi
+  git clone --branch "$REF" --single-branch "$REPO" sglang-jax
+  cd sglang-jax
+  uv venv --python 3.12 .venv
+  source .venv/bin/activate
+  uv pip install -e "python[tpu]"
+  python -c "import jax; print('jax', jax.__version__, '| devices', jax.devices())"
