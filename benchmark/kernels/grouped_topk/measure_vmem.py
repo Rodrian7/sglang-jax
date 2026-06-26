@@ -46,8 +46,14 @@ def _compiles(bt, e, G, Gtop, topk, full_unroll, limit_bytes):
     try:
         f.lower(x, bias).compile()
         return True
-    except Exception:  # noqa: BLE001 -- any compile failure (RESOURCE_EXHAUSTED etc.) means "too small"
-        return False
+    except Exception as exc:  # noqa: BLE001
+        # Only a VMEM/resource-exhaustion failure means "limit too small". Anything else
+        # (bad signature, missing attr, ...) is a real bug -- re-raise so it isn't silently
+        # reported as OOM across the whole sweep.
+        msg = str(exc).lower()
+        if "resource_exhausted" in msg or "vmem" in msg or "exceeds" in msg or "allocate" in msg:
+            return False
+        raise
 
 
 def peak_vmem(bt, e, G, Gtop, topk, full_unroll, lo=64 << 10, hi=128 * MiB):

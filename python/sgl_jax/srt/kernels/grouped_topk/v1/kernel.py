@@ -252,7 +252,9 @@ def grouped_topk_pallas(
     if vmem_limit_bytes is not None:
         import jax.experimental.pallas.tpu as pltpu
 
-        compiler_params = pltpu.TPUCompilerParams(vmem_limit_bytes=vmem_limit_bytes)
+        # jax<0.8 exposed this as TPUCompilerParams; 0.8+ renamed it to CompilerParams.
+        params_cls = getattr(pltpu, "CompilerParams", None) or pltpu.TPUCompilerParams
+        compiler_params = params_cls(vmem_limit_bytes=vmem_limit_bytes)
     weights, ids = pl.pallas_call(
         kernel,
         grid=(bs // bt,),
