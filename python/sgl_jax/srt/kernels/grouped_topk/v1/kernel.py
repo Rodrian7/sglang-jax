@@ -52,12 +52,13 @@ NEG_INF = -jnp.inf
 # fori_loop carrying a single [BT,E], not an unrolled O(topk) chain), so this bound holds for any k.
 SAFE_AUTO_BT = 2048
 
-# Final-select fori_loop unroll factor. The loop is data-dependent, but unrolling U iterations per
-# body recovers most of the cross-iteration pipelining the old Python unroll had, while keeping the
-# live [BT,E] temporaries bounded at ~U (per-block VMEM stays O(BT*E*U), independent of topk). U=4
-# is VMEM-safe for E<=512 at BT<=SAFE_AUTO_BT; raise via env to trade VMEM for speed. (A full unroll
-# = topk overlapped at once, which is why the old kernel was fast AND OOM'd for large k.)
-FINAL_SELECT_UNROLL = max(1, int(os.environ.get("SGL_GROUPED_TOPK_UNROLL", "4")))
+# Final-select unroll policy. A full unroll overlaps all `topk` picks (fast) but keeps O(topk) live
+# [BT,E] temporaries; a rolled loop keeps one (safe, ~15-44% slower). Pallas only allows fori_loop
+# unroll=1 or unroll=num_steps (no partial), so we pick per-call: full-unroll when the working set
+# `topk * BT * E` fits VMEM, else roll. The budget is calibrated to TPU v6e/v7x (~32 MiB scoped
+# VMEM; OOM observed at ~16.8M elems). Being conservative only costs speed — the rolled fallback
+# always fits — so lower it for smaller-VMEM TPU generations if needed.
+FULL_UNROLL_ELEM_BUDGET = 10_000_000  # max topk * BT * E to take the full-unroll fast path
 
 
 def _align_to(x: int, a: int) -> int:
@@ -162,8 +163,11 @@ def _grouped_topk_kernel(
             cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
             return cur, ids_buf, w_buf
 
+        # Full-unroll (overlap all picks) when the working set fits VMEM, else roll (1 live [BT,E]).
+        # bt, num_experts, topk are all static here, so this is a compile-time choice.
+        full_unroll = topk * bt * num_experts <= FULL_UNROLL_ELEM_BUDGET
         _, ids_out, w_out = jax.lax.fori_loop(
-            0, topk, _pick, (masked, ids_init, w_init), unroll=FINAL_SELECT_UNROLL
+            0, topk, _pick, (masked, ids_init, w_init), unroll=topk if full_unroll else 1
         )
 
     ids_ref[...] = ids_out  # [BT, padded_topk]

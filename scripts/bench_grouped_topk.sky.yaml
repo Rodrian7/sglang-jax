@@ -53,11 +53,8 @@ run: |
   source .venv/bin/activate
   echo "=== environment ==="
   python -c "import jax; print('jax', jax.__version__, '| devices', jax.devices())"
-  echo "=== ref=$REF  sweep: T=$T  CONFIGS=$CONFIGS  UNROLLS=${UNROLLS:-default} ==="
-  # UNROLLS (space-separated) sweeps the final-select fori_loop unroll factor for tuning; unset =>
-  # one run at the kernel default (SGL_GROUPED_TOPK_UNROLL).
-  for U in ${UNROLLS:-_}; do
-    [ "$U" = "_" ] || echo "##### SGL_GROUPED_TOPK_UNROLL=$U #####"
-    [ "$U" = "_" ] && unset SGL_GROUPED_TOPK_UNROLL || export SGL_GROUPED_TOPK_UNROLL="$U"
-    python -m benchmark.kernels.grouped_topk.bench_grouped_topk --T "$T" --configs "$CONFIGS"
-  done 2>&1 | tee grouped_topk_bench.log
+  echo "=== ref=$REF  sweep: T=$T  CONFIGS=$CONFIGS ==="
+  python -m benchmark.kernels.grouped_topk.bench_grouped_topk \
+    --T "$T" \
+    --configs "$CONFIGS" \
+    2>&1 | tee grouped_topk_bench.log
