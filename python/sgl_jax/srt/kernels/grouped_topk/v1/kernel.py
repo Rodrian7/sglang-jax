@@ -186,6 +186,7 @@ def grouped_topk_pallas(
     block_tokens: int | str = "auto",
     unroll: bool | None = None,
     interpret: bool | None = None,
+    vmem_limit_bytes: int | None = None,
 ):
     """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
 
@@ -198,6 +199,9 @@ def grouped_topk_pallas(
     `unroll` selects the final-select loop form: None (default) full-unrolls when the working set
     `topk*BT*E` fits VMEM (`FULL_UNROLL_ELEM_BUDGET`) else rolls; True/False force the choice. Full
     unroll is faster but keeps O(topk) live [BT,E] (needs a smaller BT); rolling allows a larger BT.
+
+    `vmem_limit_bytes` (None = compiler default) caps the Mosaic scoped-VMEM budget; binary-search
+    it to measure a config's real peak VMEM (the smallest value that still compiles).
     """
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
@@ -244,6 +248,11 @@ def grouped_topk_pallas(
         padded_topk=padded_topk,
         full_unroll=full_unroll,
     )
+    compiler_params = None
+    if vmem_limit_bytes is not None:
+        import jax.experimental.pallas.tpu as pltpu
+
+        compiler_params = pltpu.TPUCompilerParams(vmem_limit_bytes=vmem_limit_bytes)
     weights, ids = pl.pallas_call(
         kernel,
         grid=(bs // bt,),
@@ -261,5 +270,6 @@ def grouped_topk_pallas(
         ],
         interpret=interpret,
         name="grouped-topk",
+        compiler_params=compiler_params,
     )(router_logits, bias)
     return weights[:, :topk], ids[:, :topk]
