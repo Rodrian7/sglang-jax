@@ -27,16 +27,15 @@ resources:
 envs:
   REPO: https://github.com/primatrix/sglang-jax.git
   REF: bench/grouped-topk-tpu
-  # Token counts (rows) to sweep. Comma-separated.
-  T: "64,128,256,512,1024,2048,4096,8192,16384,32768"
-  # Routing configs as name:E/G/Gtop/k. E=num_experts, G=num_expert_group,
-  # Gtop=topk_group (groups kept), k=topk (final experts). Must satisfy
-  # E % G == 0, E/G >= 2, Gtop <= G, and k <= Gtop * (E/G).
-  # The default sweep varies Gtop in {2,4,6,8} and k in {4,8,16,32,64} to map how
-  # the fused vs sort gap moves with routing breadth/depth, plus two E=512 points.
-  # `dsv3` is the canonical DeepSeek-V3 shape; `gt2_k64` is the tightest valid
-  # case (k == Gtop * E/G == 64).
-  CONFIGS: "dsv3:256/8/4/8,gt2_k4:256/8/2/4,gt6_k8:256/8/6/8,gt8_k8:256/8/8/8,gt4_k16:256/8/4/16,gt4_k32:256/8/4/32,gt4_k64:256/8/4/64,gt2_k64:256/8/2/64,e512_gt4_k8:512/8/4/8,e512_gt6_k64:512/8/6/64"
+  # Token counts (rows) to sweep: decode-like / mid / prefill-like. Kept small so
+  # the k-sweep finishes fast; widen if you also want the T curve.
+  T: "128,1024,4096"
+  # Pure k-sweep: E, G, Gtop are held fixed (256/8/Gtop=4, so experts-per-group=32)
+  # and ONLY k (topk) varies, to isolate k's effect on the fused-vs-sort gap. The
+  # fused kernel is ~constant in k (one VMEM-resident reduce loop) while the sort
+  # path grows with k, so the speedup should rise with k. Gtop=4 allows k up to
+  # 128 (= 4*32); the default stops at 64. name:E/G/Gtop/k.
+  CONFIGS: "k4:256/8/4/4,k8:256/8/4/8,k16:256/8/4/16,k32:256/8/4/32,k64:256/8/4/64"
 
 setup: |
   set -e
