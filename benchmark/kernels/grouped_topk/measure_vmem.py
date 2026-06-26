@@ -1,18 +1,21 @@
 """Measure the real peak scoped-VMEM of `grouped_topk_pallas` and verify what scales with topk.
 
-Method: compile each (BT, E, topk, unroll) ONCE at the compiler's default VMEM limit (fast -- no
-near-threshold spilling). If it fits, we only learn "<= default". If it OOMs, the Mosaic/XLA error
-states the exact bytes it tried to allocate -> that's the config's peak VMEM need. We push topk high
-enough that full-unroll OOMs at several points, then read the slope off those exact byte counts:
+Method: compile each (BT, E, topk, unroll) under a deliberately tiny `vmem_limit_bytes` so Mosaic's
+stack allocator immediately reports the kernel's total scoped-VMEM need and bails -- the message
 
-    full-unroll  peak grows ~ topk * (BT*E*4)   slope == BT*E*4   (the replicated [BT,E] `cur`)
-    rolled       peak ~ const (one live [BT,E])  -> always fits, never OOMs
+    "Scoped allocation with size 58.33M and limit 32.00M exceeded scoped vmem limit by 26.33M"
 
-If the full-unroll OOM bytes rise by ~BT*E*4 per unit topk (NOT BT*128*4), the variable that gets
-topk live copies is `cur`, confirming the kernel comment. Run on a TPU host:
+states the exact size. This stack-size check is fast at any limit (unlike a near-threshold limit,
+which makes Mosaic spill/retry for ~30s). We parse that size for every config and read the slope:
+
+    full-unroll  peak grows with topk  (XLA keeps several live [BT,E] `cur` copies, not all topk)
+    rolled       peak ~ const          (one live [BT,E])
+
+If full-unroll's size rises with topk while rolled stays flat, the variable that replicates is `cur`
+([BT,E]), confirming the kernel comment. Run on a TPU host:
 
     python -m benchmark.kernels.grouped_topk.measure_vmem \
-        --T 2048 --E 256 --G 8 --Gtop 4 --topks 16,32,64,128 --unroll full,rolled
+        --T 2048 --E 256 --G 8 --Gtop 4 --topks 8,16,32,64,128 --unroll full,rolled
 """
 
 import argparse
@@ -25,20 +28,15 @@ from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 
 MiB = 1 << 20
 
-# Mosaic/XLA VMEM-OOM messages vary by version; pull the largest byte count out of any of them, e.g.
-#   "Failed to allocate request for 33.55M (35192832B) on device ... (VMEM)"
-#   "...VMEM... requested 35192832 bytes ... limit 33554432 bytes"
-_BYTES_RE = re.compile(r"(\d[\d,]*)\s*(?:B\b|bytes)")
+# Force OOM with a tiny limit so the stack allocator prints the total need immediately.
+TINY_LIMIT = 1 << 20  # 1 MiB -- below any real config, fails fast
+
+# "Scoped allocation with size 58.33M and limit 32.00M exceeded ..." -> 58.33 (MiB)
+_SIZE_RE = re.compile(r"Scoped allocation with size ([\d.]+)M")
 
 
-def _oom_bytes(msg):
-    """Largest byte count mentioned in an OOM message (the requested allocation), or None."""
-    nums = [int(m.replace(",", "")) for m in _BYTES_RE.findall(msg)]
-    return max(nums) if nums else None
-
-
-def compile_vmem(bt, e, G, Gtop, topk, full_unroll):
-    """Compile once at the default VMEM limit. Returns ('ok', None) or ('oom', bytes|None)."""
+def scoped_vmem_mib(bt, e, G, Gtop, topk, full_unroll):
+    """Total scoped-VMEM (MiB) the kernel needs, from the forced-OOM stack message. None if unparsed."""
     x = jnp.zeros((bt, e), jnp.float32)
     bias = jnp.zeros((e,), jnp.float32)
     f = jax.jit(
@@ -50,15 +48,19 @@ def compile_vmem(bt, e, G, Gtop, topk, full_unroll):
             topk=topk,
             block_tokens=bt,  # single block: one [BT,E] tile, no grid noise
             unroll=full_unroll,
+            vmem_limit_bytes=TINY_LIMIT,
         )
     )
     try:
         f.lower(x, bias).compile()
-        return "ok", None
+        return 0.0  # compiled even under 1 MiB (shouldn't happen for these sizes)
     except Exception as exc:  # noqa: BLE001
+        m = _SIZE_RE.search(str(exc))
+        if m:
+            return float(m.group(1))
         msg = str(exc).lower()
-        if "resource_exhausted" in msg or "vmem" in msg or "exceeds" in msg or "allocate" in msg:
-            return "oom", _oom_bytes(str(exc))
+        if "resource_exhausted" in msg or "vmem" in msg:
+            return None  # OOM but size not parsed
         raise
 
 
@@ -72,37 +74,31 @@ def main():
     ap.add_argument("--E", type=int, default=256, help="num experts")
     ap.add_argument("--G", type=int, default=8, help="num expert groups")
     ap.add_argument("--Gtop", type=int, default=4, help="topk_group")
-    ap.add_argument("--topks", type=_parse_csv_int, default=[16, 32, 64, 128])
+    ap.add_argument("--topks", type=_parse_csv_int, default=[8, 16, 32, 64, 128])
     ap.add_argument("--unroll", type=str, default="full,rolled", help="full,rolled")
     args = ap.parse_args()
 
     bt, e = args.T, args.E
-    cur_step = bt * e * 4  # bytes added per +1 topk IF `cur` [BT,E] is what replicates
-    buf_step = bt * 128 * 4  # bytes added per +128 topk IF ids/w_buf [BT,padded_topk] dominates
-    print(f"BT={bt} E={e} G={args.G} Gtop={args.Gtop}")
-    print(f"  predicted per-topk slope if `cur`:        BT*E*4   = {cur_step/MiB:.3f} MiB")
-    print(f"  predicted per-topk slope if `ids/w_buf`:  BT*128*4 = {buf_step/MiB:.3f} MiB")
+    tile_mib = bt * e * 4 / MiB  # one [BT,E] f32 tile
+    print(f"BT={bt} E={e} G={args.G} Gtop={args.Gtop}  | one [BT,E] tile = {tile_mib:.3f} MiB")
 
     for mode in args.unroll.split(","):
         full = mode == "full"
         print(f"\n[{mode}]")
         prev_k = prev_v = None
         for k in args.topks:
-            status, nbytes = compile_vmem(bt, e, args.G, args.Gtop, k, full)
-            if status == "ok":
-                print(f"  topk={k:4d}  fits under default VMEM")
-                prev_k = prev_v = None  # reset slope baseline; OK rows have no exact number
+            v = scoped_vmem_mib(bt, e, args.G, args.Gtop, k, full)
+            if v is None:
+                print(f"  topk={k:4d}  OOM (size not parsed)")
                 continue
-            if nbytes is None:
-                print(f"  topk={k:4d}  OOM (bytes not parsed from message)")
-                continue
-            line = f"  topk={k:4d}  peak={nbytes/MiB:8.3f} MiB"
-            if prev_v is not None:
-                slope = (nbytes - prev_v) / (k - prev_k)
-                line += f"  slope={slope/MiB:6.3f} MiB/topk  (cur:{cur_step/MiB:.3f})"
+            line = f"  topk={k:4d}  scoped_vmem={v:8.3f} MiB"
+            if prev_v is not None and k != prev_k:
+                slope = (v - prev_v) / (k - prev_k)  # MiB per unit topk
+                line += f"  slope={slope:6.3f} MiB/topk  ([BT,E]={tile_mib:.3f})"
             print(line)
-            prev_k, prev_v = k, nbytes
+            prev_k, prev_v = k, v
 
 
 if __name__ == "__main__":
     main()
+
