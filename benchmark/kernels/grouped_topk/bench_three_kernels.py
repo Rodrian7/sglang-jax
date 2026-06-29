@@ -41,6 +41,7 @@ KERNELS = [
     ("kernel", False),
     ("kernel1", True),
     ("kernel2", True),
+    ("kernel3", True),
 ]
 
 # Directory holding the three kernel files (repo_root/python/sgl_jax/srt/kernels/grouped_topk/v1).

@@ -30,6 +30,7 @@ KERNEL_MODULES = {
     "kernel": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel",
     "kernel1": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel1",
     "kernel2": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel2",
+    "kernel3": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel3",
 }
 
 

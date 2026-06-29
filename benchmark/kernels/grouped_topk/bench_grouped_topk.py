@@ -33,7 +33,8 @@ try:
     from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
     from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel1 import grouped_topk_pallas as grouped_topk_pallas1
     from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel2 import grouped_topk_pallas as grouped_topk_pallas2
-    
+    from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel3 import grouped_topk_pallas as grouped_topk_pallas3
+
 except Exception:  # noqa: BLE001
     # The falcon-embedded variant prepends the kernel source; `grouped_topk_pallas` is then already
     # defined at module scope, nothing to import.
@@ -56,6 +57,7 @@ def kernel_registry():
         ("kernel", "grouped_topk_pallas"),
         ("kernel1", "grouped_topk_pallas1"),
         ("kernel2", "grouped_topk_pallas2"),
+        ("kernel3", "grouped_topk_pallas3"),
     ):
         fn = globals().get(gname)
         if fn is not None:
