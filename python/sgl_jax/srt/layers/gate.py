@@ -7,9 +7,20 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    get_global_server_args,
     topk_ids_logical_to_physical,
 )
+from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+
+def _grouped_topk_kernel_enabled() -> bool:
+    server_args = get_global_server_args()
+    return (
+        server_args is not None
+        and server_args.enable_grouped_topk_kernel
+        and server_args.device == "tpu"
+    )
 
 
 class GateLogit(nnx.Module):
@@ -157,6 +168,21 @@ class TopK(nnx.Module):
         return topk_weights, topk_ids
 
     def _biased_grouped_topk(
+        self,
+        router_logits: jax.Array,
+        correction_bias: jax.Array = None,
+    ):
+        if _grouped_topk_kernel_enabled():
+            return grouped_topk_pallas(
+                router_logits,
+                correction_bias,
+                num_expert_group=self.num_expert_group,
+                topk_group=self.topk_group,
+                topk=self.topk,
+            )
+        return self._biased_grouped_topk_jax(router_logits, correction_bias)
+
+    def _biased_grouped_topk_jax(
         self,
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
