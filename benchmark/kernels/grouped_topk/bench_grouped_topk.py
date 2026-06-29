@@ -208,10 +208,11 @@ def bench_config(name, E, G, Gtop, k, Ts, kernels, bt):
         for kn, ffn in ffns.items():
             try:
                 jax.block_until_ready(ffn(h))
-            except Exception as ex:  # noqa: BLE001  (VMEM OOM etc. -> mark NaN, keep going)
+            except Exception as ex:  # noqa: BLE001  (compile/VMEM error -> mark NaN, keep going)
                 times[kn] = float("nan")
-                if "RESOURCE_EXHAUSTED" not in str(ex) and "vmem" not in str(ex).lower():
-                    print(f"  {kn} T={T}: unexpected error: {str(ex)[:80]}")
+                msg = str(ex)
+                kind = "VMEM-OOM" if ("RESOURCE_EXHAUSTED" in msg or "vmem" in msg.lower()) else "ERROR"
+                print(f"  {kn} T={T}: {kind}: {msg.strip()[:500]}")
                 continue
             us, _ = _trace_scope_us(functools.partial(ffn, h), SCOPE_FUSED, f"{kn}_{name}_{T}")
             times[kn] = us

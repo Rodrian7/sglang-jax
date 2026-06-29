@@ -96,32 +96,31 @@ def _grouped_topk_kernel(
             axis=1,
         )
 
-    # pick topk ids (2 reductions/pick), defer weights
+    # pick topk ids into a width-E order buffer (2 reductions/pick), defer weights
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
-        col_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, padded_topk), 1)
 
         def _pick(k, carry):
-            cur, ids = carry
+            cur, order = carry
             cmax = jnp.max(cur, axis=1, keepdims=True)
             idx = jnp.min(jnp.where(cur == cmax, e_iota, num_experts), axis=1, keepdims=True)
-            ids = jnp.where(col_iota == k, idx, ids)
+            order = jnp.where(e_iota == k, idx, order)  # write pick k into column k
             cur = jnp.where(e_iota == idx, NEG_INF, cur)
-            return cur, ids
+            return cur, order
 
-        ids_init = jnp.full((bt, padded_topk), -1, jnp.int32)
-        _, ids = jax.lax.fori_loop(
-            0, topk, _pick, (masked, ids_init), unroll=topk if full_unroll else 1
+        order0 = jnp.zeros((bt, num_experts), jnp.int32)
+        _, order = jax.lax.fori_loop(
+            0, topk, _pick, (masked, order0), unroll=topk if full_unroll else 1
         )
 
-    # gather weights once from the pre-bias logits at the selected ids
+    # gather all weights in one shot (Mosaic gather needs output shape == input shape -> width E)
     with jax.named_scope("gather_weights"):
-        valid = ids >= 0
-        w = jnp.take_along_axis(logits, jnp.where(valid, ids, 0), axis=1)
-        w = jnp.where(valid, w, 0.0)
+        w_full = jnp.take_along_axis(logits, order, axis=1)  # [BT, E]
 
-    ids_ref[...] = ids
-    w_ref[...] = w
+    # columns >= topk are filler (order=0); the wrapper slices [:, :topk]. padded_topk <= E always
+    # here (E is a multiple of 128), so the width-E buffers cover the output tile.
+    ids_ref[...] = order[:, :padded_topk]
+    w_ref[...] = w_full[:, :padded_topk]
 
 
 def grouped_topk_pallas(
