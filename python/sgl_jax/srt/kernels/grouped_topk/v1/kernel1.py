@@ -148,7 +148,6 @@ def _grouped_topk_kernel(
                 cand_id.append((li + g * S).astype(jnp.int32))              # [BT,1] GLOBAL id
                 cand_wt.append(jnp.sum(jnp.where(sel, lg, 0.0), axis=1, keepdims=True))  # [BT,1]
                 cur = jnp.where(sel, NEG_INF, cur)
-        
         # C = n_group * t
         cand_score = jnp.concatenate(cand_score, axis=1)                    # [BT,C]
         cand_id = jnp.concatenate(cand_id, axis=1)                          # [BT,C] (all unique)

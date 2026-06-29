@@ -1,0 +1,78 @@
+# SkyPilot task: benchmark the three grouped-topk Pallas kernels on a Cloud TPU v6e-4.
+#
+#   sky launch -c gtopk skypilot.yaml      # provision + run
+#   sky logs gtopk                         # stream / re-read output
+#   sky down gtopk                         # tear down (TPUs bill while up!)
+#
+# Clones primatrix/sglang-jax @ bench/grouped-topk-tpu and runs
+# benchmark.kernels.grouped_topk.bench_three_kernels, which times the three interchangeable
+# implementations (kernel = python-unroll, kernel1 = narrow-candidate [BT,C],
+# kernel2 = fori_loop [BT,E]) head-to-head against the sort reference.
+
+name: grouped-topk-bench
+
+resources:
+  cloud: gcp
+  region: asia-northeast1          # v6e availability varies by region; change if it won't provision
+  accelerators: tpu-v6e-1
+  accelerator_args:
+    tpu_vm: True
+    runtime_version: v2-alpha-tpuv6e
+
+# Upload the SSH *private* key so the VM can `git clone git@github.com:...` (a public key cannot
+# authenticate). Point the local side at whichever key has read access to primatrix/sglang-jax.
+file_mounts:
+  ~/.ssh/id_ed25519: ~/.ssh/id_ed25519
+
+envs:
+  REPO_URL: https://github.com/primatrix/sglang-jax.git
+  REPO_BRANCH: bench/grouped-topk-tpu
+  REPO_DIR: sglang-jax
+
+setup: |
+  set -euo pipefail
+
+  # --- git over SSH: lock down the key, trust github's host key ---
+  chmod 600 ~/.ssh/id_ed25519
+  mkdir -p ~/.ssh
+  ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+  export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
+
+  # --- clone @ branch (idempotent across re-runs of setup) ---
+  if [ ! -d "$REPO_DIR/.git" ]; then
+    git clone --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"
+  fi
+  cd "$REPO_DIR"
+  git fetch origin "$REPO_BRANCH"
+  git checkout "$REPO_BRANCH"
+  git reset --hard "origin/$REPO_BRANCH"   # always run the latest pushed commit
+
+  # --- toolchain: uv-managed venv on py3.12 (pyproject requires >=3.12,<3.14) ---
+  command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  uv venv --python 3.12 .venv
+
+  # Editable install + the TPU JAX backend (jax[tpu]==0.8.1) + pytest for the equivalence gate.
+  uv pip install --python .venv/bin/python -e ./python
+  uv pip install --python .venv/bin/python "jax[tpu]==0.8.1" pytest
+
+# run: |
+#   set -euo pipefail
+#   export PATH="$HOME/.local/bin:$PATH"
+#   cd "$REPO_DIR"
+#   source .venv/bin/activate
+
+#   echo "===== JAX / devices ====="
+#   python -c "import jax; print('jax', jax.__version__); print('devices', jax.devices())"
+
+#   # Equivalence gate: all 3 kernels must be id-for-id identical to the gate.py reference before the
+#   # perf numbers mean anything. (These cases run in Pallas interpret mode, so they don't need a TPU.)
+#   echo "===== equivalence test (kernel / kernel1 / kernel2) ====="
+#   PALLAS_INTERPRET=1 python -m pytest python/sgl_jax/test/kernels/grouped_topk_test.py -q
+
+#   # Head-to-head device-time benchmark on the TPU.
+#   echo "===== bench_three_kernels (device time vs sort) ====="
+#   python -m benchmark.kernels.grouped_topk.bench_three_kernels \
+#     --T 512,1024,2048,4096,8192,16384 \
+#     --configs A_E256:256/8/4/8,B_E512:512/8/4/8 \
+#     --bt auto --unroll auto
