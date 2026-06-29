@@ -24,12 +24,12 @@ import re
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
+from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel2 import grouped_topk_pallas
 
 MiB = 1 << 20
 
 # Force OOM with a tiny limit so the stack allocator prints the total need immediately.
-TINY_LIMIT = 1 << 20  # 1 MiB -- below any real config, fails fast
+TINY_LIMIT = 1 << 10  # 1 KB -- below any real config, fails fast
 
 # "Scoped allocation with size 58.33M and limit 32.00M exceeded ..." -> 58.33 (MiB)
 _SIZE_RE = re.compile(r"Scoped allocation with size ([\d.]+)M")

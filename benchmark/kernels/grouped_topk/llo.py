@@ -58,7 +58,7 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
 from benchmark.kernels.grouped_topk.bench_grouped_topk import H, SCOPE_FUSED, _gate  # noqa: E402
-from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas  # noqa: E402
+from python.sgl_jax.srt.kernels.grouped_topk.v1.kernel2 import grouped_topk_pallas  # noqa: E402
 
 E, G, Gtop, k = (int(v) for v in ARGS.config.split("/"))
 UNROLL = ARGS.mode == "full"  # full -> unroll=True, roll -> unroll=False

@@ -4,19 +4,39 @@ Runs the Pallas kernel in CPU interpret mode (no TPU needed) and checks it is id
 to the reference sort-based routing (verbatim copy of `gate.py:TopK._biased_grouped_topk`,
 L159-193), with matching weights.
 
+Three interchangeable kernel implementations live under `v1/` and every correctness test below runs
+against ALL of them (the `kmod` fixture parametrizes the test id with `kernel`/`kernel1`/`kernel2`):
+
+  * kernel  — Python-unrolled final-select (O(topk) live [BT,E]); the one exported by `__init__`.
+  * kernel1 — narrow-candidate [BT,C] array, then a global top-k over the candidates.
+  * kernel2 — fori_loop carrying a single [BT,E], with a full/rolled unroll switch.
+
+They must be id-for-id identical to the reference (and thus to each other); the benchmark scripts
+under `benchmark/kernels/grouped_topk/` then measure which is fastest. So the equivalence proven here
+is the precondition that makes a performance comparison meaningful.
+
 Run:  PALLAS_INTERPRET=1 python -m pytest python/sgl_jax/test/kernels/grouped_topk_test.py -q
 """
+
+import importlib
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
-    SAFE_AUTO_BT,
-    _largest_safe_divisor,
-    grouped_topk_pallas,
-)
+# The three interchangeable implementations. Every test runs against each via the `kmod` fixture.
+KERNEL_MODULES = {
+    "kernel": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel",
+    "kernel1": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel1",
+    "kernel2": "python.sgl_jax.srt.kernels.grouped_topk.v1.kernel2",
+}
+
+
+@pytest.fixture(params=list(KERNEL_MODULES), ids=list(KERNEL_MODULES))
+def kmod(request):
+    """Yields each grouped-topk implementation module in turn (kernel / kernel1 / kernel2)."""
+    return importlib.import_module(KERNEL_MODULES[request.param])
 
 
 def ref_biased_grouped_topk(router_logits, correction_bias, *, num_expert_group, topk_group, topk):
@@ -54,14 +74,14 @@ BATCHES = [256, 512, 1024]
 
 @pytest.mark.parametrize("E,G,Gtop,k,name", CONFIGS)
 @pytest.mark.parametrize("bs", BATCHES)
-def test_pallas_eq_ref(E, G, Gtop, k, name, bs):
+def test_pallas_eq_ref(kmod, E, G, Gtop, k, name, bs):
     logits = _logits(bs, E, seed=2)
     bias = jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1
 
     w_ref, ids_ref = ref_biased_grouped_topk(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
     )
-    w_pal, ids_pal = grouped_topk_pallas(
+    w_pal, ids_pal = kmod.grouped_topk_pallas(
         logits,
         bias,
         num_expert_group=G,
@@ -87,7 +107,7 @@ def test_pallas_eq_ref(E, G, Gtop, k, name, bs):
     )
 
 
-def test_against_real_topk_module():
+def test_against_real_topk_module(kmod):
     """If the sgl_jax model stack imports cleanly, also check vs the real TopK module."""
     real_topk = pytest.importorskip("sgl_jax.srt.layers.gate", reason="gate.py import").TopK
     E, G, Gtop, k, bs = 256, 8, 4, 8, 512
@@ -95,7 +115,7 @@ def test_against_real_topk_module():
     bias = jax.random.normal(jax.random.PRNGKey(3), (E,), dtype=jnp.float32) * 0.1
     mod = real_topk(topk=k, renormalize=False, num_expert_group=G, topk_group=Gtop)
     w_real, ids_real = mod._biased_grouped_topk(logits, bias)
-    w_pal, ids_pal = grouped_topk_pallas(
+    w_pal, ids_pal = kmod.grouped_topk_pallas(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, interpret=True
     )
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_real))
@@ -113,15 +133,15 @@ def test_against_real_topk_module():
         (100, None),  # 100=2^2·5^2 has no multiple-of-8 divisor
     ],
 )
-def test_largest_safe_divisor(bs, expected):
+def test_largest_safe_divisor(kmod, bs, expected):
     """The auto fallback must pick a VMEM-safe, 8-aligned divisor of bs (or None)."""
-    d = _largest_safe_divisor(bs)
+    d = kmod._largest_safe_divisor(bs)
     assert d == expected, f"bs={bs}: got {d}, want {expected}"
     if d is not None:
-        assert bs % d == 0 and d % 8 == 0 and d <= SAFE_AUTO_BT
+        assert bs % d == 0 and d % 8 == 0 and d <= kmod.SAFE_AUTO_BT
 
 
-def test_auto_block_tokens_nondivisible():
+def test_auto_block_tokens_nondivisible(kmod):
     """`block_tokens='auto'` on an odd bucket (divisible by neither tuned BT nor 512) must still
     produce a correct result — and not silently tile the whole batch (the Codex P2)."""
     E, G, Gtop, k, bs = 256, 8, 4, 8, 1000  # 1000 % 512 != 0; on CPU the tuned lookup misses
@@ -130,7 +150,7 @@ def test_auto_block_tokens_nondivisible():
     w_ref, ids_ref = ref_biased_grouped_topk(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
     )
-    w_pal, ids_pal = grouped_topk_pallas(
+    w_pal, ids_pal = kmod.grouped_topk_pallas(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, interpret=True
     )  # block_tokens defaults to "auto"
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
@@ -144,7 +164,7 @@ def test_auto_block_tokens_nondivisible():
         (256, 4, 4, 128, "n_pad==0_k128"),  # padded_topk=128, n_pad=0 (no filler)
     ],
 )
-def test_topk_pad_boundary(E, G, Gtop, k, name):
+def test_topk_pad_boundary(kmod, E, G, Gtop, k, name):
     """Exercise both the n_pad>0 (topk<128) and n_pad==0 (topk==128) output-padding paths,
     and that the returned shape is sliced back to exactly (bs, topk)."""
     bs = 512
@@ -153,7 +173,7 @@ def test_topk_pad_boundary(E, G, Gtop, k, name):
     w_ref, ids_ref = ref_biased_grouped_topk(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
     )
-    w_pal, ids_pal = grouped_topk_pallas(
+    w_pal, ids_pal = kmod.grouped_topk_pallas(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=256, interpret=True
     )
     assert ids_pal.shape == (bs, k), f"{name}: shape {ids_pal.shape} != {(bs, k)}"
@@ -163,7 +183,7 @@ def test_topk_pad_boundary(E, G, Gtop, k, name):
     )
 
 
-def test_matches_ref_on_flat_ties():
+def test_matches_ref_on_flat_ties(kmod):
     """All scores equal -> reference returns the lowest indices in order; the kernel must match
     (the stable lowest-index tie-break, vs the hardware argmax which would reorder on TPU)."""
     E, G, Gtop, k, bs = 256, 8, 4, 8, 512
@@ -172,14 +192,14 @@ def test_matches_ref_on_flat_ties():
     w_ref, ids_ref = ref_biased_grouped_topk(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
     )
-    w_pal, ids_pal = grouped_topk_pallas(
+    w_pal, ids_pal = kmod.grouped_topk_pallas(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
     )
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
     np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
 
 
-def test_matches_ref_on_partial_ties():
+def test_matches_ref_on_partial_ties(kmod):
     """Force a within-group tie (experts 3 and 5 share a score) with distinct pre-bias weights, so a
     wrong tie-break would swap their topk positions / gathered weights. Must match the reference."""
     E, G, Gtop, k, bs = 256, 8, 4, 8, 512
@@ -189,7 +209,7 @@ def test_matches_ref_on_partial_ties():
     w_ref, ids_ref = ref_biased_grouped_topk(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
     )
-    w_pal, ids_pal = grouped_topk_pallas(
+    w_pal, ids_pal = kmod.grouped_topk_pallas(
         logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
     )
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))

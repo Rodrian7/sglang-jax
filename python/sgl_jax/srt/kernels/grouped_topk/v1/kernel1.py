@@ -48,8 +48,17 @@ NEG_INF = -jnp.inf
 
 # Largest BT the multi-block (grid>1) path is known to fit in v7x VMEM (double-buffered [BT,E]
 # inputs; see tuned_block_sizes / analysis-zh.md). The "auto" path never tiles above this without
-# warning.
+# warning. The kernel's per-block working set is ~independent of topk (the final-select runs as a
+# fori_loop carrying a single [BT,E], not an unrolled O(topk) chain), so this bound holds for any k.
 SAFE_AUTO_BT = 2048
+
+# Final-select unroll policy. A full unroll overlaps all `topk` picks (fast) but keeps O(topk) live
+# [BT,E] temporaries; a rolled loop keeps one (safe, ~15-44% slower). Pallas only allows fori_loop
+# unroll=1 or unroll=num_steps (no partial), so we pick per-call: full-unroll when the working set
+# `topk * BT * E` fits VMEM, else roll. The budget is calibrated to TPU v6e/v7x (~32 MiB scoped
+# VMEM; OOM observed at ~16.8M elems). Being conservative only costs speed — the rolled fallback
+# always fits — so lower it for smaller-VMEM TPU generations if needed.
+FULL_UNROLL_ELEM_BUDGET = 10_000_000  # max topk * BT * E to take the full-unroll fast path
 
 
 def _align_to(x: int, a: int) -> int:
@@ -85,6 +94,7 @@ def _grouped_topk_kernel(
     topk: int,
     num_experts: int,
     padded_topk: int,
+    full_unroll: bool,
 ):
     S = num_experts // n_group
     logits = logits_ref[...].astype(jnp.float32)  # pre-bias
@@ -118,42 +128,60 @@ def _grouped_topk_kernel(
             group_mask = jnp.logical_or(group_mask, m)
             tmp = jnp.where(m, NEG_INF, tmp)
 
-    # mask experts in dropped groups → -inf (per-group where + concat)
-    with jax.named_scope("expert_mask"):
-        masked_slices = []
+    # build NARROW candidates: top-t experts per group (t = max a single group can give
+    #     to the global top-k). Dropped groups are forced to NEG_INF so they rank last.
+    #     Replaces the [BT,E] `masked` working array with a [BT, C] one (C = n_group*t).
+    with jax.named_scope("candidates"):
+        t = min(topk, S)                       # max picks any one group can supply
+        loc_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, S), 1)
+        cand_score, cand_id, cand_wt = [], [], []
         for g in range(n_group):
-            gm = group_mask[:, g : g + 1]  # [BT, 1]
-            masked_slices.append(jnp.where(gm, scores[:, g * S : (g + 1) * S], NEG_INF))
-        masked = jnp.concatenate(masked_slices, axis=1)  # [BT, E]
-
-    # ③ select `topk` experts, lowest-index tie-break (matches jax.lax.top_k); weight is taken from
-    #    the PRE-bias logits at the selected id (matches gate.py).
-    with jax.named_scope("final_select"):
-        e_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
-        cur = masked
-        id_cols, w_cols = [], []
-        for k in range(topk):
-            cmax = jnp.max(cur, axis=1, keepdims=True)
-            idx = jnp.min(
-                jnp.where(cur == cmax, e_iota, num_experts), axis=1, keepdims=True
-            )  # [BT,1]
-            sel = e_iota == idx  # [BT, E]
-            wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=1, keepdims=True)  # [BT, 1]
-            id_cols.append(idx.astype(jnp.int32))
-            w_cols.append(wval.astype(jnp.float32))
-            if k != topk - 1:
+            gm = group_mask[:, g : g + 1]                                   # [BT,1]
+            sl = jnp.where(gm, scores[:, g * S : (g + 1) * S], NEG_INF)     # [BT,S] post-bias (rank)
+            lg = logits[:, g * S : (g + 1) * S]                             # [BT,S] pre-bias (weight)
+            cur = sl
+            for _ in range(t):                 # extend the same max-mask trick as group_top2
+                m = jnp.max(cur, axis=1, keepdims=True)
+                li = jnp.min(jnp.where(cur == m, loc_iota, S), axis=1, keepdims=True)  # local idx
+                sel = loc_iota == li
+                cand_score.append(m)                                        # [BT,1] rank key
+                cand_id.append((li + g * S).astype(jnp.int32))              # [BT,1] GLOBAL id
+                cand_wt.append(jnp.sum(jnp.where(sel, lg, 0.0), axis=1, keepdims=True))  # [BT,1]
                 cur = jnp.where(sel, NEG_INF, cur)
+        
+        # C = n_group * t
+        cand_score = jnp.concatenate(cand_score, axis=1)                    # [BT,C]
+        cand_id = jnp.concatenate(cand_id, axis=1)                          # [BT,C] (all unique)
+        cand_wt = jnp.concatenate(cand_wt, axis=1)                          # [BT,C]
 
-    # Pad the minor (lane) dim topk -> padded_topk (multiple of 128) so the output VMEM tile is
-    # lane-aligned on TPU. Filler ids = -1, filler weights = 0.0; the wrapper slices [:, :topk]
-    # outside the kernel, so the padding is transparent to callers.
-    n_pad = padded_topk - topk
-    if n_pad > 0:
-        id_cols.append(jnp.full((bt, n_pad), -1, dtype=jnp.int32))
-        w_cols.append(jnp.zeros((bt, n_pad), dtype=jnp.float32))
+    #  global top-k on the NARROW [BT,C] array. Tie-break by lowest GLOBAL id (matches
+    #    jax.lax.top_k) using cand_id directly — ids are unique so `cand_id == pick_id` is one-hot.
+    with jax.named_scope("final_select"):
+        col_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, padded_topk), 1)
+        ids_init = jnp.full((bt, padded_topk), -1, dtype=jnp.int32)
+        w_init = jnp.zeros((bt, padded_topk), dtype=jnp.float32)
 
-    ids_ref[...] = jnp.concatenate(id_cols, axis=1)  # [BT, padded_topk]
-    w_ref[...] = jnp.concatenate(w_cols, axis=1)  # [BT, padded_topk]
+        def _pick(k, carry):
+            cur, ids_buf, w_buf = carry                                     # cur: [BT,C]
+            cmax = jnp.max(cur, axis=1, keepdims=True)
+            pick_id = jnp.min(
+                jnp.where(cur == cmax, cand_id, num_experts), axis=1, keepdims=True
+            )                                                              # [BT,1] lowest global id
+            sel = cand_id == pick_id                                        # [BT,C] one-hot
+            pick_wt = jnp.sum(jnp.where(sel, cand_wt, 0.0), axis=1, keepdims=True)
+            write = col_iota == k
+            ids_buf = jnp.where(write, pick_id, ids_buf)
+            w_buf = jnp.where(write, pick_wt, w_buf)
+            cur = jnp.where(sel, NEG_INF, cur)
+            return cur, ids_buf, w_buf
+
+        _, ids_out, w_out = jax.lax.fori_loop(
+            0, topk, _pick, (cand_score, ids_init, w_init),
+            unroll=topk if full_unroll else 1,
+        )
+
+    ids_ref[...] = ids_out  # [BT, padded_topk]
+    w_ref[...] = w_out  # [BT, padded_topk]
 
 
 def grouped_topk_pallas(
@@ -164,7 +192,9 @@ def grouped_topk_pallas(
     topk_group: int,
     topk: int,
     block_tokens: int | str = "auto",
+    unroll: bool | None = None,
     interpret: bool | None = None,
+    vmem_limit_bytes: int | None = None,
 ):
     """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
 
@@ -173,6 +203,13 @@ def grouped_topk_pallas(
 
     `block_tokens="auto"` (default) looks up the tuned BT for this device + (BS, E, G, Gtop, k)
     and falls back to a safe default on a miss; an explicit int forces that block size.
+
+    `unroll` selects the final-select loop form: None (default) full-unrolls when the working set
+    `topk*BT*E` fits VMEM (`FULL_UNROLL_ELEM_BUDGET`) else rolls; True/False force the choice. Full
+    unroll is faster but keeps O(topk) live [BT,E] (needs a smaller BT); rolling allows a larger BT.
+
+    `vmem_limit_bytes` (None = compiler default) caps the Mosaic scoped-VMEM budget; binary-search
+    it to measure a config's real peak VMEM (the smallest value that still compiles).
     """
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
@@ -206,6 +243,8 @@ def grouped_topk_pallas(
         interpret = get_interpret()
 
     padded_topk = _align_to(topk, 128)  # TPU VMEM output tile needs a 128-multiple minor dim
+    
+    full_unroll = topk * bt * e <= FULL_UNROLL_ELEM_BUDGET if unroll is None else bool(unroll)
     kernel = functools.partial(
         _grouped_topk_kernel,
         n_group=num_expert_group,
@@ -213,7 +252,15 @@ def grouped_topk_pallas(
         topk=topk,
         num_experts=e,
         padded_topk=padded_topk,
+        full_unroll=full_unroll,
     )
+    compiler_params = None
+    if vmem_limit_bytes is not None:
+        import jax.experimental.pallas.tpu as pltpu
+
+        # jax<0.8 exposed this as TPUCompilerParams; 0.8+ renamed it to CompilerParams.
+        params_cls = getattr(pltpu, "CompilerParams", None) or pltpu.TPUCompilerParams
+        compiler_params = params_cls(vmem_limit_bytes=vmem_limit_bytes)
     weights, ids = pl.pallas_call(
         kernel,
         grid=(bs // bt,),
@@ -231,5 +278,6 @@ def grouped_topk_pallas(
         ],
         interpret=interpret,
         name="grouped-topk",
+        compiler_params=compiler_params,
     )(router_logits, bias)
     return weights[:, :topk], ids[:, :topk]
