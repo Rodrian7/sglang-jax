@@ -1,15 +1,11 @@
-"""Tuned `block_tokens` (BT) for `grouped_topk_pallas`, keyed by device + routing shape.
+"""Tuned `(block_tokens, unroll)` for `grouped_topk_pallas`, keyed by device + routing shape.
 
-Populated by `benchmark/kernels/grouped_topk/tune_grouped_topk_bt.py` on real TPU. BT is the
-strongest perf lever for this kernel (bigger BT = fewer grid steps = less launch/pipeline
-overhead); the tuned value is the largest BT that fits VMEM. Lookup falls back to None on a miss
-so the caller can use a safe default.
+Tuned jointly by `benchmark/kernels/grouped_topk/tune_grouped_topk_bt.py` on real TPU: BT trades
+grid-step overhead, `unroll` (the final-select `fori_loop` factor, 1..topk) trades pick-overlap
+against the largest BT that fits VMEM. Lookup returns None on a miss so callers use a safe default.
 
-Key: (next_power_of_2(T_local), E, G, Gtop, k)  where T_local is the per-device token count.
-Source: exp-gu55bjx7yd (v7x, single-host v7x-8). +29%..+66% over block_tokens=512 for T>=1024.
-
-Self-contained on purpose (only `jax`): keeps the grouped_topk package dependency-light so the
-kernel stays embeddable / fast to import.
+Key: (next_power_of_2(T_local), E, G, Gtop, k), T_local = per-device token count. Self-contained
+(only `jax`) to keep the kernel embeddable.
 """
 
 import logging
@@ -37,59 +33,58 @@ def _device_name() -> str:
     return kind
 
 
-# device_name -> {(pow2(T), E, G, Gtop, k): BT}
-TUNED_BT: dict[str, dict[tuple, int]] = {
+# device_name -> {(pow2(T), E, G, Gtop, k): (BT, unroll)}
+# unroll=8 below = full unroll (topk) -- the pre-lever default; re-run the tuner to refine it.
+TUNED_BT: dict[str, dict[tuple, tuple[int, int]]] = {
     "TPU v7": {
         # E=256 (DeepSeek-V3 / Ling)
-        (64, 256, 8, 4, 8): 64,
-        (128, 256, 8, 4, 8): 128,
-        (256, 256, 8, 4, 8): 256,
-        (512, 256, 8, 4, 8): 512,
-        (1024, 256, 8, 4, 8): 1024,
-        (2048, 256, 8, 4, 8): 2048,
-        (4096, 256, 8, 4, 8): 2048,  # BT=4096 exceeds v7x scoped VMEM with padded outputs
-        (8192, 256, 8, 4, 8): 2048,  # multi-block double-buffer caps BT at 2048
-        (16384, 256, 8, 4, 8): 2048,
-        (32768, 256, 8, 4, 8): 2048,
+        (64, 256, 8, 4, 8): (64, 8),
+        (128, 256, 8, 4, 8): (128, 8),
+        (256, 256, 8, 4, 8): (256, 8),
+        (512, 256, 8, 4, 8): (512, 8),
+        (1024, 256, 8, 4, 8): (1024, 8),
+        (2048, 256, 8, 4, 8): (2048, 8),
+        (4096, 256, 8, 4, 8): (2048, 8),  # BT=4096 exceeds v7x scoped VMEM with padded outputs
+        (8192, 256, 8, 4, 8): (2048, 8),  # multi-block double-buffer caps BT at 2048
+        (16384, 256, 8, 4, 8): (2048, 8),
+        (32768, 256, 8, 4, 8): (2048, 8),
         # E=512 (MaxText)
-        (64, 512, 8, 4, 8): 64,
-        (128, 512, 8, 4, 8): 128,
-        (256, 512, 8, 4, 8): 256,
-        (512, 512, 8, 4, 8): 512,
-        (1024, 512, 8, 4, 8): 1024,
-        (2048, 512, 8, 4, 8): 2048,
-        (4096, 512, 8, 4, 8): 2048,  # E=512 doubles [BT,E] VMEM -> 4096 OOMs, cap 2048
-        (8192, 512, 8, 4, 8): 2048,
-        (16384, 512, 8, 4, 8): 2048,
-        (32768, 512, 8, 4, 8): 2048,
+        (64, 512, 8, 4, 8): (64, 8),
+        (128, 512, 8, 4, 8): (128, 8),
+        (256, 512, 8, 4, 8): (256, 8),
+        (512, 512, 8, 4, 8): (512, 8),
+        (1024, 512, 8, 4, 8): (1024, 8),
+        (2048, 512, 8, 4, 8): (2048, 8),
+        (4096, 512, 8, 4, 8): (2048, 8),  # E=512 doubles [BT,E] VMEM -> 4096 OOMs, cap 2048
+        (8192, 512, 8, 4, 8): (2048, 8),
+        (16384, 512, 8, 4, 8): (2048, 8),
+        (32768, 512, 8, 4, 8): (2048, 8),
     },
 }
 
 _WARNED_MISSES: set[tuple] = set()
 
 
-def get_tuned_bt(T: int, E: int, G: int, Gtop: int, k: int) -> int | None:
-    """Tuned block_tokens for this device + (T_local, E, G, Gtop, k), or None on miss.
-
-    Returns None (not an error) on a non-TPU device or an unseen shape, so callers fall back to a
-    safe default.
-    """
+def get_tuned_config(T: int, E: int, G: int, Gtop: int, k: int) -> tuple[int, int] | None:
+    """Tuned `(block_tokens, unroll)` for this device + key, or None on a non-TPU device / miss."""
     try:
         device = _device_name()
     except Exception:  # noqa: BLE001  (non-TPU device, etc.)
         return None
     key = (_next_power_of_2(T), E, G, Gtop, k)
-    bt = TUNED_BT.get(device, {}).get(key)
-    if bt is None and (device, key) not in _WARNED_MISSES:
+    cfg = TUNED_BT.get(device, {}).get(key)
+    if cfg is None and (device, key) not in _WARNED_MISSES:
         _WARNED_MISSES.add((device, key))
         logger.warning(
-            "grouped_topk: no tuned block_tokens for device=%s key=(pow2T=%d,E=%d,G=%d,Gtop=%d,k=%d)"
-            "; using default. Run benchmark/kernels/grouped_topk/tune_grouped_topk_bt.py to tune.",
+            "grouped_topk: no tuned (block_tokens, unroll) for device=%s key=%s; using default. "
+            "Run benchmark/kernels/grouped_topk/tune_grouped_topk_bt.py to tune.",
             device,
-            key[0],
-            E,
-            G,
-            Gtop,
-            k,
+            key,
         )
-    return bt
+    return cfg
+
+
+def get_tuned_bt(T: int, E: int, G: int, Gtop: int, k: int) -> int | None:
+    """Tuned block_tokens only (BT-only view of `get_tuned_config`), or None on miss."""
+    cfg = get_tuned_config(T, E, G, Gtop, k)
+    return cfg[0] if cfg is not None else None

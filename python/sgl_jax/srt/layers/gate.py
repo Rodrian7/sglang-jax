@@ -1,5 +1,7 @@
 """Gating and Top-K routing for MoE layers."""
 
+import functools
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -82,6 +84,7 @@ class TopK(nnx.Module):
         topk_group: int = 0,
         routed_scaling_factor: float | None = None,
         layer_id: int = 0,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         self.topk = topk
         self.renormalize = renormalize
@@ -89,6 +92,7 @@ class TopK(nnx.Module):
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
         self.layer_id = layer_id
+        self.mesh = mesh
 
     @named_scope
     def __call__(
@@ -172,15 +176,25 @@ class TopK(nnx.Module):
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
     ):
-        if _grouped_topk_kernel_enabled():
-            return grouped_topk_pallas(
-                router_logits,
-                correction_bias,
-                num_expert_group=self.num_expert_group,
-                topk_group=self.topk_group,
-                topk=self.topk,
+        if not _grouped_topk_kernel_enabled():
+            return self._biased_grouped_topk_jax(router_logits, correction_bias)
+        fn = functools.partial(
+            grouped_topk_pallas,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            topk=self.topk,
+        )
+        # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
+        # wrap in shard_map so each device runs the kernel on its local token slice.
+        if self.mesh is not None:
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(P("data", None), P(None)),
+                out_specs=(P("data", None), P("data", None)),
+                check_vma=False,
             )
-        return self._biased_grouped_topk_jax(router_logits, correction_bias)
+        return fn(router_logits, correction_bias)
 
     def _biased_grouped_topk_jax(
         self,

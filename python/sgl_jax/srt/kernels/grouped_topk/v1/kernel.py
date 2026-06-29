@@ -35,10 +35,10 @@ import jax.experimental.pallas as pl
 import jax.numpy as jnp
 
 try:
-    from sgl_jax.srt.kernels.grouped_topk.tuned_block_sizes import get_tuned_bt
+    from sgl_jax.srt.kernels.grouped_topk.tuned_block_sizes import get_tuned_config
 except Exception:  # noqa: BLE001  (e.g. base64-embedded standalone copy without the package)
 
-    def get_tuned_bt(*_a, **_k):  # noqa: ANN002, ANN003
+    def get_tuned_config(*_a, **_k):  # noqa: ANN002, ANN003
         return None
 
 
@@ -85,7 +85,7 @@ def _grouped_topk_kernel(
     topk: int,
     num_experts: int,
     padded_topk: int,
-    full_unroll: bool,
+    unroll_factor: int,
 ):
     S = num_experts // n_group
     logits = logits_ref[...].astype(jnp.float32)  # pre-bias
@@ -152,12 +152,10 @@ def _grouped_topk_kernel(
             cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
             return cur, ids_buf, w_buf
 
-        # Full-unroll (overlap all picks) when the working set fits VMEM, else roll (1 live [BT,E]).
-        # bt, num_experts, topk are all static here, so this is a compile-time choice.
-        # `full_unroll` is decided in the wrapper (knows bt, E, topk). Full unroll overlaps all picks
-        # (fast) but keeps O(topk) live [BT,E]; rolled keeps one (safe, allows a larger BT).
+        # `unroll_factor` (1..topk) = picks overlapped per step: higher is faster but keeps
+        # O(unroll_factor) live [BT,E] (needs a smaller BT). Tuned jointly with BT in the wrapper.
         _, ids_out, w_out = jax.lax.fori_loop(
-            0, topk, _pick, (masked, ids_init, w_init), unroll=topk if full_unroll else 1
+            0, topk, _pick, (masked, ids_init, w_init), unroll=unroll_factor
         )
 
     ids_ref[...] = ids_out  # [BT, padded_topk]
@@ -172,7 +170,7 @@ def grouped_topk_pallas(
     topk_group: int,
     topk: int,
     block_tokens: int | str = "auto",
-    # unroll: bool | None = None,
+    unroll: int | None = None,
     interpret: bool | None = None,
 ):
     """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
@@ -180,24 +178,21 @@ def grouped_topk_pallas(
     Drop-in for `gate.py:TopK._biased_grouped_topk` (renormalize / routed_scaling_factor are
     applied by the caller, exactly as in `TopK.__call__`).
 
-    `block_tokens="auto"` (default) looks up the tuned BT for this device + (BS, E, G, Gtop, k)
-    and falls back to a safe default on a miss; an explicit int forces that block size.
-
-    `unroll` selects the final-select loop form: None (default) full-unrolls when the working set
-    `topk*BT*E` fits VMEM (`FULL_UNROLL_ELEM_BUDGET`) else rolls; True/False force the choice. Full
-    unroll is faster but keeps O(topk) live [BT,E] (needs a smaller BT); rolling allows a larger BT.
-
-    `vmem_limit_bytes` (None = compiler default) caps the Mosaic scoped-VMEM budget; binary-search
-    it to measure a config's real peak VMEM (the smallest value that still compiles).
+    `block_tokens="auto"` and `unroll=None` (defaults) look up the tuned (BT, unroll) for this
+    device + (BS, E, G, Gtop, k); an explicit value forces it. `unroll` is the final-select
+    `fori_loop` factor (1..topk): higher is faster but needs a smaller BT, falls back to full
+    unroll (`topk`) on a miss.
     """
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
 
+    cfg = get_tuned_config(bs, e, num_expert_group, topk_group, topk)
+    tuned_bt, tuned_unroll = cfg if cfg is not None else (None, None)
+
     if block_tokens == "auto":
-        tuned = get_tuned_bt(bs, e, num_expert_group, topk_group, topk)
-        if tuned is not None and bs % tuned == 0:
-            bt = tuned
+        if tuned_bt is not None and bs % tuned_bt == 0:
+            bt = tuned_bt
         elif bs % 512 == 0:
             bt = min(512, bs)  # 512 divides bs -> safe default tile
         else:
@@ -222,8 +217,10 @@ def grouped_topk_pallas(
         interpret = get_interpret()
 
     padded_topk = _align_to(topk, 128)  # TPU VMEM output tile needs a 128-multiple minor dim
-    full_unroll = True
-    # full_unroll = topk * bt * e <= FULL_UNROLL_ELEM_BUDGET if unroll is None else bool(unroll)
+
+    # explicit unroll wins, else tuned, else full unroll; clamp to 1..topk
+    unroll_factor = max(1, min(int(unroll if unroll is not None else tuned_unroll or topk), topk))
+
     kernel = functools.partial(
         _grouped_topk_kernel,
         n_group=num_expert_group,
@@ -231,7 +228,7 @@ def grouped_topk_pallas(
         topk=topk,
         num_experts=e,
         padded_topk=padded_topk,
-        full_unroll=full_unroll,
+        unroll_factor=unroll_factor,
     )
     weights, ids = pl.pallas_call(
         kernel,

@@ -8,5 +8,47 @@ role_to_task_spec:
     image: "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1"
     device_type: "v7x"
     device_topo: "2x2x1"
-    supply_mode: flex-start
-    command: "echo flex-start && sleep infinity"
+    command: |
+      export DEBIAN_FRONTEND=noninteractive
+      REPO=/workspace/sglang-jax
+
+      # Shell: zsh + fast plugins + autojump
+      apt-get update -y && apt-get install -y --no-install-recommends zsh autojump git ca-certificates
+      git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions /opt/zsh/zsh-autosuggestions
+
+      # Project: clone + editable install
+      git clone https://github.com/primatrix/sglang-jax.git "$REPO"
+      pip install -e "$REPO/python[all]"
+
+      cat > ~/.zshrc <<'ZRC'
+      HISTFILE=~/.zsh_history HISTSIZE=50000 SAVEHIST=50000
+      setopt SHARE_HISTORY HIST_IGNORE_ALL_DUPS AUTO_CD AUTO_PUSHD
+      autoload -Uz compinit && compinit -u
+      zstyle ':completion:*' menu select
+      zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
+      [ -f /usr/share/autojump/autojump.sh ] && . /usr/share/autojump/autojump.sh
+      export ZSH_AUTOSUGGEST_MANUAL_REBIND=1
+      . /opt/zsh/zsh-autosuggestions/zsh-autosuggestions.zsh
+      PROMPT='%F{green}%n@%m%f:%F{blue}%~%f %# '
+      cd /workspace/sglang-jax 2>/dev/null
+      ZRC
+      chsh -s "$(command -v zsh)" root
+
+      echo flex-start && exec sleep infinity
+    mounts:
+      - name: models
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-cache:max-size-mb:20480
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+          - file-cache:parallel-downloads-per-file:32
+          - read_ahead_kb=1024
