@@ -7,12 +7,13 @@ the end-to-end routing time directly (no subtraction) and — crucially — feed
 real gate matmul so the `sort` path gets the realistic GOOD layout (an isolated jit of the routing
 picks a non-representative layout that is ~15x slower; do not benchmark it standalone).
 
-The fused kernel runs at `block_tokens="auto"` (the tuned table). `--kernel` selects which of the
-three variants to bench (`kernel`/`kernel1`/`kernel2`, or `all` to compare them side by side). Run on
-a TPU host:
+The fused kernel runs at `block_tokens="auto"` (the tuned table) by default; `--bt <int>` forces a
+block size and the `bt` column shows the size actually used. `--kernel` selects which of the three
+variants to bench (`kernel`/`kernel1`/`kernel2`, or `all` to compare them side by side). Run on a TPU
+host:
 
     python -m benchmark.kernels.grouped_topk.bench_grouped_topk \
-        --T 64,128,256,512,1024,2048,4096,8192,16384,32768 --kernel all
+        --T 64,128,256,512,1024,2048,4096,8192,16384,32768 --kernel all --bt auto
 """
 
 import argparse
@@ -94,7 +95,7 @@ def make_sort(w_gate, bias, G, Gtop, k):
     return fn
 
 
-def make_fused(fn, w_gate, bias, G, Gtop, k):
+def make_fused(fn, w_gate, bias, G, Gtop, k, bt):
     def run(hidden):
         logits = _gate(hidden, w_gate)  # gate OUTSIDE the scope
         with jax.named_scope(SCOPE_FUSED):
@@ -104,11 +105,32 @@ def make_fused(fn, w_gate, bias, G, Gtop, k):
                 num_expert_group=G,
                 topk_group=Gtop,
                 topk=k,
-                block_tokens="auto",
+                block_tokens=bt,
                 interpret=False,
             )
 
     return run
+
+
+def resolve_bt(bt, bs, e, G, Gtop, k):
+    """The block size grouped_topk_pallas will actually use, for DISPLAY only.
+
+    Mirrors the block_tokens resolution inside grouped_topk_pallas (keep in sync): an explicit int
+    is clamped to bs; "auto" consults the tuned table, then a 512-divisor default, then the largest
+    VMEM-safe divisor. Returns the raw value if the kernel module can't be introspected.
+    """
+    if bt != "auto":
+        return min(int(bt), bs)
+    try:
+        from python.sgl_jax.srt.kernels.grouped_topk.v1 import kernel2 as _k
+    except Exception:  # noqa: BLE001  (falcon-embedded: no module to introspect)
+        return bs
+    tuned = _k.get_tuned_bt(bs, e, G, Gtop, k)
+    if tuned is not None and bs % tuned == 0:
+        return tuned
+    if bs % 512 == 0:
+        return min(512, bs)
+    return _k._largest_safe_divisor(bs) or bs
 
 
 def _trace_scope_us(run_fn, scope, tag, warmup=3, iters=20):
@@ -163,18 +185,20 @@ def _trace_scope_us(run_fn, scope, tag, warmup=3, iters=20):
     return scope_tot / max(nmod, 1), len(names)
 
 
-def bench_config(name, E, G, Gtop, k, Ts, kernels):
-    """`kernels`: ordered dict {kernel_name: grouped_topk_pallas_fn} to benchmark vs the sort ref."""
+def bench_config(name, E, G, Gtop, k, Ts, kernels, bt):
+    """`kernels`: ordered dict {kernel_name: grouped_topk_pallas_fn} to benchmark vs the sort ref.
+    `bt`: block_tokens forwarded to every kernel ("auto" or an int)."""
     w_gate = jax.device_put(jax.random.normal(jax.random.PRNGKey(3), (H, E), dtype=jnp.float32))
     bias = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1)
     sfn = jax.jit(make_sort(w_gate, bias, G, Gtop, k))
-    ffns = {kn: jax.jit(make_fused(fn, w_gate, bias, G, Gtop, k)) for kn, fn in kernels.items()}
+    ffns = {kn: jax.jit(make_fused(fn, w_gate, bias, G, Gtop, k, bt)) for kn, fn in kernels.items()}
 
     cols = " ".join(f"{kn + '_us':>11}" for kn in ffns)
-    print(f"\n=== {name} (E={E}, G={G}, Gtop={Gtop}, k={k}) ===")
-    print(f"{'T':>7} {'sort_us':>10} {cols}   {'best':>16}")
+    print(f"\n=== {name} (E={E}, G={G}, Gtop={Gtop}, k={k}) bt={bt} ===")
+    print(f"{'T':>7} {'bt':>6} {'sort_us':>10} {cols}   {'best':>16}")
     for T in Ts:
         h = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (T, H), dtype=jnp.float32))
+        bt_used = resolve_bt(bt, T, E, G, Gtop, k)
         jax.block_until_ready(sfn(h))
         sort_us, _ = _trace_scope_us(functools.partial(sfn, h), SCOPE_SORT, f"sort_{name}_{T}")
 
@@ -194,7 +218,7 @@ def bench_config(name, E, G, Gtop, k, Ts, kernels):
         row = " ".join(f"{times[kn]:>11.2f}" for kn in ffns)
         best = min(valid, key=valid.get) if valid else None
         tag = f"{best} {sort_us / valid[best]:.2f}x" if best else "-"
-        print(f"{T:>7} {sort_us:>10.2f} {row}   {tag:>16}")
+        print(f"{T:>7} {bt_used:>6} {sort_us:>10.2f} {row}   {tag:>16}")
 
 
 def main():
@@ -208,7 +232,14 @@ def main():
         default="all",
         help="which kernel(s) to bench: 'all' or a comma list of kernel,kernel1,kernel2",
     )
+    ap.add_argument(
+        "--bt",
+        default="auto",
+        help="block_tokens for every kernel: 'auto' (tuned table) or an int (forced block size)",
+    )
     a = ap.parse_args()
+
+    bt = a.bt if a.bt == "auto" else int(a.bt)
 
     registry = kernel_registry()
     if not registry:
@@ -239,7 +270,7 @@ def main():
     for spec in a.configs.split(","):
         name, cfg = spec.split(":")
         E, G, Gtop, k = (int(v) for v in cfg.split("/"))
-        bench_config(name, E, G, Gtop, k, Ts, kernels)
+        bench_config(name, E, G, Gtop, k, Ts, kernels, bt)
 
 
 if __name__ == "__main__":
