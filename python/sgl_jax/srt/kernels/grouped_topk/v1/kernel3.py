@@ -1,8 +1,13 @@
-"""Grouped top-k via argmax-selection — weights gathered once after the pick loop.
+"""Grouped top-k via count-rank (vectorized, no iterative argmax).
 
-Same routing as kernel2 (id-for-id with gate.py, lowest-index tie-break) but the per-pick weight
-reduction is dropped: the loop selects ids only (max + masked-min), then weights are gathered in one
-`take_along_axis` from the pre-bias logits. Cuts the hot loop from 3 lane-reductions to 2.
+Same routing/result as kernel2 (id-for-id with gate.py, lowest-index tie-break) but the final select
+is loop-free: each expert's rank is its count of strictly-better experts (plus equal-but-lower-index
+for the tie-break), which is exactly its position in `jax.lax.top_k`'s descending order. Experts with
+rank < topk are the winners and scatter straight into their output column.
+
+Trades the scalar-bound iterative argmax for wide vector compare+reduce (uses the otherwise-idle
+VPU), at the cost of a 3D [BT,E,S] working tensor — verify it lowers on the target TPU, and keep
+block_tokens modest so [BT,E,S] fits VMEM.
 """
 
 from __future__ import annotations
@@ -27,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 NEG_INF = -jnp.inf
 SAFE_AUTO_BT = 2048
-FULL_UNROLL_ELEM_BUDGET = 10_000_000
 
 
 def _align_to(x: int, a: int) -> int:
@@ -57,14 +61,12 @@ def _grouped_topk_kernel(
     topk: int,
     num_experts: int,
     padded_topk: int,
-    full_unroll: bool,
 ):
     S = num_experts // n_group
     logits = logits_ref[...].astype(jnp.float32)
     scores = logits + bias_ref[...][None, :]
     bt = scores.shape[0]
 
-    # group score = sum of top-2 per group (2-pass max)
     with jax.named_scope("group_top2"):
         g = []
         for gi in range(n_group):
@@ -75,7 +77,6 @@ def _grouped_topk_kernel(
             g.append(v1 + jnp.max(sl2, axis=1, keepdims=True))
         group_scores = jnp.concatenate(g, axis=1)
 
-    # select topk_group groups (lowest-index tie-break)
     with jax.named_scope("group_select"):
         g_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, n_group), 1)
         group_mask = jnp.zeros((bt, n_group), jnp.bool_)
@@ -96,31 +97,31 @@ def _grouped_topk_kernel(
             axis=1,
         )
 
-    # pick topk ids into a width-E order buffer (2 reductions/pick), defer weights
-    with jax.named_scope("final_select"):
-        e_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
+    # rank[i] = #{j: masked[j] > masked[i]} + #{j<i: masked[j] == masked[i]}  == top_k position of i.
+    # Accumulated per group so the 3D working tensor is [BT, E, S], not [BT, E, E].
+    with jax.named_scope("count_rank"):
+        i_glob = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
+        si = masked[:, :, None]  # [BT, E, 1]
+        rank = jnp.zeros((bt, num_experts), jnp.int32)
+        for gi in range(n_group):
+            sj = masked[:, None, gi * S : (gi + 1) * S]  # [BT, 1, S]
+            j_glob = gi * S + jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts, S), 2)
+            beats = (sj > si) | ((sj == si) & (j_glob < i_glob[:, :, None]))
+            rank += jnp.sum(beats.astype(jnp.int32), axis=2)
 
-        def _pick(k, carry):
-            cur, order = carry
-            cmax = jnp.max(cur, axis=1, keepdims=True)
-            idx = jnp.min(jnp.where(cur == cmax, e_iota, num_experts), axis=1, keepdims=True)
-            order = jnp.where(e_iota == k, idx, order)  # write pick k into column k
-            cur = jnp.where(e_iota == idx, NEG_INF, cur)
-            return cur, order
+    # scatter each winner (rank < topk) into output column = its rank
+    with jax.named_scope("scatter"):
+        col = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts, topk), 2)
+        one = rank[:, :, None] == col  # [BT, E, topk]
+        ids = jnp.sum(jnp.where(one, i_glob[:, :, None], 0), axis=1).astype(jnp.int32)
+        w = jnp.sum(jnp.where(one, logits[:, :, None], 0.0), axis=1)
+        pad = padded_topk - topk
+        if pad > 0:
+            ids = jnp.concatenate([ids, jnp.full((bt, pad), -1, jnp.int32)], axis=1)
+            w = jnp.concatenate([w, jnp.zeros((bt, pad), jnp.float32)], axis=1)
 
-        order0 = jnp.zeros((bt, num_experts), jnp.int32)
-        _, order = jax.lax.fori_loop(
-            0, topk, _pick, (masked, order0), unroll=topk if full_unroll else 1
-        )
-
-    # gather all weights in one shot (Mosaic gather needs output shape == input shape -> width E)
-    with jax.named_scope("gather_weights"):
-        w_full = jnp.take_along_axis(logits, order, axis=1)  # [BT, E]
-
-    # columns >= topk are filler (order=0); the wrapper slices [:, :topk]. padded_topk <= E always
-    # here (E is a multiple of 128), so the width-E buffers cover the output tile.
-    ids_ref[...] = order[:, :padded_topk]
-    w_ref[...] = w_full[:, :padded_topk]
+    ids_ref[...] = ids
+    w_ref[...] = w
 
 
 def grouped_topk_pallas(
@@ -131,11 +132,11 @@ def grouped_topk_pallas(
     topk_group: int,
     topk: int,
     block_tokens: int | str = "auto",
-    unroll: bool | None = None,
+    unroll: bool | None = None,  # noqa: ARG001  (accepted for a uniform call signature; unused)
     interpret: bool | None = None,
     vmem_limit_bytes: int | None = None,
 ):
-    """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k])."""
+    """Biased grouped top-k via count-rank. Returns (topk_weights[BS,k], topk_ids[BS,k])."""
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
@@ -148,13 +149,6 @@ def grouped_topk_pallas(
             bt = min(512, bs)
         else:
             bt = _largest_safe_divisor(bs) or bs
-        if bt > SAFE_AUTO_BT:
-            logger.warning(
-                "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
-                "VMEM-safe divisor); pass an explicit block_tokens.",
-                bt,
-                bs,
-            )
     else:
         bt = min(block_tokens, bs)
         if bs % bt != 0:
@@ -163,7 +157,6 @@ def grouped_topk_pallas(
         interpret = get_interpret()
 
     padded_topk = _align_to(topk, 128)
-    full_unroll = topk * bt * e <= FULL_UNROLL_ELEM_BUDGET if unroll is None else bool(unroll)
     kernel = functools.partial(
         _grouped_topk_kernel,
         n_group=num_expert_group,
@@ -171,7 +164,6 @@ def grouped_topk_pallas(
         topk=topk,
         num_experts=e,
         padded_topk=padded_topk,
-        full_unroll=full_unroll,
     )
     compiler_params = None
     if vmem_limit_bytes is not None:
