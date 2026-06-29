@@ -1,0 +1,12 @@
+name: group_topk-ling2.6_flash
+exp_type: PROFILING
+cluster_name: tpuv7x-64-node
+artifact_type: gcs
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1"
+    device_type: "v7x"
+    device_topo: "2x2x1"
+    supply_mode: flex-start
+    command: "echo flex-start && sleep infinity"
