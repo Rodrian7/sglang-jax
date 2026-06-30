@@ -1,0 +1,117 @@
+name: group_topk-ling2.6_flash2
+exp_type: PROFILING
+cluster_name: tpuv7x-64-node
+artifact_type: GCS
+tags: []
+config: '{}'
+
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: ubuntu:24.04
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    command: |
+      set -eu
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax_cache
+      export UV_LINK_MODE=copy
+      export DEBIAN_FRONTEND=noninteractive
+      mkdir -p "$TMPDIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+      ulimit -c 0
+
+      echo "=== install deps ==="
+      apt-get update -y && apt-get install -y --no-install-recommends vim git ca-certificates expect curl
+      # ubuntu:24.04 ships no pip and blocks system `pip install` (PEP 668), so grab
+      # uv via its standalone installer instead of `pip install uv`.
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.local/bin:$PATH"
+
+      echo "=== clone sglang-jax ==="
+      rm -rf /tmp/sglang-jax
+      git clone --branch bench/grouped-topk \
+        https://github.com/primatrix/sglang-jax.git /tmp/sglang-jax
+      cd /tmp/sglang-jax
+
+      echo "=== create venv & install sglang-jax (editable) ==="
+      uv venv --python 3.12
+      . .venv/bin/activate
+      uv pip install -e "python[all]"
+      # python[all] pins jax[tpu]==0.8.1, which brings the matching libtpu. Do NOT add
+      # a separate `uv pip install jax[tpu]` upgrade here: a newer JAX's Explicit-axis
+      # shard_map no longer auto-reshards inputs and can mismatch libtpu — that broke
+      # the fused MoE kernel before.
+      # Install uv into the venv so re-exec'd shells (which activate it via ~/.bashrc)
+      # have `uv` on PATH.
+      uv pip install uv
+
+      echo "=== make exec'd shells land in the ready env ==="
+      cat > ~/.bashrc <<'BRC'
+      export TERM=xterm-256color
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax_cache
+      export PATH="$HOME/.local/bin:$PATH"
+      cd /tmp/sglang-jax && source .venv/bin/activate
+      BRC
+
+      cat > /tmp/sglang-jax/run-server.sh <<'RUN'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      cd /tmp/sglang-jax
+      source .venv/bin/activate
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax_cache
+      SERVER_LOG=/tmp/sglang-jax/server.log
+      echo "=== server log -> $SERVER_LOG ==="
+      unbuffer uv run python -m sgl_jax.launch_server \
+        --model-path /models/Ling-2.6-flash \
+        --trust-remote-code \
+        --tp-size 8 --dp-size 2 --ep-size 8 \
+        --moe-backend fused_v2 \
+        --host 0.0.0.0 --port 30000 \
+        --device tpu \
+        --dtype bfloat16 \
+        --page-size 128 \
+        --context-length 131072 \
+        --chunked-prefill-size 2048 \
+        --mem-fraction-static 0.85 \
+        --max-running-requests 256 \
+        --attention-backend fa \
+        --dp-schedule-policy round_robin \
+        --disable-radix-cache \
+        --skip-server-warmup \
+        --log-level info > ./server.log 2>&1 &
+      RUN
+      chmod +x /tmp/sglang-jax/run-server.sh
+
+      cat <<'TIP'
+      ===================================================================
+      调试盒就绪。
+        进盒:  falcon exp exec -it <exp_id> --rank 0 -- bash
+        起服务: bash /tmp/sglang-jax/run-server.sh
+        压测:  uv run python -m sgl_jax.bench_serving --backend sgl-jax \
+                --base-url http://127.0.0.1:30000 --model /models/Ling-2.6-flash \
+                --dataset-name random --random-input-len 4096 --random-output-len 1024 \
+                --max-concurrency 8 --num-prompts 24
+      ===================================================================
+      TIP
+      sleep infinity
+    mounts:
+      - name: models
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-cache:max-size-mb:409600
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+          - file-cache:parallel-downloads-per-file:128
+          - read_ahead_kb=1024
