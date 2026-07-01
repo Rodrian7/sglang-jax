@@ -58,6 +58,12 @@ class GuidanceGrammar(BaseGrammarObject):
             self.finished = True
             raise ValueError(self.ll_matcher.get_error())
 
+    def rollback(self, num_tokens: int):
+        if num_tokens <= 0:
+            return
+        self.ll_matcher.rollback(num_tokens)
+        self.finished = False
+
     def allocate_vocab_mask(self, vocab_size: int, batch_size: int) -> np.ndarray:
         """Allocate a vocabulary bitmask."""
         if self.bitmask is None or self.bitmask.shape[0] < batch_size:
@@ -85,10 +91,15 @@ class GuidanceGrammar(BaseGrammarObject):
         return self.finished
 
     def copy(self):
-        return GuidanceGrammar(
-            llguidance_tokenizer=self.llguidance_tokenizer,
-            serialized_grammar=self.serialized_grammar,
-        )
+        obj = GuidanceGrammar.__new__(GuidanceGrammar)
+        BaseGrammarObject.__init__(obj)
+        obj.llguidance_tokenizer = self.llguidance_tokenizer
+        obj.serialized_grammar = self.serialized_grammar
+        obj.eos_token = self.eos_token
+        obj.ll_matcher = self.ll_matcher.deep_copy()
+        obj.finished = self.finished
+        obj.bitmask = None
+        return obj
 
 
 def get_guidance_backend(

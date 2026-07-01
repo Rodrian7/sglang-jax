@@ -110,7 +110,81 @@ def _prepare_rejection_sampling(sampling_info, batch, total_bs: int, vocab_size:
     return temperatures, top_ks, top_ps, enable_top_k, enable_top_p
 
 
-def _prepare_verify_constraints_host(sampling_info, batch, total_bs: int, vocab_size: int):
+def _is_token_allowed_by_mask(mask_row: np.ndarray, token_id: int) -> bool:
+    if token_id < 0:
+        return False
+    word = token_id // 32
+    if word >= mask_row.shape[0]:
+        return False
+    bit = token_id % 32
+    return bool((np.uint32(mask_row[word]) & np.uint32(1 << bit)) != 0)
+
+
+def _build_per_position_grammar_mask(
+    grammars,
+    draft_tokens_2d: np.ndarray,
+    *,
+    total_bs: int,
+    draft_token_num: int,
+    vocab_size: int,
+    active: np.ndarray,
+) -> np.ndarray:
+    num_cols = (vocab_size + 31) // 32
+    vocab_mask = np.full((total_bs * draft_token_num, num_cols), -1, dtype=np.int32)
+    first_grammar = next((g for g in grammars if g), None)
+    if first_grammar is None:
+        return vocab_mask
+
+    # Use the grammar backend allocator so backend-specific vocab widths are honored.
+    vocab_mask = first_grammar.allocate_vocab_mask(
+        vocab_size=vocab_size,
+        batch_size=total_bs * draft_token_num,
+    )
+    vocab_mask.fill(-1)
+
+    for req_idx, grammar in enumerate(grammars[:total_bs]):
+        row_start = req_idx * draft_token_num
+        if (
+            not active[req_idx]
+            or grammar is None
+            or getattr(grammar, "finished", False)
+            or grammar.is_terminated()
+        ):
+            vocab_mask[row_start : row_start + draft_token_num] = -1
+            continue
+
+        # For constrained requests, leave descendants zeroed unless their path
+        # is grammar-valid. This matches SGLang's verify-time tree-mask behavior:
+        # invalid draft branches are rejected by the parent row's mask.
+        vocab_mask[row_start : row_start + draft_token_num] = 0
+        grammar_state = grammar.copy()
+        grammar_state.fill_vocab_mask(vocab_mask, row_start)
+
+        for pos in range(1, draft_token_num):
+            prev_row = row_start + pos - 1
+            token_id = int(draft_tokens_2d[req_idx, pos])
+            if not _is_token_allowed_by_mask(vocab_mask[prev_row], token_id):
+                break
+            try:
+                grammar_state.accept_token(token_id)
+            except ValueError:
+                break
+            if getattr(grammar_state, "finished", False) or grammar_state.is_terminated():
+                break
+            grammar_state.fill_vocab_mask(vocab_mask, row_start + pos)
+
+    return vocab_mask
+
+
+def _prepare_verify_constraints_host(
+    sampling_info,
+    batch,
+    total_bs: int,
+    vocab_size: int,
+    *,
+    draft_token_num: int,
+    draft_tokens_2d: np.ndarray | None = None,
+):
     active = _active_dp_slot_mask(batch, total_bs)
 
     linear_penalty_src = getattr(sampling_info, "linear_penalty", None)
@@ -124,27 +198,29 @@ def _prepare_verify_constraints_host(sampling_info, batch, total_bs: int, vocab_
         linear_penalty[~active] = 0.0
         enable_penalty = bool(np.any(linear_penalty[active] != 0.0))
 
+    num_cols = (vocab_size + 31) // 32
     vocab_mask_src = getattr(sampling_info, "vocab_mask", None)
-    vocab_mask = np.zeros((total_bs, (vocab_size + 31) // 32), dtype=np.int32)
-    enable_vocab_mask = vocab_mask_src is not None
-    if enable_vocab_mask:
-        vocab_mask = np.full((total_bs, (vocab_size + 31) // 32), -1, dtype=np.int32)
+    grammars = getattr(sampling_info, "grammars", None)
+    has_grammar = bool(grammars and any(g for g in grammars))
+    vocab_mask = np.zeros((total_bs * draft_token_num, num_cols), dtype=np.int32)
+    enable_vocab_mask = vocab_mask_src is not None or has_grammar
+    if has_grammar and draft_tokens_2d is not None:
+        vocab_mask = _build_per_position_grammar_mask(
+            grammars,
+            np.asarray(draft_tokens_2d, dtype=np.int32).reshape(total_bs, draft_token_num),
+            total_bs=total_bs,
+            draft_token_num=draft_token_num,
+            vocab_size=vocab_size,
+            active=active,
+        )
+    elif vocab_mask_src is not None:
+        vocab_mask_per_req = np.full((total_bs, num_cols), -1, dtype=np.int32)
         vocab_mask_src = np.asarray(vocab_mask_src, dtype=np.int32)
         rows = min(total_bs, vocab_mask_src.shape[0])
-        cols = min(vocab_mask.shape[1], vocab_mask_src.shape[1])
-        vocab_mask[:rows, :cols] = vocab_mask_src[:rows, :cols]
-        vocab_mask[~active] = -1
-
-        grammars = getattr(sampling_info, "grammars", None)
-        if grammars:
-            for i, grammar in enumerate(grammars[:total_bs]):
-                is_terminated = (
-                    grammar.is_terminated()
-                    if grammar is not None and hasattr(grammar, "is_terminated")
-                    else False
-                )
-                if grammar is None or getattr(grammar, "finished", False) or is_terminated:
-                    vocab_mask[i] = -1
+        cols = min(vocab_mask_per_req.shape[1], vocab_mask_src.shape[1])
+        vocab_mask_per_req[:rows, :cols] = vocab_mask_src[:rows, :cols]
+        vocab_mask_per_req[~active] = -1
+        vocab_mask = np.repeat(vocab_mask_per_req, draft_token_num, axis=0)
 
     return linear_penalty, vocab_mask, enable_penalty, enable_vocab_mask
 
@@ -159,6 +235,40 @@ def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
             out_shardings=replicated_sharding,
         )
     return draft_worker._spec_prefill_output_gather_fn(next_token_ids)
+
+
+def _prepare_verify_draft_tokens_host(
+    verified_id,
+    token_list,
+    *,
+    total_bs: int,
+    draft_token_num: int,
+) -> np.ndarray:
+    verified_id = np.asarray(jax.device_get(verified_id), dtype=np.int32).reshape(total_bs)
+    token_list = np.asarray(jax.device_get(token_list), dtype=np.int32)
+    if token_list.ndim == 3 and token_list.shape[-1] == 1:
+        token_list = np.squeeze(token_list, axis=-1)
+    token_list = token_list.reshape(total_bs, -1)
+
+    draft_tokens = np.zeros((total_bs, draft_token_num), dtype=np.int32)
+    draft_tokens[:, 0] = verified_id
+    if draft_token_num > 1:
+        draft_tokens[:, 1:] = token_list[:, : draft_token_num - 1]
+    return draft_tokens
+
+
+def _gather_relay_verify_tokens_host(relay_buffers, relay_future_indices, *, dp_size: int):
+    future_indices = np.asarray(jax.device_get(relay_future_indices), dtype=np.int32)
+    per_dp_bs = future_indices.shape[0] // dp_size
+    indices = jnp.asarray(future_indices.reshape((dp_size, per_dp_bs)), dtype=jnp.int32)
+    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+
+    topk_index = relay_buffers.topk_index[dp_indices, indices]
+    verified_id = relay_buffers.verified_id[dp_indices, indices]
+    return (
+        jax.device_get(verified_id).reshape(future_indices.shape),
+        jax.device_get(topk_index).reshape(future_indices.shape + relay_buffers.topk_index.shape[2:]),
+    )
 
 
 def _take_with_index_sharding(values, index):
@@ -177,31 +287,29 @@ def _apply_verify_logits_constraints(
     enable_vocab_mask,
     speculative_num_draft_tokens,
 ):
-    vocab = target_logits.shape[-1]
-    bs = target_logits.shape[0] // speculative_num_draft_tokens
+    # enable_* are static jit args: when neither constraint is active this whole
+    # helper compiles away and target_logits flows through untouched.
+    #
+    # We deliberately do NOT reshard to replicated. penalty/vocab_mask are pure
+    # elementwise ops that run on the native sharding, exactly like the non-spec
+    # sampler (layers/sampler.py). Force-replicating the full [bs*n, vocab] logits
+    # here previously blew up explicit-sharding compilation.
+    if not enable_penalty and not enable_vocab_mask:
+        return target_logits
+
     n = speculative_num_draft_tokens
-    sh = jax.typeof(target_logits).sharding
-    mesh = sh.mesh if isinstance(sh, NamedSharding) and getattr(sh.mesh, "axis_names", ()) else None
-
-    def _rep(x):
-        return jax.sharding.reshard(x, NamedSharding(mesh, P())) if mesh is not None else x
-
-    logits_3d = _rep(target_logits.astype(jnp.float32)).reshape(bs, n, vocab)
+    logits = target_logits
 
     if enable_penalty:
-        penalty = _rep(linear_penalty.astype(logits_3d.dtype)).reshape(bs, 1, vocab)
-        logits_3d = logits_3d + penalty
+        # linear_penalty is per-request [bs, vocab]; repeat each row across the
+        # n draft positions to match logits [bs*n, vocab] (request-major).
+        penalty = jnp.repeat(linear_penalty.astype(logits.dtype), n, axis=0)
+        logits = logits + penalty
 
     if enable_vocab_mask:
-        vocab_mask = _rep(vocab_mask)
-        mask_2d = jnp.broadcast_to(
-            vocab_mask[:, None, :],
-            (bs, n, vocab_mask.shape[-1]),
-        ).reshape(bs * n, vocab_mask.shape[-1])
-        logits_2d = apply_token_bitmask(logits_3d.reshape(bs * n, vocab), mask_2d)
-        logits_3d = logits_2d.reshape(bs, n, vocab)
+        logits = apply_token_bitmask(logits, vocab_mask)
 
-    return logits_3d.reshape(bs * n, vocab)
+    return logits
 
 
 def _prepare_draft_inputs(
@@ -1916,6 +2024,25 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     _sv_tbs = target_forward_batch.seq_lens.shape[0]
     _sv_enable_top_k = False
     _sv_enable_top_p = False
+    _sv_draft_tokens_host = None
+    _sv_has_grammar = bool(getattr(si, "grammars", None) and any(g for g in si.grammars))
+    if _sv_has_grammar:
+        _sv_constraint_verified_id = previous_verified_id
+        _sv_constraint_token_list = previous_token_list
+        if use_relay_state:
+            _sv_constraint_verified_id, _sv_constraint_token_list = (
+                _gather_relay_verify_tokens_host(
+                    getattr(spec_worker, "spec_relay_buffers", None),
+                    relay_future_indices,
+                    dp_size=model_worker_batch.dp_size,
+                )
+            )
+        _sv_draft_tokens_host = _prepare_verify_draft_tokens_host(
+            _sv_constraint_verified_id,
+            _sv_constraint_token_list,
+            total_bs=_sv_tbs,
+            draft_token_num=draft_worker.speculative_num_draft_tokens,
+        )
     (
         _sv_linear_penalty_host,
         _sv_vocab_mask_host,
@@ -1926,6 +2053,8 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         model_worker_batch,
         _sv_tbs,
         int(target_worker.model_config.vocab_size),
+        draft_token_num=draft_worker.speculative_num_draft_tokens,
+        draft_tokens_2d=_sv_draft_tokens_host,
     )
     _sv_linear_penalty = _prepare_device_array(
         _sv_linear_penalty_host,

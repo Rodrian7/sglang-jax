@@ -175,29 +175,24 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([1, 14]))
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
 
-    def test_prepare_verify_constraints_host_masks_inactive_and_unconstrained_rows(self):
+    def test_prepare_verify_constraints_host_repeats_static_vocab_mask(self):
         from sgl_jax.srt.speculative.draft_extend_fused import (
             _prepare_verify_constraints_host,
         )
 
-        class FakeGrammar:
-            finished = False
-
-            def is_terminated(self):
-                return False
-
         vocab_size = 8
         total_bs = 4
+        draft_token_num = 2
         linear_penalty = np.zeros((total_bs, vocab_size), dtype=np.float32)
         linear_penalty[0, 2] = -1.5
         linear_penalty[2, 3] = -7.0
-        vocab_mask = np.zeros((total_bs, 1), dtype=np.int32)
+        vocab_mask = np.full((total_bs, 1), -1, dtype=np.int32)
         vocab_mask[0, 0] = np.int32(1 << 2)
 
         sampling_info = SimpleNamespace(
             linear_penalty=linear_penalty,
             vocab_mask=vocab_mask,
-            grammars=[FakeGrammar(), None, FakeGrammar(), None],
+            grammars=None,
         )
         batch = SimpleNamespace(real_bs=2)
 
@@ -206,6 +201,7 @@ class TestVerifyTree(CustomTestCase):
             batch,
             total_bs,
             vocab_size,
+            draft_token_num=draft_token_num,
         )
 
         self.assertTrue(enable_penalty)
@@ -213,8 +209,98 @@ class TestVerifyTree(CustomTestCase):
         self.assertEqual(penalty[0, 2], -1.5)
         self.assertEqual(penalty[2, 3], 0.0)
         self.assertEqual(mask[0, 0], np.int32(1 << 2))
-        self.assertEqual(mask[1, 0], np.int32(-1))
+        self.assertEqual(mask[1, 0], np.int32(1 << 2))
         self.assertEqual(mask[2, 0], np.int32(-1))
+        self.assertEqual(mask[4, 0], np.int32(-1))
+
+    def test_prepare_verify_constraints_host_builds_per_position_grammar_mask(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _prepare_verify_constraints_host,
+        )
+
+        class FakeGrammar:
+            finished = False
+
+            def __init__(self, state=0):
+                self.state = state
+
+            def copy(self):
+                return FakeGrammar(self.state)
+
+            def is_terminated(self):
+                return False
+
+            def allocate_vocab_mask(self, vocab_size, batch_size):
+                return np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32)
+
+            def fill_vocab_mask(self, vocab_mask, idx):
+                allowed = {0: 3, 1: 4, 2: 5}[self.state]
+                vocab_mask[idx, 0] = np.int32(1 << allowed)
+
+            def accept_token(self, token):
+                expected = {0: 3, 1: 4}[self.state]
+                if token != expected:
+                    raise ValueError("unexpected token")
+                self.state += 1
+
+        sampling_info = SimpleNamespace(
+            linear_penalty=None,
+            vocab_mask=None,
+            grammars=[FakeGrammar(), None],
+        )
+        batch = SimpleNamespace(real_bs=2)
+
+        _penalty, mask, enable_penalty, enable_vocab_mask = _prepare_verify_constraints_host(
+            sampling_info,
+            batch,
+            2,
+            8,
+            draft_token_num=3,
+            draft_tokens_2d=np.array([[99, 3, 4], [88, 7, 8]], dtype=np.int32),
+        )
+
+        self.assertFalse(enable_penalty)
+        self.assertTrue(enable_vocab_mask)
+        self.assertEqual(mask[0, 0], np.int32(1 << 3))
+        self.assertEqual(mask[1, 0], np.int32(1 << 4))
+        self.assertEqual(mask[2, 0], np.int32(1 << 5))
+        self.assertEqual(mask[3, 0], np.int32(-1))
+        self.assertEqual(mask[4, 0], np.int32(-1))
+        self.assertEqual(mask[5, 0], np.int32(-1))
+
+    def test_model_worker_sampling_info_grammar_mask_keeps_none_rows_allowed(self):
+        from sgl_jax.srt.managers.schedule_batch import ModelWorkerSamplingInfo
+
+        class FakeGrammar:
+            finished = False
+
+            def __init__(self, token):
+                self.token = token
+
+            def is_terminated(self):
+                return False
+
+            def allocate_vocab_mask(self, vocab_size, batch_size):
+                return np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32)
+
+            def fill_vocab_mask(self, vocab_mask, idx):
+                vocab_mask[idx, 0] = np.int32(1 << self.token)
+
+        info = ModelWorkerSamplingInfo(
+            temperatures=np.ones((4, 1), dtype=np.float32),
+            top_ps=np.ones(4, dtype=np.float32),
+            top_ks=np.ones(4, dtype=np.int32),
+            min_ps=np.zeros(4, dtype=np.float32),
+            vocab_size=8,
+            grammars=[FakeGrammar(2), None, FakeGrammar(5), None],
+        )
+
+        info.update_grammar_vocab_mask()
+
+        self.assertEqual(info.vocab_mask[0, 0], np.int32(1 << 2))
+        self.assertEqual(info.vocab_mask[1, 0], np.int32(-1))
+        self.assertEqual(info.vocab_mask[2, 0], np.int32(1 << 5))
+        self.assertEqual(info.vocab_mask[3, 0], np.int32(-1))
 
     def test_apply_verify_logits_constraints_repeats_per_request_values(self):
         from sgl_jax.srt.speculative.draft_extend_fused import (
@@ -225,8 +311,9 @@ class TestVerifyTree(CustomTestCase):
         linear_penalty = np.zeros((2, 8), dtype=np.float32)
         linear_penalty[0, 3] = 5.0
         linear_penalty[1, 6] = 7.0
-        vocab_mask = np.full((2, 1), -1, dtype=np.int32)
+        vocab_mask = np.full((4, 1), -1, dtype=np.int32)
         vocab_mask[0, 0] = np.int32(1 << 3)
+        vocab_mask[1, 0] = np.int32(1 << 3)
 
         constrained = _apply_verify_logits_constraints(
             target_logits,

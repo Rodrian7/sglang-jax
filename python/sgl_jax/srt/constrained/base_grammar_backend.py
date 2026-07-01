@@ -21,6 +21,9 @@ class BaseGrammarObject:
     def accept_token(self, token: int):
         raise NotImplementedError()
 
+    def rollback(self, num_tokens: int):
+        raise NotImplementedError()
+
     def allocate_vocab_mask(self, vocab_size: int, batch_size: int):
         raise NotImplementedError()
 

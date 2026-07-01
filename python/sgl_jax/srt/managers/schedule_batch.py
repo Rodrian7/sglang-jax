@@ -2282,12 +2282,6 @@ class ScheduleBatch:
         Returns:
             Merged SamplingBatchInfo
         """
-        # Collect all requests for grammar support
-        all_reqs = []
-        for info in self.reqs_info:
-            if info.reqs:
-                all_reqs.extend(info.reqs)
-
         # Initialize merged arrays (with padding)
         temperatures = np.ones((total_bs, 1), dtype=np.float32)
         top_ps = np.ones(total_bs, dtype=np.float32)
@@ -2295,6 +2289,7 @@ class ScheduleBatch:
         min_ps = np.zeros(total_bs, dtype=np.float32)
         sampling_seeds = None
         linear_penalty = None  # lazily allocated only if any DP rank has penalties
+        grammars = [None] * total_bs if self.has_grammar else None
 
         offset_bs = 0
         has_sampling_seeds = False
@@ -2321,6 +2316,9 @@ class ScheduleBatch:
             top_ps[offset_bs : offset_bs + dp_bs] = dp_sampling.top_ps[:dp_bs]
             top_ks[offset_bs : offset_bs + dp_bs] = dp_sampling.top_ks[:dp_bs]
             min_ps[offset_bs : offset_bs + dp_bs] = dp_sampling.min_ps[:dp_bs]
+            if grammars is not None:
+                for i, req in enumerate(info.reqs):
+                    grammars[offset_bs + i] = req.grammar
 
             if dp_sampling.sampling_seeds is not None:
                 if sampling_seeds is None:
@@ -2351,7 +2349,7 @@ class ScheduleBatch:
             is_all_greedy=is_all_greedy,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
             linear_penalty=linear_penalty,
-            grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
+            grammars=grammars,
         )
 
     def _get_spec_decode_mwb_dp(
@@ -3266,6 +3264,7 @@ class ModelWorkerSamplingInfo:
             vocab_size=self.vocab_size,
             batch_size=len(self.temperatures),
         )
+        self.vocab_mask.fill(-1)
 
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished and not grammar.is_terminated():
