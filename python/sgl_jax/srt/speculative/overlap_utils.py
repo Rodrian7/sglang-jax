@@ -32,14 +32,10 @@ def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
         return False
     if any(info.decoding_reqs for info in batch.reqs_info):
         return False
-    # TODO(spec-overlap): neither the fused overlap verify kernel
-    # (draft_extend_fused.spec_decode_verify) nor the non-overlap verify path
-    # currently applies grammar / vocab_mask / penalty constraints during
-    # speculative verification. Batches carrying these constraints will have
-    # them silently ignored on the spec decode path. We do NOT exclude them in
-    # this gate because the non-overlap fallback has the same gap, so routing
-    # them off the overlap path would not make them correct. Revisit once
-    # constrained speculative verify is implemented.
+    # TODO(spec-overlap): strict grammar support needs per-position masks because
+    # speculative verify can accept multiple tokens from one request in a single
+    # step. The fused verify path applies the current batch vocab_mask/penalty,
+    # but it does not yet build grammar masks after each virtual accepted token.
     return not (batch.return_logprob or batch.return_output_logprob_only)
 
 

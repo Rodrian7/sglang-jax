@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -173,6 +174,76 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([0, 3]))
         np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([1, 14]))
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
+
+    def test_prepare_verify_constraints_host_masks_inactive_and_unconstrained_rows(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _prepare_verify_constraints_host,
+        )
+
+        class FakeGrammar:
+            finished = False
+
+            def is_terminated(self):
+                return False
+
+        vocab_size = 8
+        total_bs = 4
+        linear_penalty = np.zeros((total_bs, vocab_size), dtype=np.float32)
+        linear_penalty[0, 2] = -1.5
+        linear_penalty[2, 3] = -7.0
+        vocab_mask = np.zeros((total_bs, 1), dtype=np.int32)
+        vocab_mask[0, 0] = np.int32(1 << 2)
+
+        sampling_info = SimpleNamespace(
+            linear_penalty=linear_penalty,
+            vocab_mask=vocab_mask,
+            grammars=[FakeGrammar(), None, FakeGrammar(), None],
+        )
+        batch = SimpleNamespace(real_bs=2)
+
+        penalty, mask, enable_penalty, enable_vocab_mask = _prepare_verify_constraints_host(
+            sampling_info,
+            batch,
+            total_bs,
+            vocab_size,
+        )
+
+        self.assertTrue(enable_penalty)
+        self.assertTrue(enable_vocab_mask)
+        self.assertEqual(penalty[0, 2], -1.5)
+        self.assertEqual(penalty[2, 3], 0.0)
+        self.assertEqual(mask[0, 0], np.int32(1 << 2))
+        self.assertEqual(mask[1, 0], np.int32(-1))
+        self.assertEqual(mask[2, 0], np.int32(-1))
+
+    def test_apply_verify_logits_constraints_repeats_per_request_values(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _apply_verify_logits_constraints,
+        )
+
+        target_logits = jnp.zeros((4, 8), dtype=jnp.float32)
+        linear_penalty = np.zeros((2, 8), dtype=np.float32)
+        linear_penalty[0, 3] = 5.0
+        linear_penalty[1, 6] = 7.0
+        vocab_mask = np.full((2, 1), -1, dtype=np.int32)
+        vocab_mask[0, 0] = np.int32(1 << 3)
+
+        constrained = _apply_verify_logits_constraints(
+            target_logits,
+            jnp.asarray(linear_penalty),
+            jnp.asarray(vocab_mask),
+            enable_penalty=True,
+            enable_vocab_mask=True,
+            speculative_num_draft_tokens=2,
+        )
+        constrained = np.asarray(constrained)
+
+        self.assertTrue(np.isneginf(constrained[0, :3]).all())
+        self.assertEqual(constrained[0, 3], 5.0)
+        self.assertTrue(np.isneginf(constrained[1, :3]).all())
+        self.assertEqual(constrained[1, 3], 5.0)
+        self.assertEqual(constrained[2, 6], 7.0)
+        self.assertEqual(constrained[3, 6], 7.0)
 
     def test_greedy_prepare_uses_original_seq_lens_for_new_seq_lens(self):
         from sgl_jax.srt.speculative.draft_extend_fused import _prepare_draft_inputs

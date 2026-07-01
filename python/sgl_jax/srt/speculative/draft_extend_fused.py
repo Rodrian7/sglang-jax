@@ -13,6 +13,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.constrained.bitmask_ops import apply_token_bitmask
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
@@ -109,6 +110,45 @@ def _prepare_rejection_sampling(sampling_info, batch, total_bs: int, vocab_size:
     return temperatures, top_ks, top_ps, enable_top_k, enable_top_p
 
 
+def _prepare_verify_constraints_host(sampling_info, batch, total_bs: int, vocab_size: int):
+    active = _active_dp_slot_mask(batch, total_bs)
+
+    linear_penalty_src = getattr(sampling_info, "linear_penalty", None)
+    linear_penalty = np.zeros((total_bs, vocab_size), dtype=np.float32)
+    enable_penalty = linear_penalty_src is not None and getattr(linear_penalty_src, "size", 0) > 0
+    if enable_penalty:
+        linear_penalty_src = np.asarray(linear_penalty_src, dtype=np.float32)
+        rows = min(total_bs, linear_penalty_src.shape[0])
+        cols = min(vocab_size, linear_penalty_src.shape[1])
+        linear_penalty[:rows, :cols] = linear_penalty_src[:rows, :cols]
+        linear_penalty[~active] = 0.0
+        enable_penalty = bool(np.any(linear_penalty[active] != 0.0))
+
+    vocab_mask_src = getattr(sampling_info, "vocab_mask", None)
+    vocab_mask = np.zeros((total_bs, (vocab_size + 31) // 32), dtype=np.int32)
+    enable_vocab_mask = vocab_mask_src is not None
+    if enable_vocab_mask:
+        vocab_mask = np.full((total_bs, (vocab_size + 31) // 32), -1, dtype=np.int32)
+        vocab_mask_src = np.asarray(vocab_mask_src, dtype=np.int32)
+        rows = min(total_bs, vocab_mask_src.shape[0])
+        cols = min(vocab_mask.shape[1], vocab_mask_src.shape[1])
+        vocab_mask[:rows, :cols] = vocab_mask_src[:rows, :cols]
+        vocab_mask[~active] = -1
+
+        grammars = getattr(sampling_info, "grammars", None)
+        if grammars:
+            for i, grammar in enumerate(grammars[:total_bs]):
+                is_terminated = (
+                    grammar.is_terminated()
+                    if grammar is not None and hasattr(grammar, "is_terminated")
+                    else False
+                )
+                if grammar is None or getattr(grammar, "finished", False) or is_terminated:
+                    vocab_mask[i] = -1
+
+    return linear_penalty, vocab_mask, enable_penalty, enable_vocab_mask
+
+
 def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
     if draft_worker.mesh is None:
         return next_token_ids
@@ -126,6 +166,42 @@ def _take_with_index_sharding(values, index):
     if isinstance(index_sharding, NamedSharding):
         return values.reshape(-1).at[index].get(out_sharding=index_sharding)
     return jnp.take(values.reshape(-1), index)
+
+
+def _apply_verify_logits_constraints(
+    target_logits,
+    linear_penalty,
+    vocab_mask,
+    *,
+    enable_penalty,
+    enable_vocab_mask,
+    speculative_num_draft_tokens,
+):
+    vocab = target_logits.shape[-1]
+    bs = target_logits.shape[0] // speculative_num_draft_tokens
+    n = speculative_num_draft_tokens
+    sh = jax.typeof(target_logits).sharding
+    mesh = sh.mesh if isinstance(sh, NamedSharding) and getattr(sh.mesh, "axis_names", ()) else None
+
+    def _rep(x):
+        return jax.sharding.reshard(x, NamedSharding(mesh, P())) if mesh is not None else x
+
+    logits_3d = _rep(target_logits.astype(jnp.float32)).reshape(bs, n, vocab)
+
+    if enable_penalty:
+        penalty = _rep(linear_penalty.astype(logits_3d.dtype)).reshape(bs, 1, vocab)
+        logits_3d = logits_3d + penalty
+
+    if enable_vocab_mask:
+        vocab_mask = _rep(vocab_mask)
+        mask_2d = jnp.broadcast_to(
+            vocab_mask[:, None, :],
+            (bs, n, vocab_mask.shape[-1]),
+        ).reshape(bs * n, vocab_mask.shape[-1])
+        logits_2d = apply_token_bitmask(logits_3d.reshape(bs * n, vocab), mask_2d)
+        logits_3d = logits_2d.reshape(bs, n, vocab)
+
+    return logits_3d.reshape(bs * n, vocab)
 
 
 def _prepare_draft_inputs(
@@ -270,7 +346,7 @@ def _verify_rejection_sampling(
     # v1: replicate the working set so explicit-sharding never has to resolve
     # gather/cumsum shardings. Correctness over speed for now.
     sh = jax.typeof(target_logits).sharding
-    mesh = sh.mesh if isinstance(sh, NamedSharding) else None
+    mesh = sh.mesh if isinstance(sh, NamedSharding) and getattr(sh.mesh, "axis_names", ()) else None
 
     def _rep(x):
         return jax.sharding.reshard(x, NamedSharding(mesh, P())) if mesh is not None else x
@@ -770,6 +846,8 @@ def _build_verify(topk: int):
             "threshold_acc",
             "enable_top_k",
             "enable_top_p",
+            "enable_penalty",
+            "enable_vocab_mask",
         ],
     )
     def fused_verify(
@@ -789,6 +867,8 @@ def _build_verify(topk: int):
         temperatures,
         top_ks,
         top_ps,
+        linear_penalty,
+        vocab_mask,
         *,
         speculative_num_steps,
         speculative_num_draft_tokens,
@@ -800,6 +880,8 @@ def _build_verify(topk: int):
         threshold_acc=1.0,
         enable_top_k=False,
         enable_top_p=False,
+        enable_penalty=False,
+        enable_vocab_mask=False,
     ):
         if use_relay_state:
             relay_topk_index, _, relay_verified_id, relay_new_seq_lens = gather_spec_relay_buffers(
@@ -865,9 +947,19 @@ def _build_verify(topk: int):
         sh = jax.typeof(target_output.next_token_logits).sharding
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
         target_logits = target_output.next_token_logits
+        constrained_target_logits = _apply_verify_logits_constraints(
+            target_logits,
+            linear_penalty,
+            vocab_mask,
+            enable_penalty=enable_penalty,
+            enable_vocab_mask=enable_vocab_mask,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
         target_hidden = target_output.hidden_states
         if is_greedy:
-            target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+            target_predict = (
+                jnp.argmax(constrained_target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+            )
             prepared = _verify_greedy(
                 target_hidden=target_hidden,
                 positions=target_forward_batch.positions,
@@ -896,7 +988,7 @@ def _build_verify(topk: int):
                 positions=target_forward_batch.positions,
                 seq_lens=target_forward_batch.seq_lens,
                 draft_tokens=draft_tokens,
-                target_logits=target_logits,
+                target_logits=constrained_target_logits,
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
@@ -1811,10 +1903,38 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         )
 
     si = model_worker_batch.sampling_info
+    if getattr(si, "grammars", None):
+        if getattr(si, "sampling_info_done", None):
+            si.sampling_info_done.wait()
+        else:
+            si.update_grammar_vocab_mask()
+    if getattr(si, "linear_penalty", None) is None and getattr(
+        getattr(si, "penalizer_orchestrator", None), "is_required", False
+    ):
+        si.update_penalties()
     _sv_is_greedy = bool(getattr(si, "is_all_greedy", True))
     _sv_tbs = target_forward_batch.seq_lens.shape[0]
     _sv_enable_top_k = False
     _sv_enable_top_p = False
+    (
+        _sv_linear_penalty_host,
+        _sv_vocab_mask_host,
+        _sv_enable_penalty,
+        _sv_enable_vocab_mask,
+    ) = _prepare_verify_constraints_host(
+        si,
+        model_worker_batch,
+        _sv_tbs,
+        int(target_worker.model_config.vocab_size),
+    )
+    _sv_linear_penalty = _prepare_device_array(
+        _sv_linear_penalty_host,
+        NamedSharding(spec_worker.mesh, P("data", "tensor")),
+    )
+    _sv_vocab_mask = _prepare_device_array(
+        _sv_vocab_mask_host,
+        NamedSharding(spec_worker.mesh, P("data", None)),
+    )
     if _sv_is_greedy:
         _sv_temps = _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding)
         _sv_topks = _prepare_device_array(np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding)
@@ -1881,6 +2001,8 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
             _sv_temps,
             _sv_topks,
             _sv_topps,
+            _sv_linear_penalty,
+            _sv_vocab_mask,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
             return_target_logits=return_target_logits,
@@ -1891,6 +2013,8 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
             threshold_acc=_sv_thr_acc,
             enable_top_k=_sv_enable_top_k,
             enable_top_p=_sv_enable_top_p,
+            enable_penalty=_sv_enable_penalty,
+            enable_vocab_mask=_sv_enable_vocab_mask,
         )
         cache_miss_count = count()
 

@@ -514,8 +514,12 @@ class SchedulerOutputProcessorMixin:
 
                 # Update grammar state after token sampling
                 if req.grammar is not None:
+                    grammar_tokens = (
+                        next_token_id if isinstance(next_token_id, list) else [next_token_id]
+                    )
                     try:
-                        req.grammar.accept_token(next_token_id)
+                        for token_id in grammar_tokens:
+                            req.grammar.accept_token(int(token_id))
                     except ValueError as e:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
