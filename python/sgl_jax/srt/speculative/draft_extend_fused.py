@@ -13,7 +13,6 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.constrained.bitmask_ops import apply_token_bitmask
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
@@ -267,8 +266,23 @@ def _gather_relay_verify_tokens_host(relay_buffers, relay_future_indices, *, dp_
     verified_id = relay_buffers.verified_id[dp_indices, indices]
     return (
         jax.device_get(verified_id).reshape(future_indices.shape),
-        jax.device_get(topk_index).reshape(future_indices.shape + relay_buffers.topk_index.shape[2:]),
+        jax.device_get(topk_index).reshape(
+            future_indices.shape + relay_buffers.topk_index.shape[2:]
+        ),
     )
+
+
+def _apply_packed_token_bitmask(logits: jax.Array, vocab_mask: jax.Array) -> jax.Array:
+    """Apply packed int32 token masks without materializing an unpacked mask first."""
+    vocab = logits.shape[-1]
+    token_ids = jnp.arange(vocab, dtype=jnp.int32)
+    word_ids = token_ids // 32
+    bit_ids = token_ids % 32
+
+    words = jnp.take(vocab_mask.astype(jnp.uint32), word_ids, axis=1)
+    bits = jnp.left_shift(jnp.array(1, dtype=jnp.uint32), bit_ids.astype(jnp.uint32))
+    allowed = (words & bits[None, :]) != 0
+    return jnp.where(allowed, logits, -jnp.inf)
 
 
 def _take_with_index_sharding(values, index):
@@ -301,13 +315,17 @@ def _apply_verify_logits_constraints(
     logits = target_logits
 
     if enable_penalty:
-        # linear_penalty is per-request [bs, vocab]; repeat each row across the
-        # n draft positions to match logits [bs*n, vocab] (request-major).
-        penalty = jnp.repeat(linear_penalty.astype(logits.dtype), n, axis=0)
+        # linear_penalty is per-request [bs, vocab]; broadcast each row across
+        # the n draft positions to match logits [bs*n, vocab] (request-major).
+        bs, vocab = linear_penalty.shape
+        penalty = jnp.broadcast_to(
+            linear_penalty.astype(logits.dtype)[:, None, :],
+            (bs, n, vocab),
+        ).reshape(bs * n, vocab)
         logits = logits + penalty
 
     if enable_vocab_mask:
-        logits = apply_token_bitmask(logits, vocab_mask)
+        logits = _apply_packed_token_bitmask(logits, vocab_mask)
 
     return logits
 
@@ -2062,7 +2080,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     )
     _sv_vocab_mask = _prepare_device_array(
         _sv_vocab_mask_host,
-        NamedSharding(spec_worker.mesh, P("data", None)),
+        NamedSharding(spec_worker.mesh, P("data", "tensor")),
     )
     if _sv_is_greedy:
         _sv_temps = _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding)
