@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -35,6 +36,21 @@ def _make_config(num_layers: int = 1):
 
 
 class TestMistralModel(unittest.TestCase):
+    def test_patch_model_config_fills_missing_head_dim(self):
+        config = SimpleNamespace(hidden_size=4096, num_attention_heads=32, head_dim=None)
+        model_config = SimpleNamespace(
+            hf_text_config=config,
+            hf_config=config,
+            head_dim=None,
+            v_head_dim=None,
+        )
+
+        MistralForCausalLM.patch_model_config(model_config)
+
+        self.assertEqual(config.head_dim, 128)
+        self.assertEqual(model_config.head_dim, 128)
+        self.assertEqual(model_config.v_head_dim, 128)
+
     def test_mistral_architectures_are_registered(self):
         cls, arch = ModelRegistry.resolve_model_cls(["MistralForCausalLM"])
         self.assertIs(cls, MistralForCausalLM)

@@ -291,6 +291,19 @@ class MistralModel(LlamaModel):
 
 
 class MistralForCausalLM(LlamaForCausalLM):
+    @classmethod
+    def patch_model_config(cls, mc: ModelConfig) -> None:
+        cfg = mc.hf_text_config
+        head_dim = getattr(cfg, "head_dim", None)
+        if head_dim is None:
+            head_dim = cfg.hidden_size // cfg.num_attention_heads
+            cfg.head_dim = head_dim
+            mc.hf_config.head_dim = head_dim
+
+        mc.head_dim = head_dim
+        if getattr(mc, "v_head_dim", None) is None:
+            mc.v_head_dim = head_dim
+
     def __init__(
         self,
         config: PretrainedConfig,
