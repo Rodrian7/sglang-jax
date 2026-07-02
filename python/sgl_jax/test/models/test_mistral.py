@@ -51,6 +51,22 @@ class TestMistralModel(unittest.TestCase):
         self.assertEqual(model_config.head_dim, 128)
         self.assertEqual(model_config.v_head_dim, 128)
 
+    def test_patch_model_config_fills_missing_sliding_window(self):
+        config = SimpleNamespace(hidden_size=4096, num_attention_heads=32, sliding_window=None)
+        model_config = SimpleNamespace(
+            hf_text_config=config,
+            hf_config=config,
+            sliding_window=None,
+            head_dim=128,
+            v_head_dim=128,
+        )
+
+        MistralForCausalLM.patch_model_config(model_config)
+
+        self.assertEqual(config.sliding_window, 4096)
+        self.assertEqual(model_config.sliding_window, 4096)
+        self.assertEqual(model_config.hf_config.sliding_window, 4096)
+
     def test_mistral_architectures_are_registered(self):
         cls, arch = ModelRegistry.resolve_model_cls(["MistralForCausalLM"])
         self.assertIs(cls, MistralForCausalLM)

@@ -160,7 +160,9 @@ class MistralDecoderLayer(nnx.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         sliding_window_size = getattr(config, "sliding_window", None)
         if sliding_window_size is None:
-            sliding_window_size = getattr(config, "sliding_window_size", 0)
+            sliding_window_size = getattr(config, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = 4096
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         self.self_attn = MistralAttention(
@@ -299,6 +301,15 @@ class MistralForCausalLM(LlamaForCausalLM):
             head_dim = cfg.hidden_size // cfg.num_attention_heads
             cfg.head_dim = head_dim
             mc.hf_config.head_dim = head_dim
+
+        sliding_window = getattr(cfg, "sliding_window", None)
+        if sliding_window is None:
+            sliding_window = getattr(cfg, "sliding_window_size", None)
+        if sliding_window is None:
+            sliding_window = 4096
+        cfg.sliding_window = sliding_window
+        mc.hf_config.sliding_window = sliding_window
+        mc.sliding_window = sliding_window
 
         mc.head_dim = head_dim
         if getattr(mc, "v_head_dim", None) is None:
