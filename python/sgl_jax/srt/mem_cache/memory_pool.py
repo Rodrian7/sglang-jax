@@ -86,6 +86,10 @@ class ReqToTokenPool:
         # Use simple list to manage free slots
         self.free_slots = list(range(size))
 
+        # [SLOTLEAK-DEBUG] idx -> rid of the request currently holding each slot;
+        # pruned in free(), dumped by scheduler.check_memory() on the leak assert.
+        self._slot_owner: dict = {}
+
         # Persistent host scratch buffer reused by
         # ScheduleBatch._merge_cache_loc to avoid a fresh np.zeros every step.
         # Allocated once at startup via init_cache_loc_host_buffer (its size is
@@ -117,6 +121,7 @@ class ReqToTokenPool:
         obj.free_slots = aux_data["free_slots"]
 
         obj.req_to_token = children[0]
+        obj._slot_owner = {}  # [SLOTLEAK-DEBUG] transient pool: fresh owner map
         # Host scratch buffer is transient host memory, not model state, so it
         # is not carried through the pytree. The live serving pool keeps its
         # init-time buffer; _merge_cache_loc never runs on a reconstructed pool.
@@ -161,12 +166,30 @@ class ReqToTokenPool:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_indices[offset]
                 offset += 1
+        # [SLOTLEAK-DEBUG]
+        for r in reqs:
+            self._slot_owner[r.req_pool_idx] = getattr(r, "rid", "?")
+        logger.info(
+            "[SLOTLEAK] alloc rids=%s idxs=%s chunked=%d free_left=%d",
+            [getattr(r, "rid", "?") for r in reqs],
+            [r.req_pool_idx for r in reqs],
+            len(chunked),
+            len(self.free_slots),
+        )
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
         """Free request slot and clear req.req_pool_idx."""
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        idx = req.req_pool_idx
+        self.free_slots.append(idx)
+        self._slot_owner.pop(idx, None)  # [SLOTLEAK-DEBUG]
+        logger.info(
+            "[SLOTLEAK] free rid=%s idx=%s free_after=%d",  # [SLOTLEAK-DEBUG]
+            getattr(req, "rid", "?"),
+            idx,
+            len(self.free_slots),
+        )
         req.req_pool_idx = None
 
     def clear(self):

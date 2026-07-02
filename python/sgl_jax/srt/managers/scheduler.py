@@ -1544,6 +1544,17 @@ class Scheduler(
         req_total_size = self.req_to_token_pool.size
 
         if len(self.req_to_token_pool.free_slots) != req_total_size:
+            # [SLOTLEAK-DEBUG] which slots leaked and who last held them.
+            leaked = {
+                idx: rid
+                for idx, rid in getattr(self.req_to_token_pool, "_slot_owner", {}).items()
+                if idx not in set(self.req_to_token_pool.free_slots)
+            }
+            logger.error(
+                "[SLOTLEAK] LEAK DETECTED free_slots=%s leaked_idx->rid=%s",
+                sorted(self.req_to_token_pool.free_slots),
+                leaked,
+            )
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "

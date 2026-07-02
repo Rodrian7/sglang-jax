@@ -125,6 +125,18 @@ def release_kv_cache(
 ) -> None:
     """Single entry point for releasing a request's KV cache (sglang #12224)."""
     if req.req_pool_idx is None:
+        logger.info(
+            "[SLOTLEAK] release_kv_cache SKIP (req_pool_idx already None) rid=%s "
+            "finished=%s to_finish=%s is_retracted=%s",
+            getattr(req, "rid", "?"),
+            (
+                getattr(req, "finished", lambda: "?")()
+                if callable(getattr(req, "finished", None))
+                else getattr(req, "finished", "?")
+            ),
+            getattr(req, "to_finish", "?"),
+            getattr(req, "is_retracted", "?"),
+        )
         return
 
     dp_rank = req.dp_rank if req.dp_rank is not None else 0
