@@ -124,6 +124,12 @@ def release_kv_cache(
     allow_overallocated: bool = False,
 ) -> None:
     """Single entry point for releasing a request's KV cache (sglang #12224)."""
+    logger.info(
+        "[SLOTLEAK] release_kv_cache ENTER rid=%s idx=%s is_insert=%s",
+        getattr(req, "rid", "?"),
+        getattr(req, "req_pool_idx", "?"),
+        is_insert,
+    )
     if req.req_pool_idx is None:
         logger.info(
             "[SLOTLEAK] release_kv_cache SKIP (req_pool_idx already None) rid=%s "

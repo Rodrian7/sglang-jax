@@ -1674,6 +1674,23 @@ class ScheduleBatch:
                     and (chunked_req is None or info.reqs[i] != chunked_req)
                 ]
 
+            # [SLOTLEAK-DEBUG] Any req dropped here that still holds a
+            # req_pool_idx was never released -> the leak, caught at the drop site.
+            _dropped = set(range(len(info.reqs))) - set(keep_indices_dp)
+            for _i in _dropped:
+                _r = info.reqs[_i]
+                if getattr(_r, "req_pool_idx", None) is not None:
+                    logger.error(
+                        "[SLOTLEAK] filter_batch DROPPING req with LIVE slot rid=%s idx=%s "
+                        "finished=%s is_retracted=%s to_finish=%s keep_provided=%s",
+                        getattr(_r, "rid", "?"),
+                        _r.req_pool_idx,
+                        _r.finished() if callable(getattr(_r, "finished", None)) else "?",
+                        getattr(_r, "is_retracted", "?"),
+                        getattr(_r, "to_finish", "?"),
+                        keep_indices is not None,
+                    )
+
             # Early exit: Clear all if nothing to keep
             if len(keep_indices_dp) == 0:
                 info.reqs = []
