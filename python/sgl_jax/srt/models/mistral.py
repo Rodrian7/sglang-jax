@@ -27,6 +27,12 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader
 logger = logging.getLogger(__name__)
 
 
+def _get_sliding_window(config: PretrainedConfig) -> int | None:
+    if hasattr(config, "sliding_window"):
+        return config.sliding_window
+    return getattr(config, "sliding_window_size", None)
+
+
 class MistralAttention(nnx.Module):
     def __init__(
         self,
@@ -41,7 +47,7 @@ class MistralAttention(nnx.Module):
         partial_rotary_factor: int | None = None,
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
-        sliding_window_size: int = 0,
+        sliding_window_size: int | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         attention_bias: bool = False,
         dtype_config: DtypeConfig | None = None,
@@ -158,11 +164,7 @@ class MistralDecoderLayer(nnx.Module):
             )
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        sliding_window_size = getattr(config, "sliding_window", None)
-        if sliding_window_size is None:
-            sliding_window_size = getattr(config, "sliding_window_size", None)
-        if sliding_window_size is None:
-            sliding_window_size = 4096
+        sliding_window_size = _get_sliding_window(config)
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         self.self_attn = MistralAttention(
@@ -302,11 +304,7 @@ class MistralForCausalLM(LlamaForCausalLM):
             cfg.head_dim = head_dim
             mc.hf_config.head_dim = head_dim
 
-        sliding_window = getattr(cfg, "sliding_window", None)
-        if sliding_window is None:
-            sliding_window = getattr(cfg, "sliding_window_size", None)
-        if sliding_window is None:
-            sliding_window = 4096
+        sliding_window = _get_sliding_window(cfg)
         cfg.sliding_window = sliding_window
         mc.hf_config.sliding_window = sliding_window
         mc.sliding_window = sliding_window
