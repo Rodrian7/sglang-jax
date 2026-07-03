@@ -373,12 +373,24 @@ class MistralForCausalLM(LlamaForCausalLM):
             return False
 
         weight_info = loader._scan_weight_info()
+        hf_sentinels = (
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        )
         native_sentinels = (
             "tok_embeddings.weight",
             "norm.weight",
             "layers.0.attention.wq.weight",
         )
-        return any(key in weight_info for key in native_sentinels)
+        has_hf_layout = any(key in weight_info for key in hf_sentinels)
+        has_native_layout = any(key in weight_info for key in native_sentinels)
+        if has_hf_layout and has_native_layout:
+            logger.info(
+                "Mistral checkpoint contains both HF and native weight names; "
+                "using HF/Llama layout."
+            )
+        return has_native_layout and not has_hf_layout
 
     def _create_mistral_native_weight_mappings(self, hf_mappings: dict) -> dict:
         mappings = {

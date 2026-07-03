@@ -19,6 +19,16 @@ mesh = create_device_mesh(
 jax.sharding.set_mesh(mesh)
 
 
+class _DummyWeightLoader:
+    dummy_mode = False
+
+    def __init__(self, keys):
+        self.keys = keys
+
+    def _scan_weight_info(self):
+        return {key: [] for key in self.keys}
+
+
 def _make_config(num_layers: int = 1):
     return MistralConfig(
         vocab_size=128,
@@ -117,6 +127,42 @@ class TestMistralModel(unittest.TestCase):
             native_mappings["layers.1.feed_forward.w3.weight"].target_path,
             "model.layers.1.mlp.up_proj.weight",
         )
+
+    def test_checkpoint_format_detection_uses_native_for_native_only(self):
+        loader = _DummyWeightLoader(
+            [
+                "tok_embeddings.weight",
+                "norm.weight",
+                "layers.0.attention.wq.weight",
+            ]
+        )
+
+        self.assertTrue(MistralForCausalLM._checkpoint_uses_mistral_native_format(loader))
+
+    def test_checkpoint_format_detection_uses_hf_for_hf_only(self):
+        loader = _DummyWeightLoader(
+            [
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+            ]
+        )
+
+        self.assertFalse(MistralForCausalLM._checkpoint_uses_mistral_native_format(loader))
+
+    def test_checkpoint_format_detection_prefers_hf_when_mixed(self):
+        loader = _DummyWeightLoader(
+            [
+                "tok_embeddings.weight",
+                "norm.weight",
+                "layers.0.attention.wq.weight",
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+            ]
+        )
+
+        self.assertFalse(MistralForCausalLM._checkpoint_uses_mistral_native_format(loader))
 
 
 if __name__ == "__main__":
