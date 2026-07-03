@@ -417,26 +417,15 @@ def get_tokenizer(
             clean_up_tokenization_spaces=False,
             **kwargs,
         )
-        # Workaround: some tokenizer packages ship chat_template only in tokenizer_config.json,
-        # while older transformers versions ignore it. Load it explicitly before the
-        # jinja fallback so chat-completion models keep their canonical prompt format.
+        # Workaround: older transformers versions only read chat_template from tokenizer_config.json
+        # and do not search for chat_template.jinja files. Explicitly load it if present in model files.
         try:
-            if getattr(tokenizer, "chat_template", None) is None:
-                tokenizer_config_path = os.path.join(tokenizer_name, "tokenizer_config.json")
-                if os.path.exists(tokenizer_config_path):
-                    with open(tokenizer_config_path, encoding="utf-8") as f:
-                        tokenizer_config = json.load(f)
-                    chat_template = tokenizer_config.get("chat_template")
-                    if chat_template:
-                        tokenizer.chat_template = chat_template
-
-            if getattr(tokenizer, "chat_template", None) is None:
-                jinja_template_path = os.path.join(tokenizer_name, "chat_template.jinja")
-                if os.path.exists(jinja_template_path):
-                    with open(jinja_template_path, encoding="utf-8") as f:
-                        tokenizer.chat_template = f.read()
+            jinja_template_path = os.path.join(tokenizer_name, "chat_template.jinja")
+            if os.path.exists(jinja_template_path):
+                with open(jinja_template_path) as f:
+                    tokenizer.chat_template = f.read()
         except Exception as e:
-            logger.debug("Failed to load chat_template from tokenizer files: %s", e)
+            logger.debug("Failed to load chat_template.jinja: %s", e)
 
     except Exception as e:
         if tokenizer_backend == "fastokens":

@@ -1,6 +1,4 @@
 import unittest
-import json
-from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -77,40 +75,6 @@ class TestTokenizerBackendValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Unsupported tokenizer_backend"):
             get_tokenizer(TOKENIZER_MODEL, tokenizer_backend="not-a-backend")
-
-    def test_chat_template_is_loaded_from_tokenizer_config(self):
-        from types import SimpleNamespace
-
-        from sgl_jax.srt import hf_transformers_utils
-
-        with TemporaryDirectory() as tokenizer_dir:
-            tokenizer_path = Path(tokenizer_dir)
-            tokenizer_config = {
-                "chat_template": "{{ bos_token }}[INST] {{ messages[0]['content'] }}[/INST]",
-            }
-            (tokenizer_path / "tokenizer_config.json").write_text(
-                json.dumps(tokenizer_config),
-                encoding="utf-8",
-            )
-
-            fake_tokenizer = SimpleNamespace(
-                chat_template=None,
-                eos_token_id=2,
-                bos_token_id=1,
-                get_added_vocab=lambda: {},
-            )
-
-            with patch.object(
-                hf_transformers_utils.AutoTokenizer,
-                "from_pretrained",
-                return_value=fake_tokenizer,
-            ):
-                tokenizer = hf_transformers_utils.get_tokenizer(tokenizer_dir)
-
-            self.assertEqual(
-                tokenizer.chat_template,
-                tokenizer_config["chat_template"],
-            )
 
 
 if __name__ == "__main__":
