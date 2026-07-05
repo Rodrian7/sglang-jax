@@ -1340,6 +1340,7 @@ class Scheduler(
         ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
         ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
         ret["pd_decode_admission"] = self._get_pd_decode_admission_state()
+        ret["pd_schedule_activity"] = self.get_schedule_activity_state()
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -2029,6 +2030,7 @@ class Scheduler(
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
+        schedule_activity_start = time.perf_counter()
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -2089,6 +2091,11 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
             )
+        self.record_schedule_activity(
+            batch,
+            schedule_activity_start,
+            time.perf_counter(),
+        )
         bid = model_worker_batch.bid
 
         # These 2 values are needed for processing the output, but the values can be

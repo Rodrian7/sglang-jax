@@ -262,3 +262,36 @@ def test_wait_for_decode_admission_polls_until_unblocked(monkeypatch):
         ("get_server_info", "server_info"),
     ]
     assert sleeps == [0.025]
+
+    state = lb.get_observability_state()
+    assert state["decode_admission_wait_count"] == 1
+    assert state["decode_admission_poll_count"] == 2
+    assert state["decode_admission_blocked_count"] == 1
+    assert state["decode_admission_wait_ms_total"] >= 0.0
+
+
+def test_prefill_admission_observability_tracks_slots_and_waits():
+    lb = make_lb(prefill_limit=1)
+
+    async def run_waiter():
+        sem = lb._prefill_admission_sems["http://prefill"]
+        await sem.acquire()
+        waiter = asyncio.create_task(lb._acquire_prefill_admission("http://prefill"))
+        await asyncio.sleep(0)
+
+        waiting_state = lb.get_observability_state()
+        assert waiting_state["prefill_admission_inflight_by_url"]["http://prefill"] == 1
+        assert waiting_state["prefill_admission_waiting_by_url"]["http://prefill"] == 1
+
+        sem.release()
+        acquired = await waiter
+        acquired.release()
+
+    asyncio.run(run_waiter())
+
+    state = lb.get_observability_state()
+    assert state["pd_prefill_max_inflight_requests"] == 1
+    assert state["prefill_admission_wait_count"] == 1
+    assert state["prefill_admission_inflight_by_url"]["http://prefill"] == 0
+    assert state["prefill_admission_available_by_url"]["http://prefill"] == 1
+    assert state["prefill_admission_wait_ms_total"] >= 0.0

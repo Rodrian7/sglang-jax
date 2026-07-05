@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import time
 from http import HTTPStatus
 from itertools import chain
 
@@ -62,6 +63,14 @@ class MiniLoadBalancer:
             "pd_router_admission_poll_ms",
             50,
         )
+        self.prefill_admission_wait_count = 0
+        self.prefill_admission_wait_ms_total = 0.0
+        self.prefill_admission_wait_ms_max = 0.0
+        self.decode_admission_wait_count = 0
+        self.decode_admission_wait_ms_total = 0.0
+        self.decode_admission_wait_ms_max = 0.0
+        self.decode_admission_poll_count = 0
+        self.decode_admission_blocked_count = 0
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -172,6 +181,74 @@ class MiniLoadBalancer:
                 return True
         return False
 
+    def get_observability_state(self) -> dict:
+        return {
+            "max_concurrent_requests": self.max_concurrent_requests,
+            "pd_prefill_max_inflight_requests": self.pd_prefill_max_inflight_requests,
+            "prefill_admission_inflight_by_url": {
+                url: self._semaphore_inflight(sem)
+                for url, sem in self._prefill_admission_sems.items()
+            },
+            "prefill_admission_available_by_url": {
+                url: int(getattr(sem, "_value", 0))
+                for url, sem in self._prefill_admission_sems.items()
+            },
+            "prefill_admission_waiting_by_url": {
+                url: self._semaphore_waiter_count(sem)
+                for url, sem in self._prefill_admission_sems.items()
+            },
+            "prefill_admission_wait_count": self.prefill_admission_wait_count,
+            "prefill_admission_wait_ms_total": round(
+                self.prefill_admission_wait_ms_total, 3
+            ),
+            "prefill_admission_wait_ms_max": round(
+                self.prefill_admission_wait_ms_max, 3
+            ),
+            "decode_admission_wait_count": self.decode_admission_wait_count,
+            "decode_admission_wait_ms_total": round(
+                self.decode_admission_wait_ms_total, 3
+            ),
+            "decode_admission_wait_ms_max": round(
+                self.decode_admission_wait_ms_max, 3
+            ),
+            "decode_admission_poll_count": self.decode_admission_poll_count,
+            "decode_admission_blocked_count": self.decode_admission_blocked_count,
+            "updated_at": time.time(),
+        }
+
+    def _semaphore_inflight(self, sem: asyncio.Semaphore) -> int:
+        return max(0, self.pd_prefill_max_inflight_requests - int(getattr(sem, "_value", 0)))
+
+    @staticmethod
+    def _semaphore_waiter_count(sem: asyncio.Semaphore) -> int:
+        waiters = getattr(sem, "_waiters", None) or ()
+        return sum(1 for waiter in waiters if not waiter.done())
+
+    def _record_prefill_admission_wait(self, wait_s: float) -> None:
+        wait_ms = max(0.0, wait_s * 1000.0)
+        self.prefill_admission_wait_count += 1
+        self.prefill_admission_wait_ms_total += wait_ms
+        self.prefill_admission_wait_ms_max = max(
+            self.prefill_admission_wait_ms_max,
+            wait_ms,
+        )
+
+    def _record_decode_admission_wait(
+        self,
+        wait_s: float,
+        poll_count: int,
+        blocked_count: int,
+    ) -> None:
+        wait_ms = max(0.0, wait_s * 1000.0)
+        self.decode_admission_wait_count += 1
+        self.decode_admission_wait_ms_total += wait_ms
+        self.decode_admission_wait_ms_max = max(
+            self.decode_admission_wait_ms_max,
+            wait_ms,
+        )
+        self.decode_admission_poll_count += poll_count
+        self.decode_admission_blocked_count += blocked_count
+
     async def _wait_for_decode_admission(self, session, decode_server: str) -> None:
         if (
             self.pd_decode_prealloc_soft_limit <= 0
@@ -182,15 +259,30 @@ class MiniLoadBalancer:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout
         poll_s = max(1, int(self.pd_router_admission_poll_ms)) / 1000.0
+        start = loop.time()
+        poll_count = 0
+        blocked_count = 0
         while True:
             info = await fetch_backend_json(
                 session,
                 decode_server,
                 ("get_server_info", "server_info"),
             )
+            poll_count += 1
             if not self._decode_admission_blocked(info):
+                self._record_decode_admission_wait(
+                    loop.time() - start,
+                    poll_count,
+                    blocked_count,
+                )
                 return
+            blocked_count += 1
             if loop.time() >= deadline:
+                self._record_decode_admission_wait(
+                    loop.time() - start,
+                    poll_count,
+                    blocked_count,
+                )
                 raise HTTPException(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     detail="PD decode admission did not clear before request timeout",
@@ -216,7 +308,11 @@ class MiniLoadBalancer:
     async def _acquire_prefill_admission(self, prefill_server: str):
         sem = self._prefill_admission_sems.get(prefill_server)
         if sem is not None:
+            start = asyncio.get_running_loop().time()
             await sem.acquire()
+            self._record_prefill_admission_wait(
+                asyncio.get_running_loop().time() - start
+            )
         return sem
 
     async def _post_prefill_and_release_admission(
@@ -499,6 +595,7 @@ try:
             ),
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "router": lb.get_observability_state(),
         }
 
     async def _get_model_info_impl():

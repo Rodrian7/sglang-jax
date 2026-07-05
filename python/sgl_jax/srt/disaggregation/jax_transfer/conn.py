@@ -136,6 +136,7 @@ class PMetadata:
     swa_remote_endpoint: object | None = None
     swa_local_pages: tuple[int, ...] | None = None
     swa_local_page_by_full_page: dict[int, int] | None = None
+    time_stats: object | None = None
 
 
 @dataclass
@@ -796,6 +797,24 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
     def transfer_started_at(self) -> float | None:
         return self._transfer_started_at
 
+    def _pd_mark_time(self, name: str, *, overwrite: bool = False) -> None:
+        ts = self._metadata.time_stats if self._metadata is not None else None
+        mark = getattr(ts, "mark", None)
+        if mark is not None:
+            mark(name, overwrite=overwrite)
+
+    def _pd_add_duration(self, name: str, seconds: float) -> None:
+        ts = self._metadata.time_stats if self._metadata is not None else None
+        add_duration = getattr(ts, "add_duration", None)
+        if add_duration is not None:
+            add_duration(name, seconds)
+
+    def _pd_increment(self, name: str, amount: int = 1) -> None:
+        ts = self._metadata.time_stats if self._metadata is not None else None
+        increment = getattr(ts, "increment", None)
+        if increment is not None:
+            increment(name, amount)
+
     def clear(self) -> None:
         self._mgr._clear_terminal_record(self._req_id, role="decode")
 
@@ -884,6 +903,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
             ):
                 return state
             assert self._metadata is not None
+            self._pd_mark_time("done_recving")
             with self._state_lock:
                 if self.state != KVPoll.TRANSFERRING:
                     return self.state
@@ -974,6 +994,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._mgr.raiden_receiver_state(cu) == "done" for cu in chunk_req_ids
             ):
                 return self.state
+            self._pd_mark_time("done_recving")
             with self._state_lock:
                 if self.state != KVPoll.TRANSFERRING:
                     return self.state
@@ -1009,6 +1030,8 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         bc = self._mgr.bootstrap_client
         if bc is None or md.bootstrap_room is None:
             return
+        import time as _time
+
         try:
             info = bc.get_transfer_info(md.bootstrap_room)
         except Exception:  # noqa: BLE001
@@ -1105,6 +1128,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                         swa_remote_ids[:8],
                         swa_local_ids[:8],
                     )
+            start_call = _time.perf_counter()
             try:
                 self._mgr.raiden_wrapper.start_read(
                     cu,
@@ -1118,6 +1142,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 logger.exception("raiden start_read raised for cu=%s", cu)
                 self._fail_raiden(reason="raiden_start_read")
                 return
+            self._pd_add_duration("start_read_call", _time.perf_counter() - start_call)
+            self._pd_increment("chunks_started")
+            self._pd_mark_time("first_chunk_start_read")
+            if num_chunks > 0 and chunk_index == num_chunks - 1:
+                self._pd_mark_time("last_chunk_start_read", overwrite=True)
             with self._state_lock:
                 self._started_chunks.add(chunk_index)
         if num_chunks > 0:

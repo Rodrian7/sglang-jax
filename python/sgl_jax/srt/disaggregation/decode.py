@@ -411,7 +411,10 @@ class SchedulerDisaggregationDecodeMixin:
                         # so skip the path-A pull-result scatter (_write_kv_to_pool).
                         # NEEDS-TPU-VERIFICATION: confirm the blocks are correct
                         # and no write-back is required.
+                        self._pd_mark_time(entry.req, "done_recving")
+                        self._pd_mark_time(entry.req, "transfer_done")
                         self._enqueue_for_decode(entry.req)
+                        self._pd_mark_time(entry.req, "enqueue_decode")
                         self._pd_mark_time(entry.req, "first_token")
                         from sgl_jax.srt.disaggregation.req_time_stats import (
                             maybe_log_time_stats,
@@ -429,10 +432,13 @@ class SchedulerDisaggregationDecodeMixin:
                         continue
                     kv_result = entry.receiver.result
                     kv = kv_result["kv"] if kv_result else None
+                    self._pd_mark_time(entry.req, "done_recving")
+                    self._pd_mark_time(entry.req, "transfer_done")
                     self._maybe_log_decode_pull_debug(entry.req, kv)
                     self._write_kv_to_pool(entry.req, entry.kv_indices, kv)
                     self._record_decode_transfer_bytes(kv)
                     self._enqueue_for_decode(entry.req)
+                    self._pd_mark_time(entry.req, "enqueue_decode")
                     self._pd_mark_time(entry.req, "first_token")
                     from sgl_jax.srt.disaggregation.req_time_stats import (
                         maybe_log_time_stats,
@@ -606,6 +612,8 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
 
             try:
+                self._pd_mark_time(entry.req, "metadata_ready")
+                self._pd_mark_time(entry.req, "kv_alloc_done")
                 receiver = self.disagg_kv_manager.create_receiver(entry.req.rid)
                 spec = self._build_kv_spec_for_req(entry.req)
                 p_info = entry.p_info
@@ -616,8 +624,10 @@ class SchedulerDisaggregationDecodeMixin:
                         specs={"kv": spec},
                         p_side_channel_host=str(p_info["host"]),
                         p_side_channel_port=int(p_info["side_channel_port"]),
+                        time_stats=entry.req.pd_time_stats,
                     )
                 )
+                self._pd_mark_time(entry.req, "receiver_init_done")
             except Exception:
                 logger.exception(
                     "failed to set up KVReceiver for req_id=%s",
@@ -672,6 +682,7 @@ class SchedulerDisaggregationDecodeMixin:
             chunks = info.get("chunks", {}) or {}
             if not chunks:
                 return None
+            self._pd_mark_time(req, "metadata_ready")
             first_info = chunks[min(chunks)]
             endpoints_json = first_info.get("raiden_endpoints_json", "") or ""
             p_info = entry.p_info
@@ -711,6 +722,7 @@ class SchedulerDisaggregationDecodeMixin:
             allocator = self.token_to_kv_pool_allocator
             local_page_ids = [int(p) for p in (kv_indices_np[::page_size] // page_size)]
             local_pages = tuple(local_page_ids)
+            self._pd_mark_time(req, "kv_alloc_done")
 
             # SWA hybrid-attention: build SWA-pool local pages (tail only) and
             # remote endpoint from the SWA engine's endpoint descriptors.
@@ -771,8 +783,10 @@ class SchedulerDisaggregationDecodeMixin:
                     swa_remote_endpoint=swa_remote_endpoint,
                     swa_local_pages=swa_local_pages,
                     swa_local_page_by_full_page=swa_local_page_by_full_page,
+                    time_stats=req.pd_time_stats,
                 )
             )
+            self._pd_mark_time(req, "receiver_init_done")
         except Exception:
             logger.exception(
                 "failed to set up raiden KVReceiver for req_id=%s",
@@ -833,7 +847,9 @@ class SchedulerDisaggregationDecodeMixin:
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+    def _pd_mark_time(
+        self: Scheduler, req: Req, name: str, *, overwrite: bool = False
+    ) -> None:
         """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
 
         if not getattr(self.server_args, "enable_request_time_stats_logging", False):
@@ -845,7 +861,7 @@ class SchedulerDisaggregationDecodeMixin:
             role = getattr(self.server_args, "disaggregation_mode", "decode")
             ts = TimeStats(role)
             req.pd_time_stats = ts
-        ts.mark(name)
+        ts.mark(name, overwrite=overwrite)
 
     def _release_decode_kv_indices(self: Scheduler, kv_indices, dp_rank: int = 0) -> None:
         """Release KV indices back to the allocator."""

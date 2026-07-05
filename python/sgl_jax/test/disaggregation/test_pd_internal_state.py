@@ -88,3 +88,85 @@ def test_pd_decode_admission_state_reports_oldest_prealloc_wait(monkeypatch):
     state = Scheduler._get_pd_decode_admission_state(scheduler)
 
     assert state["oldest_prealloc_wait_ms"] == 2500.0
+
+
+def test_schedule_activity_reports_recent_forward_busy_and_idle_windows():
+    from sgl_jax.srt.managers.scheduler_metrics_mixin import ScheduleActivityTracker
+
+    tracker = ScheduleActivityTracker(window_seconds=60.0)
+
+    tracker.record_forward(
+        mode="prefill",
+        batch_size=2,
+        new_tokens=4096,
+        start=10.0,
+        end=10.25,
+    )
+    tracker.record_forward(
+        mode="decode",
+        batch_size=8,
+        new_tokens=8,
+        start=10.75,
+        end=10.85,
+    )
+
+    state = tracker.snapshot(now=11.0)
+
+    assert state["last_mode"] == "decode"
+    assert state["last_batch_size"] == 8
+    assert state["last_new_tokens"] == 8
+    assert state["last_forward_ms"] == 100.0
+    assert state["last_idle_gap_ms"] == 500.0
+    assert state["forward_count_1s"] == 2
+    assert state["busy_ms_1s"] == 350.0
+    assert state["busy_fraction_1s"] == 0.35
+    assert state["idle_gap_ms_1s"] == 650.0
+    assert state["forward_count_5s"] == 2
+
+
+def test_schedule_activity_prunes_old_forward_events():
+    from sgl_jax.srt.managers.scheduler_metrics_mixin import ScheduleActivityTracker
+
+    tracker = ScheduleActivityTracker(window_seconds=1.0)
+
+    tracker.record_forward(
+        mode="prefill",
+        batch_size=1,
+        new_tokens=2048,
+        start=1.0,
+        end=1.1,
+    )
+    tracker.record_forward(
+        mode="decode",
+        batch_size=1,
+        new_tokens=1,
+        start=3.0,
+        end=3.2,
+    )
+
+    state = tracker.snapshot(now=3.2)
+
+    assert state["forward_count_1s"] == 1
+    assert state["busy_ms_1s"] == 200.0
+    assert state["idle_gap_ms_1s"] == 800.0
+    assert state["last_idle_gap_ms"] == 1900.0
+
+
+def test_schedule_activity_idle_gap_is_bounded_to_window():
+    from sgl_jax.srt.managers.scheduler_metrics_mixin import ScheduleActivityTracker
+
+    tracker = ScheduleActivityTracker(window_seconds=60.0)
+
+    tracker.record_forward(
+        mode="decode",
+        batch_size=1,
+        new_tokens=1,
+        start=10.0,
+        end=10.1,
+    )
+
+    state = tracker.snapshot(now=20.0)
+
+    assert state["forward_count_1s"] == 0
+    assert state["busy_ms_1s"] == 0.0
+    assert state["idle_gap_ms_1s"] == 1000.0

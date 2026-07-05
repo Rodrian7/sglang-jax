@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -128,6 +129,7 @@ class PrefillBookkeeping:
     # terminal state — used to release ``req_to_token_pool`` and any
     # owned KV indices.
     on_terminal: object | None = None
+    time_stats: object | None = None
 
 
 class PrefillBootstrapQueue:
@@ -146,12 +148,16 @@ class PrefillBootstrapQueue:
         req_id: str,
         sender: JaxTransferKVSender,
         on_terminal=None,
+        time_stats=None,
     ) -> None:
         with self._lock:
             if req_id in self._entries:
                 raise ValueError(f"PrefillBootstrapQueue already tracks " f"req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
-                req_id=req_id, sender=sender, on_terminal=on_terminal
+                req_id=req_id,
+                sender=sender,
+                on_terminal=on_terminal,
+                time_stats=time_stats,
             )
 
     def drain_terminal(self) -> list[PrefillBookkeeping]:
@@ -162,6 +168,12 @@ class PrefillBootstrapQueue:
             for req_id, entry in list(self._entries.items()):
                 state = entry.sender.poll()
                 if state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                    mark = getattr(entry.time_stats, "mark", None)
+                    if mark is not None:
+                        mark(
+                            "sender_done" if state == KVPoll.SUCCESS else "sender_failed",
+                            overwrite=True,
+                        )
                     terminal.append(entry)
                     del self._entries[req_id]
         return terminal
@@ -205,7 +217,12 @@ class SchedulerDisaggregationPrefillMixin:
                 for req in batch_reqs:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
+                forward_start = time.perf_counter()
                 result = self.run_batch(batch)
+                forward_duration = time.perf_counter() - forward_start
+                for req in batch_reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_add_duration(req, "forward_chunk", forward_duration)
                 self.process_prefill_chunk(batch, result)
             else:
                 self.send_kv_chunk()
@@ -233,7 +250,7 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         for req in pd_reqs:
-            self._pd_mark_time(req, "forward_done")
+            self._pd_mark_time(req, "forward_done", overwrite=True)
 
         self.set_next_batch_sampling_info_done(batch)
 
@@ -347,7 +364,12 @@ class SchedulerDisaggregationPrefillMixin:
             def _on_terminal(req_obj=req, sender_obj=sender, _released=released):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=_released)
 
-            self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
+            self.disagg_prefill_queue.add(
+                req_id,
+                sender,
+                on_terminal=_on_terminal,
+                time_stats=req.pd_time_stats,
+            )
 
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
@@ -369,7 +391,9 @@ class SchedulerDisaggregationPrefillMixin:
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+    def _pd_mark_time(
+        self: Scheduler, req: Req, name: str, *, overwrite: bool = False
+    ) -> None:
         """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
 
         if not getattr(self.server_args, "enable_request_time_stats_logging", False):
@@ -381,7 +405,31 @@ class SchedulerDisaggregationPrefillMixin:
             role = getattr(self.server_args, "disaggregation_mode", "prefill")
             ts = TimeStats(role)
             req.pd_time_stats = ts
-        ts.mark(name)
+        ts.mark(name, overwrite=overwrite)
+
+    def _pd_add_duration(self: Scheduler, req: Req, name: str, seconds: float) -> None:
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
+            req.pd_time_stats = ts
+        ts.add_duration(name, seconds)
+
+    def _pd_increment(self: Scheduler, req: Req, name: str, amount: int = 1) -> None:
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
+            req.pd_time_stats = ts
+        ts.increment(name, amount)
 
     def _extract_req_block_ids_range(
         self: Scheduler, req: Req, start: int, end: int
@@ -496,6 +544,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req._pd_sender = sender
             if chunk_index == 0:
                 self._pd_mark_time(req, "transfer_start")
+            handoff_start = time.perf_counter()
             sender.send_chunk(
                 chunk_index,
                 block_ids,
@@ -504,6 +553,13 @@ class SchedulerDisaggregationPrefillMixin:
                 chunk_page_offset=page_offset,
                 swa_block_ids=swa_block_ids or None,
             )
+            handoff_duration = time.perf_counter() - handoff_start
+            self._pd_add_duration(req, "chunk_handoff", handoff_duration)
+            self._pd_increment(req, "chunks_registered")
+            if chunk_index == 0:
+                self._pd_mark_time(req, "first_chunk_registered")
+            if is_final:
+                self._pd_mark_time(req, "last_chunk_registered", overwrite=True)
         except Exception as exc:
             logger.exception(
                 "raiden per-chunk handoff failed for req_id=%s chunk=%s; aborting",
@@ -534,7 +590,12 @@ class SchedulerDisaggregationPrefillMixin:
             def _on_terminal(req_obj=req, sender_obj=sender):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=False)
 
-            self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
+            self.disagg_prefill_queue.add(
+                req_id,
+                sender,
+                on_terminal=_on_terminal,
+                time_stats=req.pd_time_stats,
+            )
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
