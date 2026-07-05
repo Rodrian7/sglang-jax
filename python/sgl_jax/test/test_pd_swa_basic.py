@@ -3,6 +3,8 @@
 These verify the Python-level logic without requiring TPU or raiden.
 """
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -289,6 +291,24 @@ class TestRaidenEndpointDPShards:
 
         assert endpoint == [{"endpoint": "10.0.0.1:33463", "shards": [4, 5, 6, 7]}]
 
+    def test_preserves_advertised_endpoint_host_for_remote_prefill(self):
+        from sgl_jax.srt.disaggregation.decode import _raiden_endpoint_for_dp
+
+        endpoint = _raiden_endpoint_for_dp(
+            p_host="10.125.130.4",
+            p_endpoints=[
+                {"endpoint": "10.125.132.39:34189", "shards": list(range(8))}
+            ],
+            local_eps=[{"endpoint": "10.125.129.4:12345", "shards": list(range(8))}],
+            fallback_base_port=34189,
+            dp_rank=0,
+            dp_size=2,
+        )
+
+        assert endpoint == [
+            {"endpoint": "10.125.132.39:34189", "shards": [0, 1, 2, 3]}
+        ]
+
     def test_keeps_single_endpoint_string_when_dp_is_one(self):
         from sgl_jax.srt.disaggregation.decode import _raiden_endpoint_for_dp
 
@@ -427,6 +447,7 @@ class TestDecodeDPAllocation:
             bootstrap_room=7,
             disagg_transfer_id=None,
             origin_input_ids=list(range(16)),
+            pd_time_stats=None,
         )
         entry = DecodeBookkeeping(
             req_id=req.rid,
@@ -567,6 +588,89 @@ class TestBackwardCompatible:
         _, kwargs = mgr.raiden_wrapper.calls[0]
         assert kwargs["swa_remote_block_ids"] == [41]
         assert kwargs["swa_local_block_ids"] == [103]
+
+    def test_receiver_chunk_start_logs_are_not_warning_level(self, caplog):
+        """Per-chunk transfer starts are too hot for warning-level logging."""
+        from sgl_jax.srt.disaggregation.jax_transfer.conn import (
+            JaxTransferKVReceiver,
+            PMetadata,
+        )
+
+        class FakeBootstrap:
+            def get_transfer_info(self, room):
+                assert room == 7
+                return {
+                    "num_chunks": 1,
+                    "chunks": {
+                        0: {
+                            "remote_block_ids": [31],
+                            "chunk_page_offset": 0,
+                            "swa_remote_block_ids": [41],
+                        }
+                    },
+                }
+
+        class FakeRaidenWrapper:
+            def __init__(self):
+                self.calls = []
+
+            def start_read(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class FakeManager:
+            use_raiden = True
+
+            def __init__(self):
+                self.bootstrap_client = FakeBootstrap()
+                self.raiden_wrapper = FakeRaidenWrapper()
+
+            def poll_raiden(self):
+                pass
+
+            def raiden_receiver_state(self, req_id):
+                return None
+
+            def record_terminal(self, *args, **kwargs):
+                pass
+
+            def _prune_receiver(self, req_id):
+                pass
+
+            def raiden_forget(self, req_id):
+                pass
+
+        mgr = FakeManager()
+        receiver = JaxTransferKVReceiver(mgr, "req")
+        receiver.init(
+            PMetadata(
+                remote_addr="p:1",
+                uuid="req",
+                specs={},
+                p_side_channel_host="p",
+                p_side_channel_port=2,
+                remote_endpoint="full-ep",
+                bootstrap_room=7,
+                local_pages=(10,),
+                swa_remote_endpoint="swa-ep",
+                swa_local_pages=(101,),
+                swa_local_page_by_full_page={0: 101},
+            )
+        )
+
+        caplog.set_level(
+            logging.WARNING,
+            logger="sgl_jax.srt.disaggregation.jax_transfer.conn",
+        )
+        receiver.poll()
+
+        assert mgr.raiden_wrapper.calls
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == "sgl_jax.srt.disaggregation.jax_transfer.conn"
+            and record.levelno >= logging.WARNING
+            and record.getMessage().startswith("RAIDEN-D start_read")
+        ]
 
     def test_receiver_filters_swa_page_zero_and_tail_aligns(self):
         """Old prefill metadata may include page 0; receiver should tail-align."""

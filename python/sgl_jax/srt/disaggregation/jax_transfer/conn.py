@@ -1065,7 +1065,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._fail_raiden(reason="raiden_chunk_local_mismatch")
                 return
             cu = f"{md.uuid}#c{chunk_index}"
-            logger.warning(
+            logger.debug(
                 "RAIDEN-D start_read cu=%s uuid_int=%s remote_ep=%r off=%d "
                 "n=%d remote=%s local=%s",
                 cu,
@@ -1119,7 +1119,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                         "swa_remote_block_ids": swa_remote_ids,
                         "swa_local_block_ids": swa_local_ids,
                     }
-                    logger.warning(
+                    logger.debug(
                         "RAIDEN-D start_read_swa cu=%s swa_ep=%r n_swa=%d "
                         "remote_swa=%s local_swa=%s",
                         cu,

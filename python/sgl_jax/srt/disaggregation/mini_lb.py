@@ -156,10 +156,11 @@ class MiniLoadBalancer:
         decode_req["disagg_prefill_dp_rank"] = dp_rank
         return prefill_req, decode_req
 
-    def select_pair(self) -> tuple[str, int | None, str]:
+    def select_pair(self) -> tuple[int, str, int | None, str]:
         pidx = random.randint(0, len(self.prefill_urls) - 1)
         didx = random.randint(0, len(self.decode_urls) - 1)
         return (
+            pidx,
             self.prefill_urls[pidx],
             self.prefill_bootstrap_ports[pidx],
             self.decode_urls[didx],
@@ -663,12 +664,14 @@ try:
                 status_code=400,
                 detail="PD mini_lb does not support parallel sampling (n > 1)",
             )
-        prefill_server, bootstrap_port, decode_server = lb.select_pair()
+        prefill_index, prefill_server, bootstrap_port, decode_server = lb.select_pair()
         modified_request = inject_bootstrap_fields(
             request_data,
             prefill_server=prefill_server,
             bootstrap_port=bootstrap_port,
             bootstrap_host_override=lb.prefill_bootstrap_host,
+            prefill_index=prefill_index,
+            prefill_count=len(lb.prefill_urls),
         )
         if request_data.get("stream", False):
             return await lb.generate_stream(

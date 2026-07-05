@@ -54,12 +54,27 @@ def _raiden_endpoint_for_dp(
 ) -> object:
     """Build a raiden remote endpoint, narrowing endpoint shards for DP."""
 
-    def _host_port(endpoint: object, default_port: int) -> str:
+    def _split_host_port(endpoint: object | None, default_port: int) -> tuple[str, int]:
+        if endpoint is not None:
+            try:
+                host, port_s = str(endpoint).rsplit(":", 1)
+                if host:
+                    return host, int(port_s)
+            except Exception:  # noqa: BLE001
+                pass
+        return p_host, int(default_port)
+
+    def _host_port(endpoint: object | None, default_port: int) -> str:
+        host, port = _split_host_port(endpoint, default_port)
+        return f"{host}:{port}"
+
+    def _first_endpoint() -> object | None:
+        if not p_endpoints:
+            return None
         try:
-            port = int(str(endpoint).rsplit(":", 1)[1])
+            return p_endpoints[0].get("endpoint")
         except Exception:  # noqa: BLE001
-            port = int(default_port)
-        return f"{p_host}:{port}"
+            return None
 
     def _filter_dp_shards(ep: dict) -> dict | None:
         shards = list(ep.get("shards") or [])
@@ -82,10 +97,11 @@ def _raiden_endpoint_for_dp(
 
     local_eps = local_eps or []
     if len(local_eps) <= 1:
-        return f"{p_host}:{int(fallback_base_port)}"
+        return _host_port(_first_endpoint(), fallback_base_port)
+    base_host, base_port = _split_host_port(_first_endpoint(), fallback_base_port)
     return [
         {
-            "endpoint": f"{p_host}:{int(fallback_base_port) + i}",
+            "endpoint": f"{base_host}:{base_port + i}",
             "shards": list(ep.get("shards") or []),
         }
         for i, ep in enumerate(local_eps)
