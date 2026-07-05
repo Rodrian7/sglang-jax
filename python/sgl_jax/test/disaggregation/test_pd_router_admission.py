@@ -15,6 +15,7 @@ def make_lb(**kwargs):
         test_external_dp_routing=False,
         prefill_bootstrap_host=None,
         max_concurrent_requests=None,
+        pd_prefill_max_inflight_requests=kwargs.get("prefill_limit", 0),
         pd_decode_prealloc_soft_limit=kwargs.get("prealloc_limit", 0),
         pd_decode_oldest_prealloc_wait_ms_soft_limit=kwargs.get("wait_limit", 0.0),
         pd_router_admission_poll_ms=kwargs.get("poll_ms", 50),
@@ -43,6 +44,150 @@ def test_router_args_parse_pd_decode_admission_limits():
     assert router_args.pd_decode_prealloc_soft_limit == 8
     assert router_args.pd_decode_oldest_prealloc_wait_ms_soft_limit == 5000.0
     assert router_args.pd_router_admission_poll_ms == 25
+
+
+def test_router_args_parse_pd_prefill_inflight_limit():
+    from sgl_jax.srt.disaggregation.router_args import RouterArgs
+
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser)
+    args = parser.parse_args([
+        "--pd-prefill-max-inflight-requests",
+        "4",
+    ])
+
+    router_args = RouterArgs.from_cli_args(args)
+
+    assert router_args.pd_prefill_max_inflight_requests == 4
+
+
+def test_prefill_admission_limits_concurrent_prefill_posts():
+    lb = make_lb(prefill_limit=2)
+    active = 0
+    max_active = 0
+
+    class FakeResponse:
+        status = 200
+
+        async def read(self):
+            return b"{}"
+
+    class FakeSession:
+        async def post(self, url, json):
+            nonlocal active, max_active
+            assert url == "http://prefill/generate"
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return FakeResponse()
+
+    async def run_posts():
+        session = FakeSession()
+        await asyncio.gather(
+            *[
+                lb._post_prefill_with_admission(
+                    session,
+                    "http://prefill",
+                    "generate",
+                    {"rid": i},
+                )
+                for i in range(5)
+            ]
+        )
+
+    asyncio.run(run_posts())
+
+    assert max_active == 2
+
+
+def test_generate_waits_for_prefill_slot_before_decode_post(monkeypatch):
+    import aiohttp
+
+    lb = make_lb(prefill_limit=1)
+    prefill_posts = []
+    decode_posts = []
+    first_prefill_started = asyncio.Event()
+    allow_first_prefill_finish = asyncio.Event()
+
+    async def fake_align_dp_requests(request):
+        return request, request
+
+    async def fake_wait_for_decode_admission(session, decode_server):
+        return None
+
+    lb._align_dp_requests = fake_align_dp_requests
+    lb._wait_for_decode_admission = fake_wait_for_decode_admission
+
+    class FakeResponse:
+        status = 200
+
+        async def read(self):
+            return b"{}"
+
+        async def json(self):
+            return {}
+
+    class FakeClientSession:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json):
+            rid = json["rid"]
+            if url == "http://prefill/generate":
+                prefill_posts.append(rid)
+                if rid == "first":
+                    first_prefill_started.set()
+                    await allow_first_prefill_finish.wait()
+                return FakeResponse()
+            if url == "http://decode/generate":
+                decode_posts.append(rid)
+                return FakeResponse()
+            raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", FakeClientSession)
+    monkeypatch.setattr(aiohttp, "ClientTimeout", lambda total: object())
+
+    async def run_requests():
+        first = asyncio.create_task(
+            lb.generate(
+                {"rid": "first"},
+                "http://prefill",
+                "http://decode",
+                "generate",
+            )
+        )
+        await first_prefill_started.wait()
+        await asyncio.sleep(0)
+        assert prefill_posts == ["first"]
+        assert decode_posts == ["first"]
+
+        second = asyncio.create_task(
+            lb.generate(
+                {"rid": "second"},
+                "http://prefill",
+                "http://decode",
+                "generate",
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert prefill_posts == ["first"]
+        assert decode_posts == ["first"]
+
+        allow_first_prefill_finish.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(run_requests())
+
+    assert prefill_posts == ["first", "second"]
+    assert decode_posts == ["first", "second"]
 
 
 def test_decode_admission_blocked_by_prealloc_queue():

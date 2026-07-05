@@ -75,6 +75,8 @@ spec:
           value: "<MAX_RUNNING_REQUESTS>"
         - name: ROUTER_MAX_CONCURRENT_REQUESTS
           value: "<ROUTER_MAX_CONCURRENT_REQUESTS>"
+        - name: ROUTER_PD_PREFILL_MAX_INFLIGHT_REQUESTS
+          value: "<ROUTER_PD_PREFILL_MAX_INFLIGHT_REQUESTS>"
         - name: ROUTER_TEST_EXTERNAL_DP_ROUTING
           value: "<ROUTER_TEST_EXTERNAL_DP_ROUTING>"
         - name: ROUTER_PD_DECODE_PREALLOC_SOFT_LIMIT
@@ -314,6 +316,7 @@ spec:
               --decode http://localhost:10001
               --prefill-bootstrap-host "${P_HOST}"
               --max-concurrent-requests "$ROUTER_MAX_CONCURRENT_REQUESTS"
+              --pd-prefill-max-inflight-requests "$ROUTER_PD_PREFILL_MAX_INFLIGHT_REQUESTS"
               --pd-decode-prealloc-soft-limit "$ROUTER_PD_DECODE_PREALLOC_SOFT_LIMIT"
               --pd-decode-oldest-prealloc-wait-ms-soft-limit "$ROUTER_PD_DECODE_OLDEST_PREALLOC_WAIT_MS_SOFT_LIMIT"
               --pd-router-admission-poll-ms "$ROUTER_PD_ADMISSION_POLL_MS"

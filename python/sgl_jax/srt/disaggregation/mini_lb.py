@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -34,6 +35,18 @@ class MiniLoadBalancer:
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
+        self.pd_prefill_max_inflight_requests = max(
+            0,
+            int(getattr(router_args, "pd_prefill_max_inflight_requests", 0) or 0),
+        )
+        self._prefill_admission_sems = (
+            {
+                prefill_url: asyncio.Semaphore(self.pd_prefill_max_inflight_requests)
+                for prefill_url in self.prefill_urls
+            }
+            if self.pd_prefill_max_inflight_requests > 0
+            else {}
+        )
         self.pd_decode_prealloc_soft_limit = getattr(
             router_args,
             "pd_decode_prealloc_soft_limit",
@@ -181,8 +194,45 @@ class MiniLoadBalancer:
                 raise HTTPException(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     detail="PD decode admission did not clear before request timeout",
-                )
+            )
             await asyncio.sleep(poll_s)
+
+    async def _post_prefill_with_admission(
+        self,
+        session,
+        prefill_server: str,
+        endpoint: str,
+        request: dict,
+    ):
+        sem = await self._acquire_prefill_admission(prefill_server)
+        return await self._post_prefill_and_release_admission(
+            session,
+            prefill_server,
+            endpoint,
+            request,
+            sem,
+        )
+
+    async def _acquire_prefill_admission(self, prefill_server: str):
+        sem = self._prefill_admission_sems.get(prefill_server)
+        if sem is not None:
+            await sem.acquire()
+        return sem
+
+    async def _post_prefill_and_release_admission(
+        self,
+        session,
+        prefill_server: str,
+        endpoint: str,
+        request: dict,
+        sem,
+    ):
+        try:
+            response = await session.post(f"{prefill_server}/{endpoint}", json=request)
+            return response, await response.read()
+        finally:
+            if sem is not None:
+                sem.release()
 
     async def generate(
         self,
@@ -211,14 +261,22 @@ class MiniLoadBalancer:
             timeout=aiohttp.ClientTimeout(total=self.timeout)
         ) as session:
             await self._wait_for_decode_admission(session, decode_server)
+            prefill_sem = await self._acquire_prefill_admission(prefill_server)
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                self._post_prefill_and_release_admission(
+                    session,
+                    prefill_server,
+                    endpoint,
+                    prefill_req,
+                    prefill_sem,
+                ),
                 session.post(f"{decode_server}/{endpoint}", json=decode_req),
             ]
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            prefill_result, decode_response = await asyncio.gather(*tasks)
+            prefill_response, prefill_body = prefill_result
 
             if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
+                prefill_json = json.loads(prefill_body or b"{}")
                 ret_json = await decode_response.json()
                 if "meta_info" in ret_json and "input_token_logprobs" in ret_json["meta_info"]:
                     ret_json["meta_info"]["input_token_logprobs"] = (
@@ -294,18 +352,26 @@ class MiniLoadBalancer:
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 await self._wait_for_decode_admission(session, decode_server)
+                prefill_sem = await self._acquire_prefill_admission(prefill_server)
                 tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    self._post_prefill_and_release_admission(
+                        session,
+                        prefill_server,
+                        endpoint,
+                        modified_request,
+                        prefill_sem,
+                    ),
                     session.post(f"{decode_server}/{endpoint}", json=modified_request),
                 ]
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                prefill_result, decode_response = await asyncio.gather(*tasks)
+                _, prefill_body = prefill_result
 
                 if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
-
-                    first_prefill_chunk = prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                    first_prefill_chunk = next(
+                        line[5:].strip()
+                        for line in prefill_body.decode("utf-8").splitlines()
+                        if line.startswith("data:") and "[DONE]" not in line
+                    )
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
                     async for chunk in decode_response.content:

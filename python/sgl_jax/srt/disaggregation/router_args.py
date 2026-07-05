@@ -21,6 +21,7 @@ class RouterArgs:
     prefill_bootstrap_host: str | None = None
 
     max_concurrent_requests: int | None = None
+    pd_prefill_max_inflight_requests: int = 0
     pd_decode_prealloc_soft_limit: int = 0
     pd_decode_oldest_prealloc_wait_ms_soft_limit: float = 0.0
     pd_router_admission_poll_ms: int = 50
@@ -75,6 +76,13 @@ class RouterArgs:
             "returned as client errors, never aborted). Unset = no limit.",
         )
         parser.add_argument(
+            "--pd-prefill-max-inflight-requests",
+            type=int,
+            default=RouterArgs.pd_prefill_max_inflight_requests,
+            help="If > 0, cap concurrent prefill-side requests per prefill "
+            "server. Excess requests wait at the router before prefill dispatch.",
+        )
+        parser.add_argument(
             "--pd-decode-prealloc-soft-limit",
             type=int,
             default=RouterArgs.pd_decode_prealloc_soft_limit,
@@ -109,6 +117,11 @@ class RouterArgs:
             decode_urls=cls._parse_decode_urls(getattr(args, "decode", None)),
             prefill_bootstrap_host=getattr(args, "prefill_bootstrap_host", None),
             max_concurrent_requests=getattr(args, "max_concurrent_requests", None),
+            pd_prefill_max_inflight_requests=getattr(
+                args,
+                "pd_prefill_max_inflight_requests",
+                cls.pd_prefill_max_inflight_requests,
+            ),
             pd_decode_prealloc_soft_limit=getattr(
                 args,
                 "pd_decode_prealloc_soft_limit",
