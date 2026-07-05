@@ -19,6 +19,7 @@ def make_lb(**kwargs):
         pd_decode_prealloc_soft_limit=kwargs.get("prealloc_limit", 0),
         pd_decode_oldest_prealloc_wait_ms_soft_limit=kwargs.get("wait_limit", 0.0),
         pd_router_admission_poll_ms=kwargs.get("poll_ms", 50),
+        pd_router_prefill_decode_overlap=kwargs.get("overlap", True),
         policy="random",
         pd_disaggregation=True,
     )
@@ -59,6 +60,20 @@ def test_router_args_parse_pd_prefill_inflight_limit():
     router_args = RouterArgs.from_cli_args(args)
 
     assert router_args.pd_prefill_max_inflight_requests == 4
+
+
+def test_router_args_can_disable_prefill_decode_overlap():
+    from sgl_jax.srt.disaggregation.router_args import RouterArgs
+
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser)
+    args = parser.parse_args([
+        "--no-pd-router-prefill-decode-overlap",
+    ])
+
+    router_args = RouterArgs.from_cli_args(args)
+
+    assert router_args.pd_router_prefill_decode_overlap is False
 
 
 def test_prefill_admission_limits_concurrent_prefill_posts():
@@ -188,6 +203,80 @@ def test_generate_waits_for_prefill_slot_before_decode_post(monkeypatch):
 
     assert prefill_posts == ["first", "second"]
     assert decode_posts == ["first", "second"]
+
+
+def test_generate_can_disable_prefill_decode_overlap(monkeypatch):
+    import aiohttp
+
+    lb = make_lb(prefill_limit=1, overlap=False)
+    prefill_posts = []
+    decode_posts = []
+    prefill_started = asyncio.Event()
+    allow_prefill_finish = asyncio.Event()
+
+    async def fake_align_dp_requests(request):
+        return request, request
+
+    async def fake_wait_for_decode_admission(session, decode_server):
+        return None
+
+    lb._align_dp_requests = fake_align_dp_requests
+    lb._wait_for_decode_admission = fake_wait_for_decode_admission
+
+    class FakeResponse:
+        status = 200
+
+        async def read(self):
+            return b"{}"
+
+        async def json(self):
+            return {}
+
+    class FakeClientSession:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json):
+            rid = json["rid"]
+            if url == "http://prefill/generate":
+                prefill_posts.append(rid)
+                prefill_started.set()
+                await allow_prefill_finish.wait()
+                return FakeResponse()
+            if url == "http://decode/generate":
+                decode_posts.append(rid)
+                return FakeResponse()
+            raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", FakeClientSession)
+    monkeypatch.setattr(aiohttp, "ClientTimeout", lambda total: object())
+
+    async def run_request():
+        task = asyncio.create_task(
+            lb.generate(
+                {"rid": "req0"},
+                "http://prefill",
+                "http://decode",
+                "generate",
+            )
+        )
+        await prefill_started.wait()
+        await asyncio.sleep(0)
+        assert prefill_posts == ["req0"]
+        assert decode_posts == []
+
+        allow_prefill_finish.set()
+        await task
+
+    asyncio.run(run_request())
+
+    assert decode_posts == ["req0"]
 
 
 def test_decode_admission_blocked_by_prealloc_queue():

@@ -25,6 +25,7 @@ class RouterArgs:
     pd_decode_prealloc_soft_limit: int = 0
     pd_decode_oldest_prealloc_wait_ms_soft_limit: float = 0.0
     pd_router_admission_poll_ms: int = 50
+    pd_router_prefill_decode_overlap: bool = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -102,6 +103,14 @@ class RouterArgs:
             default=RouterArgs.pd_router_admission_poll_ms,
             help="Polling interval in milliseconds for router-side PD decode admission.",
         )
+        parser.add_argument(
+            "--no-pd-router-prefill-decode-overlap",
+            action="store_false",
+            dest="pd_router_prefill_decode_overlap",
+            default=RouterArgs.pd_router_prefill_decode_overlap,
+            help="Disable router-side overlap between prefill and decode POSTs. "
+            "Useful for A/B benchmarking the PD overlap benefit.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> RouterArgs:
@@ -136,6 +145,11 @@ class RouterArgs:
                 args,
                 "pd_router_admission_poll_ms",
                 cls.pd_router_admission_poll_ms,
+            ),
+            pd_router_prefill_decode_overlap=getattr(
+                args,
+                "pd_router_prefill_decode_overlap",
+                cls.pd_router_prefill_decode_overlap,
             ),
         )
 

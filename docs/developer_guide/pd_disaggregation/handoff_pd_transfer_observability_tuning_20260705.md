@@ -12,15 +12,18 @@ Falcon tuning on MiMo-V2-Flash SWA PD disaggregation.
 - Workload: random 16k input, 128 output
 - Transfer: Raiden chunked path, 8 chunks for 16k prompts
 - Recommended current router cap: `--pd-prefill-max-inflight-requests 4`
+- Recommended router P/D request mode: prefill/decode POST overlap enabled
 - JIT cache: `/tmp/tpu_logs/jit_cache`
 
-At handoff time, both sides were healthy and router was restored to cap 4:
+At handoff time, both sides were healthy and router was restored to cap 4 with
+prefill/decode overlap enabled:
 
 ```text
 rank0: bootstrap health ok, prefill health ok
 rank1: decode health ok, router health ok
-router pid: 221444
+router pid: 225058
 router cap: 4
+pd_router_prefill_decode_overlap: true
 ```
 
 The final `prefill.py` was copied back to both pod disks after a reverted
@@ -42,6 +45,9 @@ Runtime observability:
 - Jax transfer receiver records `start_read` call time and chunk-start count.
 - Router/scheduler metrics expose macro backlog/busy-shape signals for quick
   C16/C64 regression.
+- Router now exposes `pd_router_prefill_decode_overlap` in `/server_info` and
+  supports `--no-pd-router-prefill-decode-overlap` for A/B only. The default
+  remains overlap enabled.
 
 Tests:
 
@@ -161,14 +167,29 @@ transfer_tail mean:         326.41ms
 Conclusion: do not keep this as an optimization. The P-side wait is not fixed
 by one more scheduler-level poll before forward.
 
+Router prefill/decode overlap A/B, C16 16k/128:
+
+| mode | log prefix | duration | throughput | TTFT mean | P sender_done_wait |
+|---|---|---:|---:|---:|---:|
+| overlap on | `overlap_on_c16_1783246003` | 24.15s | 0.66 req/s | 12675.81ms | hundreds of ms |
+| overlap off | `overlap_off_c16_full_1783246538` | 164.96s | 0.10 req/s | streaming stat invalid | about 30000ms |
+
+Conclusion: router-side prefill/decode POST overlap is required for good
+throughput in this Raiden path. With overlap disabled, prefill waits for sender
+completion while decode has not started reading yet, so P-side
+`sender_done_wait/transfer_tail` inflates to the 30s pull-timeout scale. The
+measured C16 throughput drops by about 6.8x.
+
 ## Next Work
 
 1. Keep cap 4 as the default for this debug environment.
-2. Use C16 for quick transfer/forward regression, then C64 for utilization and
+2. Keep router prefill/decode overlap enabled. Use the disable flag only for
+   explicit A/B or failure reproduction.
+3. Use C16 for quick transfer/forward regression, then C64 for utilization and
    tail validation.
-3. Instrument Raiden sender completion more directly:
+4. Instrument Raiden sender completion more directly:
    final chunk accepted, transport complete, first poll success.
-4. If TTFT needs a real step-function improvement, scale prefill capacity
+5. If TTFT needs a real step-function improvement, scale prefill capacity
    first, e.g. multiple prefill workers per decode, then retune router cap.
-5. Treat `metadata_wait/prealloc_wait` as backlog visibility unless it remains
+6. Treat `metadata_wait/prealloc_wait` as backlog visibility unless it remains
    high after prefill capacity is scaled.

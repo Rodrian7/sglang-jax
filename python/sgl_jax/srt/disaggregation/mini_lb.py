@@ -63,6 +63,9 @@ class MiniLoadBalancer:
             "pd_router_admission_poll_ms",
             50,
         )
+        self.pd_router_prefill_decode_overlap = bool(
+            getattr(router_args, "pd_router_prefill_decode_overlap", True)
+        )
         self.prefill_admission_wait_count = 0
         self.prefill_admission_wait_ms_total = 0.0
         self.prefill_admission_wait_ms_max = 0.0
@@ -185,6 +188,7 @@ class MiniLoadBalancer:
         return {
             "max_concurrent_requests": self.max_concurrent_requests,
             "pd_prefill_max_inflight_requests": self.pd_prefill_max_inflight_requests,
+            "pd_router_prefill_decode_overlap": self.pd_router_prefill_decode_overlap,
             "prefill_admission_inflight_by_url": {
                 url: self._semaphore_inflight(sem)
                 for url, sem in self._prefill_admission_sems.items()
@@ -358,18 +362,33 @@ class MiniLoadBalancer:
         ) as session:
             await self._wait_for_decode_admission(session, decode_server)
             prefill_sem = await self._acquire_prefill_admission(prefill_server)
-            tasks = [
-                self._post_prefill_and_release_admission(
-                    session,
-                    prefill_server,
-                    endpoint,
-                    prefill_req,
-                    prefill_sem,
-                ),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
-            prefill_result, decode_response = await asyncio.gather(*tasks)
-            prefill_response, prefill_body = prefill_result
+            if self.pd_router_prefill_decode_overlap:
+                tasks = [
+                    self._post_prefill_and_release_admission(
+                        session,
+                        prefill_server,
+                        endpoint,
+                        prefill_req,
+                        prefill_sem,
+                    ),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                ]
+                prefill_result, decode_response = await asyncio.gather(*tasks)
+                prefill_response, prefill_body = prefill_result
+            else:
+                prefill_response, prefill_body = await (
+                    self._post_prefill_and_release_admission(
+                        session,
+                        prefill_server,
+                        endpoint,
+                        prefill_req,
+                        prefill_sem,
+                    )
+                )
+                decode_response = await session.post(
+                    f"{decode_server}/{endpoint}",
+                    json=decode_req,
+                )
 
             if "return_logprob" in modified_request:
                 prefill_json = json.loads(prefill_body or b"{}")
@@ -449,18 +468,31 @@ class MiniLoadBalancer:
             ) as session:
                 await self._wait_for_decode_admission(session, decode_server)
                 prefill_sem = await self._acquire_prefill_admission(prefill_server)
-                tasks = [
-                    self._post_prefill_and_release_admission(
+                if self.pd_router_prefill_decode_overlap:
+                    tasks = [
+                        self._post_prefill_and_release_admission(
+                            session,
+                            prefill_server,
+                            endpoint,
+                            modified_request,
+                            prefill_sem,
+                        ),
+                        session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                    ]
+                    prefill_result, decode_response = await asyncio.gather(*tasks)
+                    _, prefill_body = prefill_result
+                else:
+                    _, prefill_body = await self._post_prefill_and_release_admission(
                         session,
                         prefill_server,
                         endpoint,
                         modified_request,
                         prefill_sem,
-                    ),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
-                ]
-                prefill_result, decode_response = await asyncio.gather(*tasks)
-                _, prefill_body = prefill_result
+                    )
+                    decode_response = await session.post(
+                        f"{decode_server}/{endpoint}",
+                        json=modified_request,
+                    )
 
                 if modified_request.get("return_logprob", False):
                     first_prefill_chunk = next(
