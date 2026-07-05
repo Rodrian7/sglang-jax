@@ -16,6 +16,9 @@ class FakeAllocator:
     def available_size(self, dp_rank=0):
         return 1000 - dp_rank
 
+    def get_kvcache(self):
+        return SimpleNamespace(mem_usage=0.25)
+
 
 class FakeBatch:
     def __init__(self, reqs_by_dp):
@@ -24,6 +27,9 @@ class FakeBatch:
     def is_empty(self):
         return not any(info.reqs for info in self.reqs_info)
 
+    def batch_size(self):
+        return sum(len(info.reqs) for info in self.reqs_info)
+
 
 def test_pd_decode_admission_state_empty_when_no_queue():
     from sgl_jax.srt.managers.scheduler import Scheduler
@@ -31,6 +37,38 @@ def test_pd_decode_admission_state_empty_when_no_queue():
     scheduler = SimpleNamespace(disagg_prealloc_queue=None)
 
     assert Scheduler._get_pd_decode_admission_state(scheduler) == {}
+
+
+def test_internal_state_reports_enable_overlap():
+    from sgl_jax.srt.managers.scheduler import Scheduler
+
+    scheduler = SimpleNamespace(
+        last_gen_throughput=0.0,
+        token_to_kv_pool_allocator=FakeAllocator(),
+        max_total_num_tokens=1024,
+        _engine_paused=False,
+        waiting_queue=[],
+        running_batch=FakeBatch([[]]),
+        cur_batch=None,
+        last_batch=None,
+        chunked_reqs=[None],
+        tree_cache=None,
+        req_to_token_pool=None,
+        num_generated_tokens=0,
+        forward_ct_decode=0,
+        new_token_ratio=0.0,
+        init_new_token_ratio=0.0,
+        disagg_prefill_queue=None,
+        disagg_prealloc_queue=None,
+        disagg_transfer_queue=None,
+        enable_overlap=True,
+        _get_pd_decode_admission_state=lambda: {},
+        get_schedule_activity_state=lambda: {},
+    )
+
+    output = Scheduler.get_internal_state(scheduler, SimpleNamespace())
+
+    assert output.internal_state["enable_overlap"] is True
 
 
 def test_pd_decode_admission_state_counts_queue_tokens_and_dp_capacity():

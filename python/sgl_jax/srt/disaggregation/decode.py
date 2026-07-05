@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -240,6 +241,79 @@ class SchedulerDisaggregationDecodeMixin:
                 self.new_token_ratio = self.init_new_token_ratio
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
+
+            self.last_batch = batch
+
+    def event_loop_overlap_disagg_decode(self: Scheduler) -> None:
+        """Decode event loop with host/device overlap."""
+
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode, ScheduleBatch
+
+        wd = self.disagg_decode_watchdog
+        wd.start()
+        self.result_queue = deque()
+
+        while True:
+            wd.beat("recv_requests")
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            wd.beat("process_input_requests")
+            self.process_input_requests_disagg_decode(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
+            wd.beat("process_decode_queue")
+            self.process_decode_queue()
+
+            wd.beat("get_next_batch")
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                batch.launch_done = threading.Event()
+                wd.beat("run_batch")
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
+
+                if self.last_batch is None:
+                    tmp_batch = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
+                    )
+                    tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+            else:
+                wd.beat("idle")
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+
+            if self.last_batch:
+                wd.beat("process_batch_result")
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
+                )
+                self.process_batch_result(
+                    tmp_batch,
+                    tmp_result,
+                    batch.launch_done if batch else None,
+                )
 
             self.last_batch = batch
 

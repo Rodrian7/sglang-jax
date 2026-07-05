@@ -197,9 +197,6 @@ class Scheduler(
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
-        if server_args.disaggregation_mode != "null":
-            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
@@ -1304,6 +1301,7 @@ class Scheduler(
         ret["running_batch_rids"] = [req.rid for req in all_reqs] if len(all_reqs) != 0 else []
 
         # scheduling state
+        ret["enable_overlap"] = self.enable_overlap
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
         ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
@@ -2470,9 +2468,15 @@ def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs)
 
     mode = server_args.disaggregation_mode
     if mode == "prefill":
-        scheduler.event_loop_normal_disagg_prefill()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            scheduler.event_loop_normal_disagg_prefill()
     elif mode == "decode":
-        scheduler.event_loop_normal_disagg_decode()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
     elif scheduler.enable_overlap:
         scheduler.event_loop_overlap()
     else:

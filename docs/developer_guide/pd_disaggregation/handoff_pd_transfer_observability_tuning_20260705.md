@@ -49,6 +49,38 @@ Runtime observability:
   supports `--no-pd-router-prefill-decode-overlap` for A/B only. The default
   remains overlap enabled.
 
+Scheduler host/device overlap:
+
+- PD disaggregation no longer forcibly disables scheduler overlap when
+  `--disable-overlap-schedule` is not set.
+- Added PD-specific overlap event loops for prefill and decode.
+- Prefill overlap resolves the previous forward result before publishing that
+  batch's KV chunks, but keeps PD batches out of `running_batch`.
+- Prefill overlap stores a per-batch snapshot of `chunked_reqs`. This is
+  required because `scheduler.chunked_reqs` has already advanced by the time the
+  previous batch is processed. Without the snapshot, a mid chunk can be
+  incorrectly registered as final; Falcon reproduced this as duplicate terminal
+  chunks such as `c6/7` then `c7/8`, decode starting only 7 chunks, and prefill
+  waiting for Raiden `done_sending` until the 30s timeout.
+- `/get_server_info` internal state now includes `enable_overlap`.
+
+Falcon local TPU env correction:
+
+```bash
+export TPU_PROCESS_ADDRESSES=localhost:8471
+export TPU_WORKER_HOSTNAMES=localhost
+export TPU_PROCESS_PORT=8471
+export TPU_WORKER_ID=0
+export TPU_HOST_BOUNDS=1,1,1
+export HOST_BOUNDS=1,1,1
+export TPU_TOPOLOGY=2x2x1
+```
+
+Using Falcon's default two-rank TPU env made JAX see 16 global devices and fail
+against the `(2,4)` mesh. Setting only `TPU_PROCESS_ADDRESSES=localhost:8471`
+is also insufficient because libtpu still infers two workers from
+`TPU_HOST_BOUNDS=1,1,2`.
+
 Tests:
 
 - Added `python/sgl_jax/test/disaggregation/test_pd_time_stats.py`.
@@ -67,6 +99,16 @@ pass
 
 git diff --check
 clean
+```
+
+Additional scheduler-overlap verification:
+
+```text
+.venv/bin/pytest python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py \
+  python/sgl_jax/test/disaggregation/test_pd_time_stats.py \
+  python/sgl_jax/test/disaggregation/test_pd_internal_state.py \
+  python/sgl_jax/test/disaggregation/test_pd_router_admission.py -q
+28 passed in 3.51s
 ```
 
 ## Serial / Parallel Shape
@@ -179,6 +221,19 @@ throughput in this Raiden path. With overlap disabled, prefill waits for sender
 completion while decode has not started reading yet, so P-side
 `sender_done_wait/transfer_tail` inflates to the 30s pull-timeout scale. The
 measured C16 throughput drops by about 6.8x.
+
+Scheduler host/device overlap, C16 16k/128:
+
+| mode | log prefix | duration | throughput | TTFT mean | ITL mean | P sender_done_wait |
+|---|---|---:|---:|---:|---:|---:|
+| router overlap only baseline | `overlap_on_c16_1783246003` | 24.15s | 0.66 req/s | 12675.81ms | 19.81ms | hundreds of ms |
+| scheduler overlap bug | `pd_sched_overlap_c16_1783248833` | 135.46s | 0.12 req/s | 83610.25ms | 0.02ms | about 30000ms |
+| scheduler overlap fixed | `pd_sched_overlap_chunkfix_c16_1783249614` | 22.94s | 0.70 req/s | 12382.19ms | 12.78ms | 312.24ms |
+
+The fixed run had `chunks_registered_count=8` on prefill and
+`chunks_started_count=8` on decode for all last-16 requests. Decode
+`transfer_tail` averaged `51.81ms`; prefill `transfer_tail` averaged
+`312.36ms`.
 
 ## Next Work
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -240,21 +241,111 @@ class SchedulerDisaggregationPrefillMixin:
                 else batch
             )
 
-    def process_prefill_chunk(self: Scheduler, batch, result) -> None:
+    def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        """Prefill-only event loop with host/device overlap."""
+
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode, ScheduleBatch
+
+        self.result_queue = deque()
+        last_launched_batch = None
+
+        while True:
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                batch_reqs = _batch_reqs(batch)
+                for req in batch_reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_mark_time(req, "forward_start")
+                batch._pd_forward_started_at = time.perf_counter()
+                batch.launch_done = threading.Event()
+                result = self.run_batch(batch)
+                queued_batch = batch.copy()
+                queued_batch._pd_forward_started_at = batch._pd_forward_started_at
+                queued_batch._pd_chunked_reqs = tuple(
+                    r for r in getattr(self, "chunked_reqs", ()) if r is not None
+                )
+                self.result_queue.append((queued_batch, result))
+
+                if last_launched_batch is None:
+                    tmp_batch = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
+                    )
+                    tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+            else:
+                self.send_kv_chunk()
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+
+            if last_launched_batch is not None:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
+                )
+                self.process_prefill_chunk(
+                    tmp_batch,
+                    tmp_result,
+                    batch.launch_done if batch else None,
+                )
+
+            self.send_kv_chunk()
+            last_launched_batch = batch
+            # PD reqs are finished and released inside process_prefill_chunk;
+            # do not expose the launched PD batch through self.last_batch where
+            # get_next_batch_to_run would merge it into running_batch.
+            self.last_batch = None
+
+    def process_prefill_chunk(self: Scheduler, batch, result, launch_done=None) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
         batch_reqs = _batch_reqs(batch)
         pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
-            self.process_batch_result(batch, result)
+            self.process_batch_result(batch, result, launch_done)
             return
 
+        if getattr(self, "enable_overlap", False):
+            self.tp_worker.resolve_last_batch_result(launch_done)
+
+        forward_started_at = getattr(batch, "_pd_forward_started_at", None)
+        forward_duration = (
+            None if forward_started_at is None else time.perf_counter() - forward_started_at
+        )
         for req in pd_reqs:
             self._pd_mark_time(req, "forward_done", overwrite=True)
+            if forward_duration is not None:
+                self._pd_add_duration(req, "forward_chunk", forward_duration)
 
         self.set_next_batch_sampling_info_done(batch)
 
-        chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
+        chunked_now = getattr(batch, "_pd_chunked_reqs", None)
+        if chunked_now is None:
+            chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
         use_raiden = self.disagg_kv_manager.use_raiden
         for req in batch_reqs:
             if req.bootstrap_room is None:
