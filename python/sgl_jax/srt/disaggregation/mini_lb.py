@@ -34,6 +34,21 @@ class MiniLoadBalancer:
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
+        self.pd_decode_prealloc_soft_limit = getattr(
+            router_args,
+            "pd_decode_prealloc_soft_limit",
+            0,
+        )
+        self.pd_decode_oldest_prealloc_wait_ms_soft_limit = getattr(
+            router_args,
+            "pd_decode_oldest_prealloc_wait_ms_soft_limit",
+            0.0,
+        )
+        self.pd_router_admission_poll_ms = getattr(
+            router_args,
+            "pd_router_admission_poll_ms",
+            50,
+        )
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -125,6 +140,50 @@ class MiniLoadBalancer:
             self.decode_urls[didx],
         )
 
+    def _decode_admission_blocked(self, decode_info: dict) -> bool:
+        states = decode_info.get("internal_states") or []
+        for state in states:
+            admission = state.get("pd_decode_admission") or {}
+            prealloc_q = admission.get("prealloc_queue_size", 0)
+            oldest_ms = admission.get("oldest_prealloc_wait_ms")
+            if (
+                self.pd_decode_prealloc_soft_limit > 0
+                and prealloc_q >= self.pd_decode_prealloc_soft_limit
+            ):
+                return True
+            if (
+                self.pd_decode_oldest_prealloc_wait_ms_soft_limit > 0
+                and oldest_ms is not None
+                and oldest_ms >= self.pd_decode_oldest_prealloc_wait_ms_soft_limit
+            ):
+                return True
+        return False
+
+    async def _wait_for_decode_admission(self, session, decode_server: str) -> None:
+        if (
+            self.pd_decode_prealloc_soft_limit <= 0
+            and self.pd_decode_oldest_prealloc_wait_ms_soft_limit <= 0
+        ):
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        poll_s = max(1, int(self.pd_router_admission_poll_ms)) / 1000.0
+        while True:
+            info = await fetch_backend_json(
+                session,
+                decode_server,
+                ("get_server_info", "server_info"),
+            )
+            if not self._decode_admission_blocked(info):
+                return
+            if loop.time() >= deadline:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="PD decode admission did not clear before request timeout",
+                )
+            await asyncio.sleep(poll_s)
+
     async def generate(
         self,
         modified_request: dict,
@@ -151,6 +210,7 @@ class MiniLoadBalancer:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout)
         ) as session:
+            await self._wait_for_decode_admission(session, decode_server)
             tasks = [
                 session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
                 session.post(f"{decode_server}/{endpoint}", json=decode_req),
@@ -233,6 +293,7 @@ class MiniLoadBalancer:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
+                await self._wait_for_decode_admission(session, decode_server)
                 tasks = [
                     session.post(f"{prefill_server}/{endpoint}", json=modified_request),
                     session.post(f"{decode_server}/{endpoint}", json=modified_request),

@@ -77,6 +77,12 @@ spec:
           value: "<ROUTER_MAX_CONCURRENT_REQUESTS>"
         - name: ROUTER_TEST_EXTERNAL_DP_ROUTING
           value: "<ROUTER_TEST_EXTERNAL_DP_ROUTING>"
+        - name: ROUTER_PD_DECODE_PREALLOC_SOFT_LIMIT
+          value: "<ROUTER_PD_DECODE_PREALLOC_SOFT_LIMIT>"
+        - name: ROUTER_PD_DECODE_OLDEST_PREALLOC_WAIT_MS_SOFT_LIMIT
+          value: "<ROUTER_PD_DECODE_OLDEST_PREALLOC_WAIT_MS_SOFT_LIMIT>"
+        - name: ROUTER_PD_ADMISSION_POLL_MS
+          value: "<ROUTER_PD_ADMISSION_POLL_MS>"
         - name: CONTEXT_LENGTH
           value: "<CONTEXT_LENGTH>"
         - name: CHUNKED_PREFILL_SIZE
@@ -308,6 +314,9 @@ spec:
               --decode http://localhost:10001
               --prefill-bootstrap-host "${P_HOST}"
               --max-concurrent-requests "$ROUTER_MAX_CONCURRENT_REQUESTS"
+              --pd-decode-prealloc-soft-limit "$ROUTER_PD_DECODE_PREALLOC_SOFT_LIMIT"
+              --pd-decode-oldest-prealloc-wait-ms-soft-limit "$ROUTER_PD_DECODE_OLDEST_PREALLOC_WAIT_MS_SOFT_LIMIT"
+              --pd-router-admission-poll-ms "$ROUTER_PD_ADMISSION_POLL_MS"
               --host 0.0.0.0 --port 30000
             )
             if [ "$ROUTER_TEST_EXTERNAL_DP_ROUTING" = "1" ]; then
