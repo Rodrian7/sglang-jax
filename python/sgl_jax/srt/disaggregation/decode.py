@@ -297,6 +297,9 @@ class SchedulerDisaggregationDecodeMixin:
                         self._current_sampling_info_owner().cur_sampling_info
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
+
+                wd.beat("process_decode_queue_after_launch")
+                self.process_decode_queue()
             else:
                 wd.beat("idle")
                 self.new_token_ratio = self.init_new_token_ratio

@@ -132,3 +132,73 @@ def test_prefill_chunk_snapshot_keeps_mid_chunk_when_global_state_advances():
     )
 
     assert calls == [False]
+
+
+def test_decode_overlap_polls_transfer_queue_after_launch_before_result_processing():
+    from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+
+    class StopLoop(Exception):
+        pass
+
+    calls = []
+
+    class FakeWatchdog:
+        def start(self):
+            calls.append("watchdog_start")
+
+        def beat(self, label):
+            calls.append(("beat", label))
+
+    class FakeBatch:
+        def copy(self):
+            return SimpleNamespace(next_batch_sampling_info=None)
+
+    batch = FakeBatch()
+
+    class FakeScheduler:
+        disagg_decode_watchdog = FakeWatchdog()
+        _comm_backend = None
+        _engine_paused = False
+        last_batch = object()
+
+        def recv_requests(self):
+            calls.append("recv")
+            return []
+
+        def select_dp_for_request(self, recv_reqs):
+            return recv_reqs
+
+        def process_input_requests_disagg_decode(self, recv_reqs):
+            calls.append("process_input")
+
+        def process_decode_queue(self):
+            if "run_batch" in calls:
+                calls.append("after_launch_poll")
+                raise StopLoop
+            calls.append("pre_launch_poll")
+
+        def get_next_batch_to_run(self):
+            calls.append("get_next_batch")
+            return batch
+
+        def run_batch(self, batch):
+            calls.append("run_batch")
+            return SimpleNamespace()
+
+        def _current_sampling_info_owner(self):
+            return SimpleNamespace(cur_sampling_info=None)
+
+        def process_batch_result(self, batch, result, launch_done=None):
+            raise AssertionError(
+                "decode overlap loop processed a batch result before polling "
+                "the transfer queue after launch"
+            )
+
+    try:
+        SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode(
+            FakeScheduler()
+        )
+    except StopLoop:
+        pass
+
+    assert calls.index("after_launch_poll") > calls.index("run_batch")
