@@ -1,0 +1,175 @@
+name: gtopk-ab-enabled-ling2.6flash
+exp_type: PROFILING
+cluster_name: tpuv7x-64-node
+artifact_type: GCS
+tags: []
+config: '{}'
+
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    command: |
+      set -eu
+      # ============ A/B variant (this box) ============
+      #   VARIANT=enabled  -> Pallas grouped-topk kernel (kernel ON)
+      #   The disabled box drops the --enable-grouped-topk-kernel flag
+      VARIANT=enabled
+      KERNEL_FLAG="--enable-grouped-topk-kernel"
+      # ================================================
+
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax_cache
+      export UV_LINK_MODE=copy
+      export DEBIAN_FRONTEND=noninteractive
+      mkdir -p "$TMPDIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+      ulimit -c 0
+
+      echo "=== install deps ==="
+      apt-get update -y && apt-get install -y --no-install-recommends vim git ca-certificates expect curl
+      # ubuntu:24.04 ships no pip and blocks system `pip install` (PEP 668), so grab
+      # uv via its standalone installer instead of `pip install uv`.
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.local/bin:$PATH"
+
+      echo "=== clone sglang-jax ==="
+      rm -rf /tmp/sglang-jax
+      git clone --branch bench/grouped-topk \
+        https://github.com/primatrix/sglang-jax.git /tmp/sglang-jax
+      cd /tmp/sglang-jax
+
+      echo "=== create venv & install sglang-jax (editable) ==="
+      uv venv --python 3.12
+      . .venv/bin/activate
+      uv pip install -e "python[all]"
+      # python[all] pins jax[tpu]==0.8.1, which brings the matching libtpu. Do NOT add
+      # a separate `uv pip install jax[tpu]` upgrade here: a newer JAX's Explicit-axis
+      # shard_map no longer auto-reshards inputs and can mismatch libtpu — that broke
+      # the fused MoE kernel before.
+      uv pip install uv
+
+      echo "=== install evalscope (isolated tool venv) ==="
+      uv tool install evalscope
+      export PATH="$HOME/.local/bin:$PATH"
+
+      echo "=== make exec'd shells land in the ready env ==="
+      cat > ~/.bashrc <<'BRC'
+      export TERM=xterm-256color
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax_cache
+      export PATH="$HOME/.local/bin:$PATH"
+      cd /tmp/sglang-jax && source .venv/bin/activate
+      BRC
+
+      # ---- server launcher (kernel flag injected per-variant) ----
+      cat > /tmp/sglang-jax/run-server.sh <<RUN
+      #!/usr/bin/env bash
+      set -euo pipefail
+      cd /tmp/sglang-jax
+      source .venv/bin/activate
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax_cache
+      echo "=== server log -> /tmp/sglang-jax/server.log  (VARIANT=$VARIANT) ==="
+      unbuffer uv run python -m sgl_jax.launch_server \\
+        --model-path /models/Ling-2.6-flash \\
+        --served-model-name inclusionAI/Ling-2.6-flash \\
+        --trust-remote-code \\
+        --tp-size 8 --dp-size 2 --ep-size 8 \\
+        --moe-backend fused_v2 \\
+        --host 0.0.0.0 --port 30000 \\
+        --device tpu \\
+        --dtype bfloat16 \\
+        --page-size 128 \\
+        --context-length 131072 \\
+        --chunked-prefill-size 2048 \\
+        --mem-fraction-static 0.85 \\
+        --max-running-requests 256 \\
+        --attention-backend fa \\
+        --dp-schedule-policy round_robin \\
+        --disable-radix-cache \\
+        --skip-server-warmup \\
+        $KERNEL_FLAG \\
+        --log-level info > /tmp/sglang-jax/server.log 2>&1 &
+      echo \$! > /tmp/sglang-jax/server.pid
+      RUN
+      chmod +x /tmp/sglang-jax/run-server.sh
+
+      # ---- full auto A/B-eval driver (this box runs ONE variant end-to-end) ----
+      cat > /tmp/sglang-jax/run-ab-eval.sh <<'EVAL'
+      #!/usr/bin/env bash
+      set -uo pipefail
+      cd /tmp/sglang-jax
+      source .venv/bin/activate
+      export PATH="$HOME/.local/bin:$PATH"
+      VARIANT="${VARIANT:-disabled}"
+      OUT=/tmp/sglang-jax/eval-out/$VARIANT
+      mkdir -p "$OUT"
+
+      echo "=== [$VARIANT] starting server ==="
+      bash /tmp/sglang-jax/run-server.sh
+
+      echo "=== [$VARIANT] waiting for /health (up to 60 min) ==="
+      ready=0
+      for i in $(seq 1 360); do
+        if curl -sf http://127.0.0.1:30000/health >/dev/null 2>&1; then ready=1; break; fi
+        sleep 10
+      done
+      if [ "$ready" != "1" ]; then
+        echo "!!! [$VARIANT] server never became healthy; see server.log" | tee "$OUT/FAILED"
+        tail -n 50 /tmp/sglang-jax/server.log || true
+        exit 1
+      fi
+      echo "=== [$VARIANT] server healthy, running evalscope ==="
+
+      evalscope eval \
+        --model inclusionAI/Ling-2.6-flash \
+        --api-url http://127.0.0.1:30000/v1 \
+        --api-key EMPTY \
+        --datasets aime26 \
+        --generation-config temperature=0.6,top_p=0.95,max_tokens=32768 \
+        --repeats 4 \
+        --eval-batch-size 8 \
+        --dataset-args '{"aime26": {"aggregation": "mean_and_pass_at_k"}}' \
+        --work-dir "$OUT" 2>&1 | tee "$OUT/eval.log"
+
+      echo "=== [$VARIANT] DONE. results under $OUT ==="
+      touch "$OUT/DONE"
+      EVAL
+      chmod +x /tmp/sglang-jax/run-ab-eval.sh
+
+      cat <<'TIP'
+      ===================================================================
+      全自动 A/B box (VARIANT=enabled, kernel ON) 就绪，正在后台执行 eval。
+        进盒:   falcon exp exec -it <exp_id> --rank 0 -- bash
+        看服务: tail -f /tmp/sglang-jax/server.log
+        看评测: tail -f /tmp/sglang-jax/eval-out/enabled/eval.log
+        完成标志: /tmp/sglang-jax/eval-out/enabled/DONE
+      ===================================================================
+      TIP
+
+      # kick off the full pipeline in the background, keep the box alive for inspection
+      VARIANT="$VARIANT" nohup bash /tmp/sglang-jax/run-ab-eval.sh \
+        > /tmp/sglang-jax/run-ab-eval.log 2>&1 &
+
+      sleep infinity
+    mounts:
+      - name: models
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        mount_path: /models
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
