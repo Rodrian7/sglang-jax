@@ -6,7 +6,8 @@
 - 16K input / 4K output 最好点仍是 C128：client 全程平均 `13.64K total tok/s`，其中 `10.91K input tok/s`、`2.73K output tok/s`；client peak output `3.48K tok/s`。
 - 用 server log 看 device 能力：prefill forward-only 估计约 `22.8K input tok/s`（router prefill inflight=4 反推），但包含 transfer/tail 后的实际 active prefill 只有 `12.8K input tok/s`；decode highwater steady 约 `3.18K output tok/s`，max `3.41K output tok/s`。
 - 额外做了 `2 prefill : 1 decode` 探索。C64 收益很小（`10.83K total tok/s`，比 1P1D C64 高约 `2.7%`）；C128 提升更明显（`15.31K total tok/s`，比 1P1D C128 高约 `12.2%`，mean TTFT 从 `57.6s` 降到 `20.1s`），但长输出阶段仍由单 decode device 主导。
-- AIME24 完整 30 题结果为 `0.7667`（23/30），和 PDF 中的 AIME24 结果一致，没有看到精度异常。
+- 2026-07-06 补了一个更公平的 non-PD C64：两台普通 non-PD server + serve-level round-robin proxy，结果 `11.70K total tok/s`、`2.34K output tok/s`，高于 PD 1P1D/2P1D 的 C64。因此 C64 不能用单机 non-PD 对比来证明 PD 吞吐优势；PD 优势更应看高压、角色隔离和 device-role 峰值。
+- AIME24 两次完整 30 题：PD endpoint 为 `0.7667`（23/30），两机 non-PD serve-level DP endpoint 为 `0.8667`（26/30）。由于使用 `temperature=1` 非贪心采样，这个差异更像采样波动；没有看到精度异常信号。
 
 ## Tested Code
 
@@ -25,7 +26,7 @@ Remote benchmark code:
 
 Local verification code:
 
-- Local git head: `a7ba33c4a7a07c05a091076994bcc00eaf8668ac`
+- Local git head: `df0e812fad11c3fe2bbe30514ee136ef899b5ad6`
 - Added regression test at [test_pd_overlap_schedule.py](/Users/jiongxuan/workspace/sglang-jax/python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py:137).
 - Verification: `.venv/bin/python -m pytest python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py python/sgl_jax/test/disaggregation/test_pd_time_stats.py python/sgl_jax/test/disaggregation/test_pd_internal_state.py -q` -> `18 passed in 3.35s`.
 
@@ -349,13 +350,52 @@ Important observations:
 - Decode is still the limiting role for long 4K output. C128 output throughput improves to `3.06K tok/s` with a `3.97K tok/s` client peak, but ITL worsens (`28.73ms -> 35.08ms`) because one decode host is carrying a larger effective running set.
 - Transfer itself did not regress with remote extra prefill: decode `kv_wait` stays around `2.31s`; prefill transfer stays around `2.56s`.
 
+## Non-PD Two-Host Serve-Level DP Follow-Up
+
+The original non-PD comparison used one server host, so it was not pod-count
+fair against PD 1P1D. On 2026-07-06, C64 was rerun with two normal non-PD
+servers, one on each Falcon rank, behind a thin streaming round-robin proxy.
+
+Run id:
+
+```text
+nonpd_2host_c64_aime24_1783295840
+```
+
+Client result, 16K input / 4K output:
+
+| Mode | Hosts | C | success | total tok/s | input tok/s | output tok/s | peak output tok/s | mean TTFT ms | mean ITL ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| non-PD single server | 1 | 64 | 192/192 | 7106 | 5685 | 1421 | 2688 | 42904 | 34.55 |
+| non-PD serve-level DP | 2 | 64 | 192/192 | 11700 | 9360 | 2340 | 3884 | 13675 | 23.89 |
+| PD 1P1D | 2 | 64 | 192/192 | 10546 | 8437 | 2109 | 2653 | 16476 | 24.13 |
+| PD 2P1D | 3 | 64 | 192/192 | 10829 | 8663 | 2166 | 2844 | 11488 | 25.84 |
+
+Serve-log summary for the two-host C64 run:
+
+| Rank | prefill active input tok/s | decode high-load mean tok/s | decode max tok/s | max running |
+|---:|---:|---:|---:|---:|
+| 0 | 5958 | 1879 | 1970 | 40 |
+| 1 | 5935 | 1882 | 1963 | 48 |
+| combined | 11893 | 3761 | 3933 | n/a |
+
+Interpretation:
+
+- At C64, serve-level DP is stronger than PD because each server handles about half the burst with local KV and no transfer path.
+- This does not invalidate the PD high-pressure result, but it narrows the claim: PD 1P1D should not be presented as universally faster than a pod-count-fair non-PD deployment at C64.
+- A fair two-host non-PD C128 was not run in this follow-up. If we need a strict apples-to-apples C128 conclusion, that is the next benchmark to add.
+
 ## AIME24
 
 | Dataset | Num | Score | Correct |
 |---|---:|---:|---:|
-| AIME24 / `HuggingFaceH4/aime_2024` | 30 | 0.7667 | 23 |
+| PD endpoint, AIME24 / `HuggingFaceH4/aime_2024` | 30 | 0.7667 | 23 |
+| non-PD serve-level DP endpoint, AIME24 / `HuggingFaceH4/aime_2024` | 30 | 0.8667 | 26 |
 
-This matches the PDF number (`0.7667`) under the non-greedy reasoning config.
+The PD result matches the PDF number (`0.7667`) under the non-greedy reasoning
+config. The two-host non-PD rerun is higher, but the config uses
+`temperature=1`, so a 23/30 vs 26/30 delta should be treated as sampling
+variance unless we add a deterministic accuracy protocol.
 
 ## Raw Artifacts
 
@@ -377,6 +417,12 @@ Local artifacts:
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/raw/aime24_eval.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/aime24_workdir/20260705_135200/reports/MiMo-V2-Flash/aime24.json`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/aime24_workdir/20260705_135200/predictions/MiMo-V2-Flash/aime24_default.jsonl`
+- non-PD two-host C64/AIME24 follow-up:
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_aime24_1783295840_rank0.tar.gz`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_aime24_1783295840_rank1.tar.gz`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/rank1_extract/nonpd_2host_c64_aime24_1783295840/raw/bench_c64.log`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/rank1_extract/nonpd_2host_c64_aime24_1783295840/aime24_workdir/20260706_001210/reports/MiMo-V2-Flash/aime24.json`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_parsed_summary.json`
 - 2P1D:
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/pd_2p1d_16k_4k_bench_1783270151/raw/bench_c64.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/pd_2p1d_16k_4k_bench_1783270151/raw/bench_c128.log`
