@@ -1,6 +1,6 @@
-# MiMo-V2-Flash PD Disaggregation Performance Report, 2026-07-05
+# MiMo-V2-Flash PD 分离性能报告, 2026-07-05
 
-## TL;DR
+## 摘要
 
 - 本轮小优化是在 decode overlap loop 里，当前 batch `run_batch` launch 后、上一批 `process_batch_result` 前，额外 poll 一次 transfer queue。单测通过，但 C32/C64/C128 回归显示吞吐收益很小，基本在噪声范围内。
 - 16K input / 4K output 最好点仍是 C128：client 全程平均 `13.64K total tok/s`，其中 `10.91K input tok/s`、`2.73K output tok/s`；client peak output `3.48K tok/s`。
@@ -11,31 +11,31 @@
   [pd_steady_state_advantage_20260706.md](/Users/jiongxuan/workspace/sglang-jax/docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md)。在该口径下，PD 1P1D C128 的 prefill active input 为 `12.79K tok/s`，PD 2P1D 为 `15.71K tok/s`；serve-internal PD handoff total 分别约 `4.80s` / `4.37s`，明显小于 client TTFT，因为 client TTFT 包含 burst queueing。
 - AIME24 两次完整 30 题：PD endpoint 为 `0.7667`（23/30），两机 non-PD serve-level DP endpoint 为 `0.8667`（26/30）。由于使用 `temperature=1` 非贪心采样，这个差异更像采样波动；没有看到精度异常信号。
 
-## Tested Code
+## 测试代码
 
-Remote benchmark code:
+远端 benchmark 代码：
 
 - Falcon exp: `exp-5uqgg64144`
-- Remote repo: `/tmp/sglang-jax`
-- Remote git head: `c6105f1cb09119ce40462d9f65776198a312737b`
-- Remote working tree is dirty; exact dirty status is saved in:
+- 远端 repo: `/tmp/sglang-jax`
+- 远端 git head: `c6105f1cb09119ce40462d9f65776198a312737b`
+- 远端 working tree 是 dirty 状态；精确 dirty status 已保存在：
   `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/env.json`
-- This round added the extra decode transfer poll at [decode.py](/Users/jiongxuan/workspace/sglang-jax/python/sgl_jax/srt/disaggregation/decode.py:301).
-- Multi-prefill follow-up fixes:
-  - Router aligns injected `bootstrap_room` with the selected prefill index so bootstrap registry selection matches the actual forwarded prefill URL.
-  - Decode preserves the Raiden endpoint descriptor's advertised host instead of rewriting it to the bootstrap registry host. This fixed a real `2P1D` failure where decode tried to connect to `10.125.130.4:34189` even though that Raiden endpoint belonged to `10.125.132.39:34189`.
-  - Per-chunk `RAIDEN-D start_read*` logs were demoted from warning to debug; this removes hot-path log noise without changing transfer behavior.
+- 本轮在 [decode.py](/Users/jiongxuan/workspace/sglang-jax/python/sgl_jax/srt/disaggregation/decode.py:301) 增加了额外 decode transfer poll。
+- Multi-prefill follow-up 修复：
+  - Router 会把注入的 `bootstrap_room` 与选中的 prefill index 对齐，使 bootstrap registry selection 与实际 forwarded prefill URL 一致。
+  - Decode 保留 Raiden endpoint descriptor 中声明的 host，而不是重写成 bootstrap registry host。这个修复解决了一个真实 `2P1D` 失败：decode 曾尝试连接 `10.125.130.4:34189`，但该 Raiden endpoint 实际属于 `10.125.132.39:34189`。
+  - Per-chunk `RAIDEN-D start_read*` 日志从 warning 降为 debug；这样能去掉热路径日志噪声，并且不改变 transfer 行为。
 
-Local verification code:
+本地验证代码：
 
-- Local git head: `df0e812fad11c3fe2bbe30514ee136ef899b5ad6`
-- Added regression test at [test_pd_overlap_schedule.py](/Users/jiongxuan/workspace/sglang-jax/python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py:137).
-- Verification: `.venv/bin/python -m pytest python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py python/sgl_jax/test/disaggregation/test_pd_time_stats.py python/sgl_jax/test/disaggregation/test_pd_internal_state.py -q` -> `18 passed in 3.35s`.
+- 本地 git head: `df0e812fad11c3fe2bbe30514ee136ef899b5ad6`
+- 在 [test_pd_overlap_schedule.py](/Users/jiongxuan/workspace/sglang-jax/python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py:137) 增加 regression test。
+- 验证：`.venv/bin/python -m pytest python/sgl_jax/test/disaggregation/test_pd_overlap_schedule.py python/sgl_jax/test/disaggregation/test_pd_time_stats.py python/sgl_jax/test/disaggregation/test_pd_internal_state.py -q` -> `18 passed in 3.35s`。
 
-## Environment
+## 环境
 
-- Rank 0: PD bootstrap + prefill server
-- Rank 1: decode server + PD router + benchmark/eval driver
+- Rank 0：PD bootstrap + prefill server
+- Rank 1：decode server + PD router + benchmark/eval driver
 - Model: `/models/MiMo-V2-Flash`
 - Python: `3.12.12`
 - Runtime env:
@@ -56,9 +56,9 @@ export PYTHONPATH=/tmp/tpu-raiden-cached/tpu-raiden:/tmp/sglang-jax:${PYTHONPATH
 export SGLANG_JAX_USE_RAIDEN=1
 ```
 
-Precompile cache was enabled through `JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jit_cache`. In this restart, both prefill/decode precompile finished in about 17s after model load.
+通过 `JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jit_cache` 启用了 precompile cache。本次重启中，prefill/decode 在模型加载后的 precompile 都约 17s 完成。
 
-## Serve Commands
+## Serve 命令
 
 Bootstrap, rank 0:
 
@@ -125,7 +125,7 @@ Router, rank 1:
   --host 0.0.0.0 --port 30000
 ```
 
-## Benchmark Commands
+## Benchmark 命令
 
 16K/4K throughput:
 
@@ -168,51 +168,51 @@ AIME24:
   --generation-config '{"temperature":1,"top_p":0.95,"max_tokens":30000,"chat_template_kwargs":{"enable_thinking":true}}'
 ```
 
-## Throughput Results
+## 吞吐结果
 
-Client full-run numbers, 16K/4K:
+Client 全程平均数据，16K/4K：
 
 | Run | C | req/s | input tok/s | output tok/s | client peak output tok/s | total tok/s | mean TTFT ms | p99 TTFT ms | mean ITL ms | p99 ITL ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| before extra poll | 32 | 0.39 | 6350 | 1588 | 1984 | 7938 | 10175 | 41913 | 16.68 | 42.24 |
-| after extra poll | 32 | 0.38 | 6270 | 1568 | 2016 | 7838 | 10266 | 41479 | 16.96 | 41.19 |
-| before extra poll | 64 | 0.52 | 8589 | 2147 | 2655 | 10736 | 16939 | 83534 | 23.55 | 81.01 |
-| after extra poll | 64 | 0.51 | 8437 | 2109 | 2653 | 10546 | 16476 | 81917 | 24.13 | 82.07 |
-| before extra poll | 128 | 0.66 | 10867 | 2717 | 3491 | 13584 | 61510 | 162593 | 27.91 | 88.66 |
-| after extra poll | 128 | 0.67 | 10913 | 2728 | 3483 | 13642 | 57602 | 161325 | 28.73 | 89.26 |
+| extra poll 前 | 32 | 0.39 | 6350 | 1588 | 1984 | 7938 | 10175 | 41913 | 16.68 | 42.24 |
+| extra poll 后 | 32 | 0.38 | 6270 | 1568 | 2016 | 7838 | 10266 | 41479 | 16.96 | 41.19 |
+| extra poll 前 | 64 | 0.52 | 8589 | 2147 | 2655 | 10736 | 16939 | 83534 | 23.55 | 81.01 |
+| extra poll 后 | 64 | 0.51 | 8437 | 2109 | 2653 | 10546 | 16476 | 81917 | 24.13 | 82.07 |
+| extra poll 前 | 128 | 0.66 | 10867 | 2717 | 3491 | 13584 | 61510 | 162593 | 27.91 | 88.66 |
+| extra poll 后 | 128 | 0.67 | 10913 | 2728 | 3483 | 13642 | 57602 | 161325 | 28.73 | 89.26 |
 
-Server-side prefill input capacity:
+Server 侧 prefill input capacity：
 
 | Run | C | observed active input tok/s | observed active req/s @16K | forward mean ms | forward-only capacity @4 inflight | prefill total mean ms |
 |---|---:|---:|---:|---:|---:|---:|
-| before extra poll | 32 | 8322 | 0.508 | 2844 | 23044 tok/s | 4056 |
-| after extra poll | 32 | 8150 | 0.497 | 2860 | 22922 tok/s | 4168 |
-| before extra poll | 64 | 10736 | 0.655 | 2689 | 24372 tok/s | 3491 |
-| after extra poll | 64 | 10556 | 0.644 | 2693 | 24343 tok/s | 3501 |
-| before extra poll | 128 | 12684 | 0.774 | 2899 | 22608 tok/s | 4838 |
-| after extra poll | 128 | 12788 | 0.780 | 2879 | 22764 tok/s | 4799 |
+| extra poll 前 | 32 | 8322 | 0.508 | 2844 | 23044 tok/s | 4056 |
+| extra poll 后 | 32 | 8150 | 0.497 | 2860 | 22922 tok/s | 4168 |
+| extra poll 前 | 64 | 10736 | 0.655 | 2689 | 24372 tok/s | 3491 |
+| extra poll 后 | 64 | 10556 | 0.644 | 2693 | 24343 tok/s | 3501 |
+| extra poll 前 | 128 | 12684 | 0.774 | 2899 | 22608 tok/s | 4838 |
+| extra poll 后 | 128 | 12788 | 0.780 | 2879 | 22764 tok/s | 4799 |
 
-Interpretation: P-side pure forward capacity is roughly in the `22K-24K input tok/s` band when router keeps 4 prefill requests in flight. The realized active prefill ingress rate is much lower, around `12.8K input tok/s` at C128, because transfer/prealloc/tail still sit on the critical path.
+解读：当 router 保持 4 个 prefill request in flight 时，P 侧纯 forward capacity 大致在 `22K-24K input tok/s` 区间。但实际 active prefill ingress rate 要低很多，C128 约 `12.8K input tok/s`，因为 transfer/prealloc/tail 仍在 critical path 上。
 
-Server-side decode output capacity:
+Server 侧 decode output capacity：
 
 | Run | C | max running | all mean output tok/s | all max output tok/s | highwater steady mean | highwater steady max |
 |---|---:|---:|---:|---:|---:|---:|
-| before extra poll | 32 | 32 | 1596 | 1983 | 1847 | 1983 |
-| after extra poll | 32 | 32 | 1594 | 2016 | 1852 | 2016 |
-| before extra poll | 64 | 64 | 2069 | 2648 | 2505 | 2648 |
-| after extra poll | 64 | 64 | 2039 | 2607 | 2462 | 2607 |
-| before extra poll | 128 | 98 | 2591 | 3374 | 3161 | 3374 |
-| after extra poll | 128 | 100 | 2616 | 3414 | 3180 | 3414 |
+| extra poll 前 | 32 | 32 | 1596 | 1983 | 1847 | 1983 |
+| extra poll 后 | 32 | 32 | 1594 | 2016 | 1852 | 2016 |
+| extra poll 前 | 64 | 64 | 2069 | 2648 | 2505 | 2648 |
+| extra poll 后 | 64 | 64 | 2039 | 2607 | 2462 | 2607 |
+| extra poll 前 | 128 | 98 | 2591 | 3374 | 3161 | 3374 |
+| extra poll 后 | 128 | 100 | 2616 | 3414 | 3180 | 3414 |
 
-The decode peak is therefore around `3.2K output tok/s` steady/highwater and `3.4K output tok/s` instantaneous serve-log max. The extra poll does not materially change this.
+因此 decode peak 大约是 steady/highwater `3.2K output tok/s`，instantaneous serve-log max `3.4K output tok/s`。额外 poll 没有实质改变这个结果。
 
-## Steady Windows
+## 稳态窗口
 
-The steady windows below are computed from server logs in the benchmark window:
+下面的 steady window 是从 benchmark window 内的 server logs 计算出来的：
 
-- Prefill active window: first to last `Prefill batch` line for the concurrency case.
-- Decode highwater steady: rows where `running-req >= 0.9 * max_observed_running_req` for that case. For C128, max observed running on decode was 100 rather than 128, so this highwater definition is more useful than the PDF's `0.9 * bs` rule.
+- Prefill active window：对应 concurrency case 的第一条到最后一条 `Prefill batch` 日志。
+- Decode highwater steady：满足 `running-req >= 0.9 * max_observed_running_req` 的行。C128 中 decode 观测到的 max running 是 100 而不是 128，因此这个 highwater 定义比 PDF 的 `0.9 * bs` 规则更有解释力。
 
 | C | prefill active window UTC | prefill active duration s | prefill active input tok/s | decode highwater threshold | decode steady window UTC | decode steady duration s | highwater mean output tok/s | highwater max output tok/s |
 |---:|---|---:|---:|---:|---|---:|---:|---:|
@@ -222,24 +222,24 @@ The steady windows below are computed from server logs in the benchmark window:
 
 ## Transfer / Time Stats
 
-Mean per-request PD time stats:
+Per-request PD time stats 均值：
 
 | Run | C | P forward ms | P transfer ms | P transfer_tail ms | P total ms | D prealloc_wait ms | D kv_wait ms | D transfer_tail ms | D total ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| before extra poll | 32 | 2844 | 2534 | 307 | 4056 | 1710 | 2279 | 50 | 3990 |
-| after extra poll | 32 | 2860 | 2544 | 308 | 4168 | 1819 | 2284 | 46 | 4103 |
-| before extra poll | 64 | 2689 | 2395 | 264 | 3491 | 1270 | 2182 | 48 | 3453 |
-| after extra poll | 64 | 2693 | 2401 | 268 | 3501 | 1258 | 2180 | 46 | 3439 |
-| before extra poll | 128 | 2899 | 2591 | 329 | 4838 | 2521 | 2320 | 55 | 4842 |
-| after extra poll | 128 | 2879 | 2567 | 322 | 4799 | 2497 | 2293 | 45 | 4790 |
+| extra poll 前 | 32 | 2844 | 2534 | 307 | 4056 | 1710 | 2279 | 50 | 3990 |
+| extra poll 后 | 32 | 2860 | 2544 | 308 | 4168 | 1819 | 2284 | 46 | 4103 |
+| extra poll 前 | 64 | 2689 | 2395 | 264 | 3491 | 1270 | 2182 | 48 | 3453 |
+| extra poll 后 | 64 | 2693 | 2401 | 268 | 3501 | 1258 | 2180 | 46 | 3439 |
+| extra poll 前 | 128 | 2899 | 2591 | 329 | 4838 | 2521 | 2320 | 55 | 4842 |
+| extra poll 后 | 128 | 2879 | 2567 | 322 | 4799 | 2497 | 2293 | 45 | 4790 |
 
-Main conclusion:
+主要结论：
 
-- Prefill chunk transfer is partially overlapped with forward, but the remaining transfer/tail still reduces realized prefill capacity from about `22.8K input tok/s` forward-only to about `12.8K input tok/s` active end-to-end at C128.
-- Decode receive path is still effectively serial at request level: `prealloc_wait + kv_wait ~= total`. For C128 after extra poll, `2497 + 2293 ~= 4790 ms`.
-- The extra after-launch poll trims little or no measurable time. It is low-risk, but it is not the bottleneck.
+- Prefill chunk transfer 已经和 forward 部分 overlap，但剩余 transfer/tail 仍然把 C128 的 realized prefill capacity 从 forward-only 的约 `22.8K input tok/s` 降到 active end-to-end 的约 `12.8K input tok/s`。
+- Decode receive path 在 request 级别仍基本串行：`prealloc_wait + kv_wait ~= total`。extra poll 后的 C128 是 `2497 + 2293 ~= 4790 ms`。
+- launch 后额外 poll 几乎没有可测收益。它风险较低，但不是瓶颈。
 
-Detailed prefill per-request stage stats after the extra poll:
+Extra poll 后的详细 prefill per-request stage stats：
 
 | C | stage | n | mean ms | p50 ms | p95 ms | p99 ms | max ms |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -265,7 +265,7 @@ Detailed prefill per-request stage stats after the extra poll:
 | 128 | transfer | 384 | 2567.1 | 2597.9 | 2703.1 | 2749.8 | 2835.3 |
 | 128 | total | 384 | 4798.8 | 4860.0 | 5031.4 | 5072.2 | 5669.1 |
 
-Detailed decode per-request stage stats after the extra poll:
+Extra poll 后的详细 decode per-request stage stats：
 
 | C | stage | n | mean ms | p50 ms | p95 ms | p99 ms | max ms |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -294,17 +294,17 @@ Detailed decode per-request stage stats after the extra poll:
 | 128 | enqueue_decode | 384 | 3.8 | 3.8 | 4.5 | 4.9 | 5.4 |
 | 128 | total | 384 | 4790.2 | 4851.1 | 5029.1 | 5088.0 | 5551.3 |
 
-## 2P1D Multi-Prefill Probe
+## 2P1D 多 Prefill 探索
 
-This run used two prefill TPU hosts feeding one decode TPU host:
+这轮使用两个 prefill TPU host 供给一个 decode TPU host：
 
-- Original prefill: `exp-5uqgg64144` rank 0, `10.125.130.4`.
-- Extra prefill: `exp-ahgyl3g479` rank 0, `10.125.132.39`.
-- Decode/router/driver: `exp-5uqgg64144` rank 1, `10.125.129.4`.
-- Router used both prefill URLs and one decode URL, with the same `--pd-prefill-max-inflight-requests 4`.
-- Raw run id: `pd_2p1d_16k_4k_bench_1783270151`.
+- 原始 prefill：`exp-5uqgg64144` rank 0, `10.125.130.4`。
+- 额外 prefill：`exp-ahgyl3g479` rank 0, `10.125.132.39`。
+- Decode/router/driver：`exp-5uqgg64144` rank 1, `10.125.129.4`。
+- Router 使用两个 prefill URL 和一个 decode URL，并保持同样的 `--pd-prefill-max-inflight-requests 4`。
+- Raw run id: `pd_2p1d_16k_4k_bench_1783270151`。
 
-Extra prefill serve command is the same as the rank0 prefill command above except:
+Extra prefill serve command 与上面的 rank0 prefill command 相同，区别是：
 
 ```bash
 --disaggregation-bootstrap-url http://falcon-job-p6bmn75fnu-0.falcon-job-p6bmn75fnu.falcon-jobs.svc.cluster.local:8998
@@ -327,7 +327,7 @@ Extra prefill serve command is the same as the rank0 prefill command above excep
   --host 0.0.0.0 --port 30000
 ```
 
-Client results, 16K/4K:
+Client 结果，16K/4K：
 
 | Mode | C | success | req/s | input tok/s | output tok/s | peak output tok/s | total tok/s | mean TTFT ms | p99 TTFT ms | mean ITL ms | p99 ITL ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -336,7 +336,7 @@ Client results, 16K/4K:
 | PD 1P1D | 128 | 384/384 | 0.67 | 10913 | 2728 | 3483 | 13642 | 57602 | 161325 | 28.73 | 89.26 |
 | PD 2P1D | 128 | 384/384 | 0.75 | 12246 | 3061 | 3968 | 15307 | 20114 | 91477 | 35.08 | 128.74 |
 
-2P1D per-request stage stats:
+2P1D per-request stage stats：
 
 | C | role | n | forward mean ms | transfer / kv_wait mean ms | total mean ms | p50 total ms | p95 total ms |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -345,27 +345,27 @@ Client results, 16K/4K:
 | 128 | prefill | 384 | 1512 | 2564 transfer | 4407 | 4844 | 5272 |
 | 128 | decode | 384 | n/a | 2313 kv_wait | 4369 | 4838 | 5273 |
 
-Important observations:
+重要观察：
 
-- `2P1D` improves C128 total throughput by about `12.2%` over 1P1D (`15.31K / 13.64K`) and reduces mean TTFT by about `65%` (`57.6s -> 20.1s`). It helps because prefill queueing pressure is split across two P hosts.
-- C64 barely improves (`10.83K / 10.55K`, about `2.7%`), so one prefill is already close enough for this concurrency.
-- Decode is still the limiting role for long 4K output. C128 output throughput improves to `3.06K tok/s` with a `3.97K tok/s` client peak, but ITL worsens (`28.73ms -> 35.08ms`) because one decode host is carrying a larger effective running set.
-- Transfer itself did not regress with remote extra prefill: decode `kv_wait` stays around `2.31s`; prefill transfer stays around `2.56s`.
+- `2P1D` 相比 1P1D 把 C128 total throughput 提升约 `12.2%`（`15.31K / 13.64K`），并把 mean TTFT 降低约 `65%`（`57.6s -> 20.1s`）。它有帮助，是因为 prefill queueing pressure 被两个 P host 分摊。
+- C64 提升很小（`10.83K / 10.55K`，约 `2.7%`），说明这个 concurrency 下一个 prefill 已经基本够用。
+- Decode 仍是 4K 长输出的限制角色。C128 output throughput 提升到 `3.06K tok/s`，client peak `3.97K tok/s`，但 ITL 变差（`28.73ms -> 35.08ms`），因为单个 decode host 承载了更大的 effective running set。
+- 远端 extra prefill 没有让 transfer 本身回退：decode `kv_wait` 仍约 `2.31s`；prefill transfer 仍约 `2.56s`。
 
-## Non-PD Two-Host Serve-Level DP Follow-Up
+## Non-PD Two-Host Serve-Level DP 补充测试
 
-The original non-PD comparison used one server host, so it was not pod-count
-fair against PD 1P1D. On 2026-07-06, C64 was rerun with two normal non-PD
-servers, one on each Falcon rank, behind a thin streaming round-robin proxy.
+原始 non-PD 对比只使用一个 server host，因此不能和 PD 1P1D 做 pod-count-fair
+比较。2026-07-06 使用两个普通 non-PD server 重跑 C64，每个 Falcon rank 一个，
+后面接一个轻量 streaming round-robin proxy。
 
-Run ids:
+Run ids：
 
 ```text
 C64 + AIME24: nonpd_2host_c64_aime24_1783295840
 C128:         nonpd_2host_c128_1783298516
 ```
 
-Client result, 16K input / 4K output:
+Client 结果，16K input / 4K output：
 
 | Mode | Hosts | C | success | total tok/s | input tok/s | output tok/s | peak output tok/s | mean TTFT ms | mean ITL ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -377,7 +377,7 @@ Client result, 16K input / 4K output:
 | PD 1P1D | 2 | 128 | 384/384 | 13642 | 10913 | 2728 | 3483 | 57602 | 28.73 |
 | PD 2P1D | 3 | 128 | 384/384 | 15307 | 12246 | 3061 | 3968 | 20114 | 35.08 |
 
-Serve-log summary for the two-host runs:
+Two-host runs 的 serve-log summary：
 
 | C | Rank | prefill active input tok/s | decode high-load mean tok/s | decode max tok/s | max running |
 |---:|---:|---:|---:|---:|---:|
@@ -388,11 +388,11 @@ Serve-log summary for the two-host runs:
 | 128 | 1 | 5836 | 2393 | 2868 | 75 |
 | 128 | combined | 11642 | 4672 | 5361 | n/a |
 
-Interpretation:
+解读：
 
-- At C64, serve-level DP is stronger than PD because each server handles about half the burst with local KV and no transfer path.
-- At C128, each non-PD server is effectively at C64 pressure and same-device prefill/decode contention returns. PD 1P1D is about `6.8%` higher than two-host non-PD by total tok/s, and PD 2P1D is about `19.8%` higher, though PD 2P1D uses one additional prefill host.
-- This narrows the claim: PD 1P1D should not be presented as universally faster than a pod-count-fair non-PD deployment at C64, but it does recover a measurable advantage at C128.
+- C64 下 serve-level DP 比 PD 更强，因为每个 server 处理约一半 burst，KV local 且没有 transfer path。
+- C128 下，每个 non-PD server 实际接近 C64 压力，同设备 prefill/decode contention 重新出现。按 total tok/s，PD 1P1D 比 two-host non-PD 高约 `6.8%`，PD 2P1D 高约 `19.8%`，但 PD 2P1D 多用一个 prefill host。
+- 因此结论需要收窄：不能说 PD 1P1D 在 C64 一定比 pod-count-fair non-PD deployment 更快；但在 C128 它确实重新获得可测量优势。
 
 ## AIME24
 
@@ -401,24 +401,23 @@ Interpretation:
 | PD endpoint, AIME24 / `HuggingFaceH4/aime_2024` | 30 | 0.7667 | 23 |
 | non-PD serve-level DP endpoint, AIME24 / `HuggingFaceH4/aime_2024` | 30 | 0.8667 | 26 |
 
-The PD result matches the PDF number (`0.7667`) under the non-greedy reasoning
-config. The two-host non-PD rerun is higher, but the config uses
-`temperature=1`, so a 23/30 vs 26/30 delta should be treated as sampling
-variance unless we add a deterministic accuracy protocol.
+PD 结果在 non-greedy reasoning config 下与 PDF 数字（`0.7667`）一致。two-host
+non-PD rerun 更高，但 config 使用 `temperature=1`，所以除非增加 deterministic
+accuracy protocol，否则 23/30 vs 26/30 的差异应视为采样波动。
 
-## Raw Artifacts
+## 原始产物
 
-Local artifacts:
+本地产物：
 
-- Parsed summary: `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/parsed_summary.json`
-- 2P1D parsed summary: `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/parsed_summary.json`
-- Rank 1 raw tar: `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/rank1.tar.gz`
-- Rank 0 raw tar: `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/rank0.tar.gz`
-- Benchmark logs:
+- Parsed summary：`/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/parsed_summary.json`
+- 2P1D parsed summary：`/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/parsed_summary.json`
+- Rank 1 raw tar：`/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/rank1.tar.gz`
+- Rank 0 raw tar：`/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/rank0.tar.gz`
+- Benchmark 日志：
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/raw/bench_c32.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/raw/bench_c64.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/pd_16k_4k_extra_poll_1783257767/raw/bench_c128.log`
-- Server logs:
+- Server 日志：
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/prefill_extra_poll_server.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/decode_extra_poll_server.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/router_extra_poll.log`
@@ -444,10 +443,10 @@ Local artifacts:
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/rank0_prefill_logs/prefill_extra_poll_server.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/extra_prefill_2p1d_1783268093/raw/extra_prefill_server.log`
 
-## Next Optimization Direction
+## 后续优化方向
 
-1. Transfer path should be the next target, not router admission. The useful gap is between forward-only `~22.8K input tok/s` and realized active prefill `~12.8K input tok/s`.
-2. Decode receiver needs true overlap between metadata/prealloc and kv transfer wait. Today `prealloc_wait + kv_wait` almost equals total, so it is still serial.
-3. Prefill sender tail is still visible: C128 `transfer_tail` is about `322 ms`, and transfer span is about `2.57 s`. Reducing bootstrap/register polling and Raiden done-sending tail should directly improve prefill realized bandwidth.
-4. 2P1D is worth keeping for high-concurrency production-like loads, but the current best cost/perf point is workload-dependent: C64 has negligible gain, C128 has clear TTFT and throughput gain.
-5. The next code experiment should be larger-grain host/device scheduling overlap: make transfer discovery/progress independent of the decode event-loop tick, or pipeline the next request's transfer setup while the current decode forward is in flight.
+1. 下一步目标应该是 transfer path，而不是 router admission。真正有用的 gap 在 forward-only `~22.8K input tok/s` 和 realized active prefill `~12.8K input tok/s` 之间。
+2. Decode receiver 需要 metadata/prealloc 与 KV transfer wait 之间的真正 overlap。目前 `prealloc_wait + kv_wait` 几乎等于 total，因此仍是串行。
+3. Prefill sender tail 仍然可见：C128 `transfer_tail` 约 `322 ms`，transfer span 约 `2.57 s`。减少 bootstrap/register polling 和 Raiden done-sending tail 应该能直接提升 prefill realized bandwidth。
+4. 2P1D 值得为高并发 production-like load 保留，但当前最佳 cost/perf point 依赖 workload：C64 收益可以忽略，C128 有明确 TTFT 和吞吐收益。
+5. 下一步代码实验应关注更大粒度的 host/device scheduling overlap：让 transfer discovery/progress 独立于 decode event-loop tick，或在当前 decode forward in flight 时 pipeline 下一个 request 的 transfer setup。

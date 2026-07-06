@@ -1,52 +1,53 @@
-# PD Performance Overnight Handoff, 2026-07-05
+# PD 性能夜间交接, 2026-07-05
 
-## Current Status
+## 当前状态
 
-Completed overnight items:
+夜间已完成事项：
 
-- Expanded the PD performance report with 1P1D, non-PD comparison, AIME24, and 2P1D multi-prefill results.
-- Added the non-PD baseline document:
-  `docs/developer_guide/pd_disaggregation/nonpd_mimo_v2_flash_16k4k_baseline_20260705.md`.
-- Fixed multi-prefill routing correctness:
-  - Router now aligns `bootstrap_room` to the selected prefill index.
-  - Decode now preserves the Raiden endpoint descriptor host instead of rewriting it to the bootstrap registry host.
-- Reduced hot-path transfer log noise by demoting per-chunk `RAIDEN-D start_read*` logs from warning to debug.
-- Ran 2P1D C64/C128 16K/4K benchmark after the fix.
+- 扩展了 PD 性能报告，加入 1P1D、non-PD 对比、AIME24 和 2P1D 多 prefill 结果。
+- 增加 non-PD baseline 文档：
+  `docs/developer_guide/pd_disaggregation/nonpd_mimo_v2_flash_16k4k_baseline_20260705.md`。
+- 修复多 prefill routing 正确性：
+  - Router 现在会把 `bootstrap_room` 对齐到选中的 prefill index。
+  - Decode 现在保留 Raiden endpoint descriptor 中声明的 host，而不是重写成 bootstrap registry host。
+- 把热路径上的 per-chunk `RAIDEN-D start_read*` 日志从 warning 降为 debug，减少日志噪声。
+- 修复后完成 2P1D C64/C128 16K/4K benchmark。
 
-2026-07-06 follow-up:
+2026-07-06 补充：
 
-- Added pod-count-fair non-PD C64 comparison: two ordinary non-PD servers,
-  one per Falcon rank, behind a thin streaming round-robin proxy.
-- Added pod-count-fair non-PD C128 comparison on the same two-host endpoint.
-- Reran AIME24 on that two-host non-PD endpoint.
-- Added a C128 steady-state advantage note:
-  `docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md`.
+- 增加 pod-count-fair non-PD C64 对比：两个普通 non-PD server，
+  每个 Falcon rank 一个，后面接一个轻量 streaming round-robin proxy。
+- 在同一个 two-host endpoint 上增加 pod-count-fair non-PD C128 对比。
+- 在 two-host non-PD endpoint 上重跑 AIME24。
+- 增加 C128 steady-state advantage note：
+  `docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md`。
 
-## Code Changes
+## 代码改动
 
-Changed files:
+改动文件：
 
 - `python/sgl_jax/srt/disaggregation/mini_lb_helpers.py`
-  - Added `align_bootstrap_room_to_prefill`.
-  - Batched requests now use `room + i * prefill_count` so all items map to the same selected prefill.
+  - 增加 `align_bootstrap_room_to_prefill`。
+  - batched requests 现在使用 `room + i * prefill_count`，保证所有 item 都映射到同一个被选中的 prefill。
 - `python/sgl_jax/srt/disaggregation/mini_lb.py`
-  - `select_pair()` returns `prefill_index`.
-  - Router injects `prefill_index/prefill_count` into bootstrap field generation.
+  - `select_pair()` 返回 `prefill_index`。
+  - Router 在生成 bootstrap field 时注入 `prefill_index/prefill_count`。
 - `python/sgl_jax/srt/disaggregation/decode.py`
-  - `_raiden_endpoint_for_dp()` keeps the host from Raiden's advertised endpoint.
-  - This fixes the observed bad connection attempt `10.125.130.4:34189` when the actual extra prefill endpoint was `10.125.132.39:34189`.
+  - `_raiden_endpoint_for_dp()` 保留 Raiden 广播 endpoint 中的 host。
+  - 这修复了实际观测到的错误连接：decode 曾尝试连接 `10.125.130.4:34189`，
+    但该 Raiden endpoint 实际属于 `10.125.132.39:34189`。
 - `python/sgl_jax/srt/disaggregation/jax_transfer/conn.py`
-  - Per-chunk start-read logs are `debug` level.
+  - per-chunk start-read 日志改为 `debug` 级别。
 - `python/sgl_jax/test/disaggregation/test_pd_mini_lb_helpers.py`
-  - Adds multi-prefill bootstrap-room alignment tests.
+  - 增加 multi-prefill bootstrap-room alignment 测试。
 - `python/sgl_jax/test/test_pd_swa_basic.py`
-  - Adds endpoint-host preservation test and hot-path logging test.
+  - 增加 endpoint-host preservation 测试和热路径日志测试。
 
-## Benchmark Summary
+## Benchmark 摘要
 
-16K input / 4K output:
+16K input / 4K output：
 
-| Mode | C | total tok/s | input tok/s | output tok/s | peak output tok/s | mean TTFT ms | mean ITL ms |
+| 模式 | C | total tok/s | input tok/s | output tok/s | peak output tok/s | mean TTFT ms | mean ITL ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | non-PD | 128 | 8617 | 6894 | 1723 | 4504 | 83256 | 53.54 |
 | non-PD serve-level DP | 64 | 11700 | 9360 | 2340 | 3884 | 13675 | 23.89 |
@@ -54,46 +55,55 @@ Changed files:
 | PD 1P1D | 128 | 13642 | 10913 | 2728 | 3483 | 57602 | 28.73 |
 | PD 2P1D | 128 | 15307 | 12246 | 3061 | 3968 | 20114 | 35.08 |
 
-Main conclusion:
+主要结论：
 
-- The original single-host non-PD baseline proves that same-device prefill/decode contention is real, but it is not pod-count fair.
-- The 2026-07-06 two-host non-PD C64 run is stronger than PD at C64: `11.70K total tok/s` vs PD 1P1D `10.55K` and PD 2P1D `10.83K`.
-- The two-host non-PD C128 run is the first fair high-pressure comparison and gives PD a measurable advantage: PD 1P1D is `13.64K` vs non-PD serve-level DP `12.78K` total tok/s, and PD 2P1D is `15.31K`.
-- 2P1D mainly helps high concurrency. C128 total throughput is about `12%` higher than 1P1D and mean TTFT is much lower. C64 only improves about `3%`.
-- One decode host remains the long-output limiter. More prefill helps queueing and prefill pressure, but does not fundamentally change decode ITL.
-- Per-request transfer cost is stable in 2P1D: decode `kv_wait` is about `2.31s`, prefill `transfer` about `2.56s`.
-- Steady-state C128 view:
-  - PD 1P1D prefill active input is `12.79K tok/s`, decode highwater output is `3.18K tok/s`, and serve-internal PD handoff total is about `4.80s`.
-  - PD 2P1D prefill active input is `15.71K tok/s`, decode highwater output is `3.63K tok/s`, and serve-internal PD handoff total is about `4.37s`.
-  - Two-host non-PD C128 prefill active input is `11.64K tok/s`; rank-local decode highwater is high but not aligned/sustained enough to win the full C128 run.
-- AIME24 follow-up on non-PD serve-level DP got `0.8667` (26/30). Previous PD endpoint run got `0.7667` (23/30). With `temperature=1`, treat this as sampling variance rather than evidence of a precision regression.
+- 原始 single-host non-PD baseline 证明同设备 prefill/decode contention 是真实存在的，但它不是 pod-count fair。
+- 2026-07-06 two-host non-PD C64 run 在 C64 比 PD 更强：`11.70K total tok/s`，
+  高于 PD 1P1D 的 `10.55K` 和 PD 2P1D 的 `10.83K`。
+- two-host non-PD C128 run 是第一个公平的高压对比，并给了 PD 一个可测量优势：
+  PD 1P1D 是 `13.64K`，two-host non-PD serve-level DP 是 `12.78K` total tok/s；
+  PD 2P1D 是 `15.31K`。
+- 2P1D 主要帮助高并发。C128 total throughput 比 1P1D 高约 `12%`，mean TTFT
+  也明显更低。C64 只提升约 `3%`。
+- 单个 decode host 仍是长输出阶段的限制因素。更多 prefill 能缓解 queueing 和
+  prefill pressure，但不会从根本上改变 decode ITL。
+- 2P1D 的 per-request transfer cost 仍然稳定：decode `kv_wait` 约 `2.31s`，
+  prefill `transfer` 约 `2.56s`。
+- C128 steady-state 视角：
+  - PD 1P1D prefill active input 是 `12.79K tok/s`，decode highwater output 是
+    `3.18K tok/s`，serve-internal PD handoff total 约 `4.80s`。
+  - PD 2P1D prefill active input 是 `15.71K tok/s`，decode highwater output 是
+    `3.63K tok/s`，serve-internal PD handoff total 约 `4.37s`。
+  - Two-host non-PD C128 prefill active input 是 `11.64K tok/s`；rank-local decode
+    highwater 很高，但不够对齐/持续，无法赢下完整 C128 run。
+- non-PD serve-level DP 的 AIME24 follow-up 得到 `0.8667`（26/30）。之前 PD endpoint
+  得到 `0.7667`（23/30）。由于使用 `temperature=1`，这应视为采样波动，而不是精度回退证据。
 
-## Remote State
+## 远端状态
 
-Main Falcon exp:
+主 Falcon exp：
 
 - `exp-5uqgg64144`
-- rank0: currently non-PD server on port `30010`, IP `10.125.130.4`
-- rank1: currently non-PD server on port `30010` + proxy on port `30000`, IP `10.125.129.4`
+- rank0：当前是 port `30010` 上的 non-PD server，IP `10.125.130.4`
+- rank1：当前是 port `30010` 上的 non-PD server 加 port `30000` 上的 proxy，IP `10.125.129.4`
 
-Extra prefill Falcon exp:
+额外 prefill Falcon exp：
 
 - `exp-ahgyl3g479`
-- rank0: extra prefill, IP `10.125.132.39`
+- rank0：extra prefill，IP `10.125.132.39`
 
-After the 2026-07-06 follow-up, the main Falcon exp is no longer running the
-PD services. It is running the two-host non-PD follow-up topology:
+2026-07-06 follow-up 后，主 Falcon exp 不再运行 PD services。它当前运行的是
+two-host non-PD follow-up 拓扑：
 
-- rank0: non-PD server on port `30010`.
-- rank1: non-PD server on port `30010`.
-- rank1: round-robin proxy on port `30000`.
-- Run dir: `/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840`.
+- rank0：port `30010` 上的 non-PD server。
+- rank1：port `30010` 上的 non-PD server。
+- rank1：port `30000` 上的 round-robin proxy。
+- Run dir: `/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840`。
 
-The extra prefill Falcon exp `exp-ahgyl3g479` was not used for this follow-up.
-Its old prefill process may still be running, but the main rank0 bootstrap was
-stopped when switching the main exp to non-PD.
+extra prefill Falcon exp `exp-ahgyl3g479` 没有参与这次 follow-up。旧的 prefill
+process 可能还在，但主 rank0 bootstrap 在切到 non-PD 时已经停止。
 
-Useful health checks:
+有用的健康检查：
 
 ```bash
 falcon exp exec exp-5uqgg64144 --rank 1 -- \
@@ -103,46 +113,46 @@ falcon exp exec exp-5uqgg64144 --rank 0 -- \
   "curl -sf http://localhost:30010/health"
 ```
 
-## Raw Artifacts
+## 原始产物
 
-Main report:
+主报告：
 
 - `docs/developer_guide/pd_disaggregation/pd_mimo_v2_flash_final_perf_report_20260705.md`
 
-Non-PD report:
+Non-PD 报告：
 
 - `docs/developer_guide/pd_disaggregation/nonpd_mimo_v2_flash_16k4k_baseline_20260705.md`
 
-Steady-state C128 advantage note:
+C128 steady-state advantage note：
 
 - `docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md`
 
-PD 1P1D raw logs:
+PD 1P1D 原始日志：
 
 - `tmp/e2e_logs/pd_16k_4k_extra_poll_1783257767/`
 
-Non-PD raw logs:
+Non-PD 原始日志：
 
 - `tmp/e2e_logs/nonpd_16k_4k_1783265639/`
 
-Non-PD two-host C64/AIME24 raw logs:
+Non-PD two-host C64/AIME24 原始日志：
 
 - `tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/`
 - parsed summary: `tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_parsed_summary.json`
 
-Non-PD two-host C128 raw logs:
+Non-PD two-host C128 原始日志：
 
 - `tmp/e2e_logs/nonpd_2host_c128_1783298516/`
 - parsed summary: `tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_parsed_summary.json`
 
-PD 2P1D raw logs:
+PD 2P1D 原始日志：
 
 - `tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/`
 - parsed summary: `tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/parsed_summary.json`
 
-## Verification
+## 验证
 
-Local targeted tests run during this work:
+本轮工作期间跑过的本地 targeted tests：
 
 ```bash
 .venv/bin/python -m pytest \
@@ -156,14 +166,16 @@ Local targeted tests run during this work:
   python/sgl_jax/test/disaggregation/test_pd_internal_state.py -q
 ```
 
-The endpoint-host regression test was first run before the fix and failed as expected, then passed after the decode change.
+endpoint-host regression test 在修复前先失败，decode 改动后通过。
 
-## Next Work
+## 后续工作
 
-Recommended next steps:
+建议下一步：
 
-1. Keep focusing on transfer and host/device scheduling overlap. Router admission is not the important remaining cost.
-2. Investigate moving transfer discovery/progress off the decode event-loop tick so decode forward and incoming KV progress overlap more cleanly.
-3. Add goodput/SLO sweeps for the C128 anchor instead of relying only on full-run averages. Suggested SLOs: TTFT `<30s` or `<60s`, ITL `<40ms` or `<60ms`.
-4. Evaluate decode-heavy ratios such as `1P:2D` or `1P:3D` when hosts are available. Public PD-ratio reports show `3P:1D` is not always optimal once decode dominates.
-5. Treat precompile cache as a startup optimization, not a runtime throughput issue. Current precompile itself is about tens of seconds after model load; model load/layout conversion dominates restart time.
+1. 继续聚焦 transfer 和 host/device scheduling overlap。Router admission 不是当前最重要的剩余成本。
+2. 研究把 transfer discovery/progress 从 decode event-loop tick 中移出来，让 decode forward 和 incoming KV progress 更好地重叠。
+3. 对 C128 anchor 增加 goodput/SLO sweep，不要只依赖 full-run average。建议 SLO：
+   TTFT `<30s` 或 `<60s`，ITL `<40ms` 或 `<60ms`。
+4. host 可用时评估 decode-heavy ratio，例如 `1P:2D` 或 `1P:3D`。公开 PD-ratio
+   报告显示，一旦 decode 成为主导，`3P:1D` 不一定是最优。
+5. 把 precompile cache 视为启动优化，而不是运行时吞吐问题。当前 precompile 本身在模型加载后大约是几十秒；模型加载和 layout conversion 才是重启主要耗时。

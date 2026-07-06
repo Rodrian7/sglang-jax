@@ -1,37 +1,45 @@
-# MiMo-V2-Flash Non-PD 16K/4K Baseline, 2026-07-05
+# MiMo-V2-Flash Non-PD 16K/4K 基线, 2026-07-05
 
-## Summary
+## 摘要
 
-The original 2026-07-05 run used one v7x-8 host as a normal non-PD server.
-That is useful as a single-host baseline, but it is not a pod-count-fair
-comparison against PD 1P1D.
+最初的 2026-07-05 run 使用 1 个 v7x-8 host 作为普通 non-PD server。
+这可以作为单机 baseline，但不能和 PD 1P1D 做 pod-count-fair 比较。
 
-The 2026-07-06 follow-up adds a fairer C64 comparison: two normal non-PD
-servers, one on each Falcon rank, behind a thin streaming round-robin proxy.
-This is equivalent to doing data parallelism at the serve layer instead of P/D
-disaggregation.
+2026-07-06 的补充测试增加了一个更公平的 C64 对比：两个普通 non-PD server，
+分别运行在一个 Falcon rank 上，并通过一个轻量 streaming round-robin proxy
+转发请求。这个拓扑等价于在 serve 层做 data parallelism，而不是做 P/D 分离。
 
-Main result:
+主要结果：
 
-- Best non-PD client throughput is C128: `8.62K total tok/s`, with `6.89K input tok/s` and `1.72K output tok/s`.
-- PD 1P1D C128 is `13.64K total tok/s`, with `10.91K input tok/s` and `2.73K output tok/s`.
-- Non-PD C128 decode serve-log highwater is strong: `3.87K output tok/s` mean, `4.10K max`. The end-to-end loss is not decode kernel weakness; it is same-device prefill/decode contention and long prefill queueing.
-- Non-PD C128 had `383/384` successful requests. The failed request is included in the raw benchmark log and makes this point slightly noisy, but it does not change the conclusion.
-- The two-host non-PD C64 follow-up reached `11.70K total tok/s`, `9.36K input tok/s`, and `2.34K output tok/s`. This is higher than PD 1P1D C64 (`10.55K total tok/s`) and PD 2P1D C64 (`10.83K total tok/s`).
-- The two-host non-PD C128 follow-up reached `12.78K total tok/s`, `10.22K input tok/s`, and `2.56K output tok/s`, with `383/384` successful requests. This is lower than PD 1P1D C128 (`13.64K total tok/s`) and PD 2P1D C128 (`15.31K total tok/s`).
-- Therefore, the fair conclusion is more nuanced: serve-level DP is better at C64, while PD has an advantage again at C128/high pressure.
+- 单机 non-PD 最好 client throughput 是 C128：`8.62K total tok/s`，其中
+  `6.89K input tok/s`、`1.72K output tok/s`。
+- PD 1P1D C128 是 `13.64K total tok/s`，其中 `10.91K input tok/s`、
+  `2.73K output tok/s`。
+- 单机 non-PD C128 的 decode serve-log highwater 很强：均值
+  `3.87K output tok/s`，max `4.10K`。端到端损失不是 decode kernel 弱，
+  而是同设备 prefill/decode contention 和长 prefill queueing。
+- 单机 non-PD C128 有 `383/384` 个 request 成功。失败 request 已保留在原始
+  benchmark log 中，因此这个点略有噪声，但不改变整体结论。
+- two-host non-PD C64 follow-up 达到 `11.70K total tok/s`、`9.36K input tok/s`
+  和 `2.34K output tok/s`。它高于 PD 1P1D C64（`10.55K total tok/s`）和
+  PD 2P1D C64（`10.83K total tok/s`）。
+- two-host non-PD C128 follow-up 达到 `12.78K total tok/s`、`10.22K input tok/s`
+  和 `2.56K output tok/s`，成功数 `383/384`。它低于 PD 1P1D C128
+  （`13.64K total tok/s`）和 PD 2P1D C128（`15.31K total tok/s`）。
+- 因此公平结论更细：serve-level DP 在 C64 更好，而 PD 在 C128 / high pressure
+  下重新获得优势。
 
-## Tested Code / Environment
+## 测试代码和环境
 
-- Falcon exp: `exp-5uqgg64144`, rank 1.
-- Remote repo: `/tmp/sglang-jax`.
-- Remote run dir: `/tmp/e2e_logs/nonpd_16k_4k_1783265639`.
-- Local raw archive: `tmp/e2e_logs/nonpd_16k_4k_1783265639/nonpd_16k_4k_1783265639.tar.gz`.
-- Parsed summary: `tmp/e2e_logs/nonpd_16k_4k_1783265639/parsed_summary.json`.
-- Model: `/models/MiMo-V2-Flash`.
-- JAX compilation cache: `/tmp/tpu_logs/jit_cache`.
+- Falcon exp: `exp-5uqgg64144`, rank 1。
+- 远端 repo: `/tmp/sglang-jax`。
+- 远端 run dir: `/tmp/e2e_logs/nonpd_16k_4k_1783265639`。
+- 本地原始 archive: `tmp/e2e_logs/nonpd_16k_4k_1783265639/nonpd_16k_4k_1783265639.tar.gz`。
+- 解析 summary: `tmp/e2e_logs/nonpd_16k_4k_1783265639/parsed_summary.json`。
+- Model: `/models/MiMo-V2-Flash`。
+- JAX compilation cache: `/tmp/tpu_logs/jit_cache`。
 
-## Serve Command
+## Serve 命令
 
 ```bash
 /usr/local/bin/python -m sgl_jax.launch_server \
@@ -48,7 +56,7 @@ Main result:
   --host 0.0.0.0 --port 30000
 ```
 
-## Benchmark Command
+## Benchmark 命令
 
 ```bash
 for C in 32 64 128; do
@@ -73,7 +81,7 @@ for C in 32 64 128; do
 done
 ```
 
-## Client Results
+## Client 结果
 
 | C | success | req/s | input tok/s | output tok/s | peak output tok/s | total tok/s | mean TTFT ms | p99 TTFT ms | mean ITL ms | p99 ITL ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -81,7 +89,7 @@ done
 | 64 | 192/192 | 0.35 | 5685 | 1421 | 2688 | 7106 | 42904 | 83541 | 34.55 | 41.88 |
 | 128 | 383/384 | 0.42 | 6894 | 1723 | 4504 | 8617 | 83256 | 162879 | 53.54 | 317.23 |
 
-## Serve-Log Steady Results
+## Serve Log 稳态结果
 
 | C | prefill active window UTC | prefill span s | prefill active input tok/s | prefill max queue | decode highwater window UTC | decode highwater mean tok/s | decode highwater max tok/s |
 |---:|---|---:|---:|---:|---|---:|---:|
@@ -91,7 +99,7 @@ done
 
 ## PD vs Non-PD
 
-| Mode | Hosts | C | client total tok/s | client input tok/s | client output tok/s | serve prefill active input tok/s | serve decode highwater output tok/s |
+| 模式 | host 数 | C | client total tok/s | client input tok/s | client output tok/s | serve prefill active input tok/s | serve decode highwater output tok/s |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | non-PD single server | 1 | 32 | 5922 | 4737 | 1184 | 5980 | 1880 |
 | PD 1P1D | 2 | 32 | 7838 | 6270 | 1568 | 8150 | 1852 |
@@ -104,36 +112,41 @@ done
 | PD 1P1D | 2 | 128 | 13642 | 10913 | 2728 | 12788 | 3180 |
 | PD 2P1D | 3 | 128 | 15307 | 12246 | 3061 | n/a | n/a |
 
-Interpretation:
+解读：
 
-- The original single-host non-PD baseline is not a fair pod-count comparison against PD.
-- At C64 with two hosts, serve-level DP is about `10.9%` higher than PD 1P1D by client total tok/s (`11.70K / 10.55K`) and about `8.0%` higher than PD 2P1D C64 (`11.70K / 10.83K`), while also showing lower mean TTFT (`13.7s` vs PD 1P1D `16.5s`).
-- At C128 with two hosts, the result flips back: PD 1P1D is about `6.8%` higher than two-host non-PD by client total tok/s (`13.64K / 12.78K`), and PD 2P1D is about `19.8%` higher (`15.31K / 12.78K`), though PD 2P1D uses one additional prefill host.
-- This makes sense: at C64, two full non-PD replicas split the burst and keep KV local, avoiding PD transfer overhead. At C128, each replica is effectively under C64 pressure, where same-device prefill/decode contention and longer tail latency reappear.
-- PD's role-isolation story is therefore strongest in the higher pressure region, not at moderate C64.
+- 原始 single-host non-PD baseline 不能和 PD 做 pod-count-fair 比较。
+- C64 two-host 场景下，serve-level DP 的 client total tok/s 比 PD 1P1D 高约
+  `10.9%`（`11.70K / 10.55K`），比 PD 2P1D C64 高约 `8.0%`
+  （`11.70K / 10.83K`），同时 mean TTFT 也更低（`13.7s` vs PD 1P1D `16.5s`）。
+- C128 two-host 场景下，结论反转：PD 1P1D 的 client total tok/s 比 two-host
+  non-PD 高约 `6.8%`（`13.64K / 12.78K`）；PD 2P1D 高约 `19.8%`
+  （`15.31K / 12.78K`），但 PD 2P1D 多使用了一个 prefill host。
+- 这符合预期：C64 时两个完整 non-PD replica 分摊 burst，并且 KV local，
+  避免了 PD transfer overhead；C128 时每个 replica 接近 C64 压力，同设备
+  prefill/decode contention 和更长 tail latency 又出现了。
+- 因此 PD 的 role-isolation 价值主要出现在更高压力区间，而不是中等 C64。
 
-## Two-Host Serve-Level DP Follow-Up
+## Two-Host Serve-Level DP 补充测试
 
-Run ids:
+Run ids：
 
 ```text
 C64 + AIME24: nonpd_2host_c64_aime24_1783295840
 C128:         nonpd_2host_c128_1783298516
 ```
 
-Topology:
+拓扑：
 
-- Falcon exp: `exp-5uqgg64144`.
-- Rank 0: normal non-PD server, `http://rank0:30010`.
-- Rank 1: normal non-PD server, `http://localhost:30010`.
-- Rank 1 proxy: `http://localhost:30000`, thin streaming round-robin proxy.
+- Falcon exp: `exp-5uqgg64144`。
+- Rank 0：普通 non-PD server，`http://rank0:30010`。
+- Rank 1：普通 non-PD server，`http://localhost:30010`。
+- Rank 1 proxy：`http://localhost:30000`，轻量 streaming round-robin proxy。
 
-The proxy performed no admission or scheduling optimization beyond round-robin
-request distribution. After the C64 benchmark it reported `196` total forwarded
-requests, `98` per backend. That includes the 192 benchmark requests plus
-metadata/health requests.
+proxy 除了 round-robin request distribution 外，没有做 admission 或调度优化。
+C64 benchmark 后它报告总共转发 `196` 个 request，每个 backend `98` 个。这包含
+192 个 benchmark request 以及 metadata/health request。
 
-Server command on both ranks:
+两个 rank 的 server 命令：
 
 ```bash
 /usr/local/bin/python -m sgl_jax.launch_server \
@@ -150,7 +163,7 @@ Server command on both ranks:
   --host 0.0.0.0 --port 30010
 ```
 
-Benchmark command:
+Benchmark 命令：
 
 ```bash
 /usr/local/bin/python -m sgl_jax.bench_serving \
@@ -172,14 +185,14 @@ Benchmark command:
   --output-file /tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/bench_c64.jsonl
 ```
 
-Client results:
+Client 结果：
 
 | C | success | duration s | req/s | input tok/s | output tok/s | peak output tok/s | total tok/s | mean TTFT ms | p99 TTFT ms | mean ITL ms | p99 ITL ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 64 | 192/192 | 336.08 | 0.57 | 9360 | 2340 | 3884 | 11700 | 13675 | 40857 | 23.89 | 171.86 |
 | 128 | 383/384 | 613.79 | 0.62 | 10223 | 2556 | 5017 | 12779 | 46493 | 170968 | 34.56 | 278.65 |
 
-The failed C128 request was preserved in `bench_c128.jsonl`:
+C128 失败 request 保存在 `bench_c128.jsonl`：
 
 ```text
 idx=354 Bad Gateway: ServerDisconnectedError('Server disconnected')
@@ -198,9 +211,9 @@ Serve-log summary:
 | 128 | 1 | 00:42:56-00:51:55 | 539 | 5836 | 48 | 2393 | 2868 | 75 |
 | 128 | combined | n/a | n/a | 11642 | n/a | 4672 | 5361 | n/a |
 
-## AIME24 Follow-Up
+## AIME24 补充测试
 
-The same two-host non-PD serve-level DP endpoint was used for an AIME24 rerun:
+同一个 two-host non-PD serve-level DP endpoint 用来重跑 AIME24：
 
 ```bash
 /usr/local/bin/python -m evalscope.run \
@@ -215,30 +228,29 @@ The same two-host non-PD serve-level DP endpoint was used for an AIME24 rerun:
   --generation-config '{"temperature":1,"top_p":0.95,"max_tokens":30000,"chat_template_kwargs":{"enable_thinking":true}}'
 ```
 
-Result:
+结果：
 
 | Endpoint | Dataset | Num | Score | Correct |
 |---|---|---:|---:|---:|
 | non-PD serve-level DP | AIME24 / `HuggingFaceH4/aime_2024` | 30 | 0.8667 | 26 |
 
-The earlier PD run got `0.7667` (23/30) with the same non-greedy generation
-shape. Because the config uses `temperature=1`, this difference should be
-treated as sampling variance unless a deterministic accuracy protocol is added.
-Both results are within a plausible band and do not suggest a precision bug.
+更早的 PD run 在相同 non-greedy generation 形态下得到 `0.7667`（23/30）。
+由于 config 使用 `temperature=1`，除非增加 deterministic accuracy protocol，
+否则这个差异应视为采样波动。两个结果都在合理范围内，没有精度异常信号。
 
-## Raw Logs
+## 原始日志
 
-- Client logs: `raw/bench_c32.log`, `raw/bench_c64.log`, `raw/bench_c128.log`.
-- Server log: `raw/nonpd_server.log`.
-- JSONL details: `bench_c32.jsonl`, `bench_c64.jsonl`, `bench_c128.jsonl`.
-- Window markers: `c32.window`, `c64.window`, `c128.window`.
-- Two-host C64/AIME24 local artifacts:
+- Client 日志: `raw/bench_c32.log`, `raw/bench_c64.log`, `raw/bench_c128.log`。
+- Server 日志: `raw/nonpd_server.log`。
+- JSONL 详情: `bench_c32.jsonl`, `bench_c64.jsonl`, `bench_c128.jsonl`。
+- Window markers: `c32.window`, `c64.window`, `c128.window`。
+- Two-host C64/AIME24 本地产物：
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_aime24_1783295840_rank0.tar.gz`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_aime24_1783295840_rank1.tar.gz`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/rank1_extract/nonpd_2host_c64_aime24_1783295840/raw/bench_c64.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/rank1_extract/nonpd_2host_c64_aime24_1783295840/aime24_workdir/20260706_001210/reports/MiMo-V2-Flash/aime24.json`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_parsed_summary.json`
-- Two-host C128 local artifacts:
+- Two-host C128 本地产物：
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_1783298516_rank0_serve.tar.gz`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_1783298516_rank1_serve.tar.gz`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/rank1_extract/nonpd_2host_c128_1783298516/raw/bench_c128.log`
