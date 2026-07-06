@@ -17,6 +17,7 @@ Completed overnight items:
 
 - Added pod-count-fair non-PD C64 comparison: two ordinary non-PD servers,
   one per Falcon rank, behind a thin streaming round-robin proxy.
+- Added pod-count-fair non-PD C128 comparison on the same two-host endpoint.
 - Reran AIME24 on that two-host non-PD endpoint.
 
 ## Code Changes
@@ -47,6 +48,7 @@ Changed files:
 |---|---:|---:|---:|---:|---:|---:|---:|
 | non-PD | 128 | 8617 | 6894 | 1723 | 4504 | 83256 | 53.54 |
 | non-PD serve-level DP | 64 | 11700 | 9360 | 2340 | 3884 | 13675 | 23.89 |
+| non-PD serve-level DP | 128 | 12779 | 10223 | 2556 | 5017 | 46493 | 34.56 |
 | PD 1P1D | 128 | 13642 | 10913 | 2728 | 3483 | 57602 | 28.73 |
 | PD 2P1D | 128 | 15307 | 12246 | 3061 | 3968 | 20114 | 35.08 |
 
@@ -54,7 +56,7 @@ Main conclusion:
 
 - The original single-host non-PD baseline proves that same-device prefill/decode contention is real, but it is not pod-count fair.
 - The 2026-07-06 two-host non-PD C64 run is stronger than PD at C64: `11.70K total tok/s` vs PD 1P1D `10.55K` and PD 2P1D `10.83K`.
-- PD 1P1D still improves C128 total throughput by about `58%` over the single-host non-PD C128 baseline. A fair two-host non-PD C128 run has not yet been done.
+- The two-host non-PD C128 run is the first fair high-pressure comparison and gives PD a measurable advantage: PD 1P1D is `13.64K` vs non-PD serve-level DP `12.78K` total tok/s, and PD 2P1D is `15.31K`.
 - 2P1D mainly helps high concurrency. C128 total throughput is about `12%` higher than 1P1D and mean TTFT is much lower. C64 only improves about `3%`.
 - One decode host remains the long-output limiter. More prefill helps queueing and prefill pressure, but does not fundamentally change decode ITL.
 - Per-request transfer cost is stable in 2P1D: decode `kv_wait` is about `2.31s`, prefill `transfer` about `2.56s`.
@@ -117,6 +119,11 @@ Non-PD two-host C64/AIME24 raw logs:
 
 - `tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/`
 - parsed summary: `tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_parsed_summary.json`
+
+Non-PD two-host C128 raw logs:
+
+- `tmp/e2e_logs/nonpd_2host_c128_1783298516/`
+- parsed summary: `tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_parsed_summary.json`
 
 PD 2P1D raw logs:
 

@@ -6,7 +6,7 @@
 - 16K input / 4K output 最好点仍是 C128：client 全程平均 `13.64K total tok/s`，其中 `10.91K input tok/s`、`2.73K output tok/s`；client peak output `3.48K tok/s`。
 - 用 server log 看 device 能力：prefill forward-only 估计约 `22.8K input tok/s`（router prefill inflight=4 反推），但包含 transfer/tail 后的实际 active prefill 只有 `12.8K input tok/s`；decode highwater steady 约 `3.18K output tok/s`，max `3.41K output tok/s`。
 - 额外做了 `2 prefill : 1 decode` 探索。C64 收益很小（`10.83K total tok/s`，比 1P1D C64 高约 `2.7%`）；C128 提升更明显（`15.31K total tok/s`，比 1P1D C128 高约 `12.2%`，mean TTFT 从 `57.6s` 降到 `20.1s`），但长输出阶段仍由单 decode device 主导。
-- 2026-07-06 补了一个更公平的 non-PD C64：两台普通 non-PD server + serve-level round-robin proxy，结果 `11.70K total tok/s`、`2.34K output tok/s`，高于 PD 1P1D/2P1D 的 C64。因此 C64 不能用单机 non-PD 对比来证明 PD 吞吐优势；PD 优势更应看高压、角色隔离和 device-role 峰值。
+- 2026-07-06 补了更公平的两机 non-PD serve-level DP。C64 是 `11.70K total tok/s`、`2.34K output tok/s`，高于 PD 1P1D/2P1D 的 C64；但 C128 是 `12.78K total tok/s`、`2.56K output tok/s`，低于 PD 1P1D C128 的 `13.64K` 和 PD 2P1D C128 的 `15.31K`。因此 PD 优势主要出现在更高压的 C128，而不是 C64。
 - AIME24 两次完整 30 题：PD endpoint 为 `0.7667`（23/30），两机 non-PD serve-level DP endpoint 为 `0.8667`（26/30）。由于使用 `temperature=1` 非贪心采样，这个差异更像采样波动；没有看到精度异常信号。
 
 ## Tested Code
@@ -356,10 +356,11 @@ The original non-PD comparison used one server host, so it was not pod-count
 fair against PD 1P1D. On 2026-07-06, C64 was rerun with two normal non-PD
 servers, one on each Falcon rank, behind a thin streaming round-robin proxy.
 
-Run id:
+Run ids:
 
 ```text
-nonpd_2host_c64_aime24_1783295840
+C64 + AIME24: nonpd_2host_c64_aime24_1783295840
+C128:         nonpd_2host_c128_1783298516
 ```
 
 Client result, 16K input / 4K output:
@@ -370,20 +371,26 @@ Client result, 16K input / 4K output:
 | non-PD serve-level DP | 2 | 64 | 192/192 | 11700 | 9360 | 2340 | 3884 | 13675 | 23.89 |
 | PD 1P1D | 2 | 64 | 192/192 | 10546 | 8437 | 2109 | 2653 | 16476 | 24.13 |
 | PD 2P1D | 3 | 64 | 192/192 | 10829 | 8663 | 2166 | 2844 | 11488 | 25.84 |
+| non-PD serve-level DP | 2 | 128 | 383/384 | 12779 | 10223 | 2556 | 5017 | 46493 | 34.56 |
+| PD 1P1D | 2 | 128 | 384/384 | 13642 | 10913 | 2728 | 3483 | 57602 | 28.73 |
+| PD 2P1D | 3 | 128 | 384/384 | 15307 | 12246 | 3061 | 3968 | 20114 | 35.08 |
 
-Serve-log summary for the two-host C64 run:
+Serve-log summary for the two-host runs:
 
-| Rank | prefill active input tok/s | decode high-load mean tok/s | decode max tok/s | max running |
-|---:|---:|---:|---:|---:|
-| 0 | 5958 | 1879 | 1970 | 40 |
-| 1 | 5935 | 1882 | 1963 | 48 |
-| combined | 11893 | 3761 | 3933 | n/a |
+| C | Rank | prefill active input tok/s | decode high-load mean tok/s | decode max tok/s | max running |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 5958 | 1879 | 1970 | 40 |
+| 64 | 1 | 5935 | 1882 | 1963 | 48 |
+| 64 | combined | 11893 | 3761 | 3933 | n/a |
+| 128 | 0 | 5806 | 2279 | 2492 | 57 |
+| 128 | 1 | 5836 | 2393 | 2868 | 75 |
+| 128 | combined | 11642 | 4672 | 5361 | n/a |
 
 Interpretation:
 
 - At C64, serve-level DP is stronger than PD because each server handles about half the burst with local KV and no transfer path.
-- This does not invalidate the PD high-pressure result, but it narrows the claim: PD 1P1D should not be presented as universally faster than a pod-count-fair non-PD deployment at C64.
-- A fair two-host non-PD C128 was not run in this follow-up. If we need a strict apples-to-apples C128 conclusion, that is the next benchmark to add.
+- At C128, each non-PD server is effectively at C64 pressure and same-device prefill/decode contention returns. PD 1P1D is about `6.8%` higher than two-host non-PD by total tok/s, and PD 2P1D is about `19.8%` higher, though PD 2P1D uses one additional prefill host.
+- This narrows the claim: PD 1P1D should not be presented as universally faster than a pod-count-fair non-PD deployment at C64, but it does recover a measurable advantage at C128.
 
 ## AIME24
 
@@ -423,6 +430,11 @@ Local artifacts:
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/rank1_extract/nonpd_2host_c64_aime24_1783295840/raw/bench_c64.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/rank1_extract/nonpd_2host_c64_aime24_1783295840/aime24_workdir/20260706_001210/reports/MiMo-V2-Flash/aime24.json`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c64_aime24_1783295840/nonpd_2host_c64_parsed_summary.json`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_1783298516_rank0_serve.tar.gz`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_1783298516_rank1_serve.tar.gz`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/rank1_extract/nonpd_2host_c128_1783298516/raw/bench_c128.log`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/rank1_extract/nonpd_2host_c128_1783298516/bench_c128.jsonl`
+  - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/nonpd_2host_c128_1783298516/nonpd_2host_c128_parsed_summary.json`
 - 2P1D:
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/pd_2p1d_16k_4k_bench_1783270151/raw/bench_c64.log`
   - `/Users/jiongxuan/workspace/sglang-jax/tmp/e2e_logs/pd_2p1d_16k_4k_bench_1783270151/pd_2p1d_16k_4k_bench_1783270151/raw/bench_c128.log`
