@@ -19,6 +19,8 @@ Completed overnight items:
   one per Falcon rank, behind a thin streaming round-robin proxy.
 - Added pod-count-fair non-PD C128 comparison on the same two-host endpoint.
 - Reran AIME24 on that two-host non-PD endpoint.
+- Added a C128 steady-state advantage note:
+  `docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md`.
 
 ## Code Changes
 
@@ -60,6 +62,10 @@ Main conclusion:
 - 2P1D mainly helps high concurrency. C128 total throughput is about `12%` higher than 1P1D and mean TTFT is much lower. C64 only improves about `3%`.
 - One decode host remains the long-output limiter. More prefill helps queueing and prefill pressure, but does not fundamentally change decode ITL.
 - Per-request transfer cost is stable in 2P1D: decode `kv_wait` is about `2.31s`, prefill `transfer` about `2.56s`.
+- Steady-state C128 view:
+  - PD 1P1D prefill active input is `12.79K tok/s`, decode highwater output is `3.18K tok/s`, and serve-internal PD handoff total is about `4.80s`.
+  - PD 2P1D prefill active input is `15.71K tok/s`, decode highwater output is `3.63K tok/s`, and serve-internal PD handoff total is about `4.37s`.
+  - Two-host non-PD C128 prefill active input is `11.64K tok/s`; rank-local decode highwater is high but not aligned/sustained enough to win the full C128 run.
 - AIME24 follow-up on non-PD serve-level DP got `0.8667` (26/30). Previous PD endpoint run got `0.7667` (23/30). With `temperature=1`, treat this as sampling variance rather than evidence of a precision regression.
 
 ## Remote State
@@ -106,6 +112,10 @@ Main report:
 Non-PD report:
 
 - `docs/developer_guide/pd_disaggregation/nonpd_mimo_v2_flash_16k4k_baseline_20260705.md`
+
+Steady-state C128 advantage note:
+
+- `docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md`
 
 PD 1P1D raw logs:
 
@@ -154,6 +164,6 @@ Recommended next steps:
 
 1. Keep focusing on transfer and host/device scheduling overlap. Router admission is not the important remaining cost.
 2. Investigate moving transfer discovery/progress off the decode event-loop tick so decode forward and incoming KV progress overlap more cleanly.
-3. Add a fair two-host non-PD C128 run before making strong C128 pod-count claims.
-4. Evaluate 2P1D only for high concurrency or production-like burst patterns. It is useful at C128, but not very useful at C64.
-4. Treat precompile cache as a startup optimization, not a runtime throughput issue. Current precompile itself is about tens of seconds after model load; model load/layout conversion dominates restart time.
+3. Add goodput/SLO sweeps for the C128 anchor instead of relying only on full-run averages. Suggested SLOs: TTFT `<30s` or `<60s`, ITL `<40ms` or `<60ms`.
+4. Evaluate decode-heavy ratios such as `1P:2D` or `1P:3D` when hosts are available. Public PD-ratio reports show `3P:1D` is not always optimal once decode dominates.
+5. Treat precompile cache as a startup optimization, not a runtime throughput issue. Current precompile itself is about tens of seconds after model load; model load/layout conversion dominates restart time.

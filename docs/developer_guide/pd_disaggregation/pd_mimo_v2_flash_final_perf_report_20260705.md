@@ -7,6 +7,8 @@
 - 用 server log 看 device 能力：prefill forward-only 估计约 `22.8K input tok/s`（router prefill inflight=4 反推），但包含 transfer/tail 后的实际 active prefill 只有 `12.8K input tok/s`；decode highwater steady 约 `3.18K output tok/s`，max `3.41K output tok/s`。
 - 额外做了 `2 prefill : 1 decode` 探索。C64 收益很小（`10.83K total tok/s`，比 1P1D C64 高约 `2.7%`）；C128 提升更明显（`15.31K total tok/s`，比 1P1D C128 高约 `12.2%`，mean TTFT 从 `57.6s` 降到 `20.1s`），但长输出阶段仍由单 decode device 主导。
 - 2026-07-06 补了更公平的两机 non-PD serve-level DP。C64 是 `11.70K total tok/s`、`2.34K output tok/s`，高于 PD 1P1D/2P1D 的 C64；但 C128 是 `12.78K total tok/s`、`2.56K output tok/s`，低于 PD 1P1D C128 的 `13.64K` 和 PD 2P1D C128 的 `15.31K`。因此 PD 优势主要出现在更高压的 C128，而不是 C64。
+- 2026-07-06 追加了 C128 steady-state 口径分析：
+  [pd_steady_state_advantage_20260706.md](/Users/jiongxuan/workspace/sglang-jax/docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md)。在该口径下，PD 1P1D C128 的 prefill active input 为 `12.79K tok/s`，PD 2P1D 为 `15.71K tok/s`；serve-internal PD handoff total 分别约 `4.80s` / `4.37s`，明显小于 client TTFT，因为 client TTFT 包含 burst queueing。
 - AIME24 两次完整 30 题：PD endpoint 为 `0.7667`（23/30），两机 non-PD serve-level DP endpoint 为 `0.8667`（26/30）。由于使用 `temperature=1` 非贪心采样，这个差异更像采样波动；没有看到精度异常信号。
 
 ## Tested Code
