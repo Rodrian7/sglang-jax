@@ -9,6 +9,7 @@
 - 2026-07-06 补了更公平的两机 non-PD serve-level DP。C64 是 `11.70K total tok/s`、`2.34K output tok/s`，高于 PD 1P1D/2P1D 的 C64；但 C128 是 `12.78K total tok/s`、`2.56K output tok/s`，低于 PD 1P1D C128 的 `13.64K` 和 PD 2P1D C128 的 `15.31K`。因此 PD 优势主要出现在更高压的 C128，而不是 C64。
 - 2026-07-06 追加了 C128 steady-state 口径分析：
   [pd_steady_state_advantage_20260706.md](/Users/jiongxuan/workspace/sglang-jax/docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md)。在该口径下，PD 1P1D C128 的 prefill active input 为 `12.79K tok/s`，PD 2P1D 为 `15.71K tok/s`；serve-internal PD handoff total 分别约 `4.80s` / `4.37s`，明显小于 client TTFT，因为 client TTFT 包含 burst queueing。
+- 对齐 DistServe / TensorRT-LLM / dstack / NVIDIA NIM 的公开口径后，本报告应被理解为 `request_rate=inf` closed-loop burst benchmark 加 serve-log 稳态分析，而不是 SLO goodput 结果。现有 C128 steady 数据显示 PD 1P1D 的 prefill/decode 基本 rate matched（`0.780` vs `0.776 req/s`），PD 2P1D 则开始偏 decode-constrained（`0.959` vs `0.886 req/s`）。
 - AIME24 两次完整 30 题：PD endpoint 为 `0.7667`（23/30），两机 non-PD serve-level DP endpoint 为 `0.8667`（26/30）。由于使用 `temperature=1` 非贪心采样，这个差异更像采样波动；没有看到精度异常信号。
 
 ## 测试代码
@@ -219,6 +220,30 @@ Server 侧 decode output capacity：
 | 32 | 13:22:56-13:26:09 | 193 | 8150 | >= 29/32 | 13:23:35-13:26:43 | 188 | 1852 | 2016 |
 | 64 | 13:27:42-13:32:40 | 298 | 10556 | >= 58/64 | 13:28:59-13:32:58 | 239 | 2462 | 2607 |
 | 128 | 13:34:40-13:42:52 | 492 | 12788 | >= 90/100 | 13:37:41-13:43:02 | 321 | 3180 | 3414 |
+
+## 公开口径对齐
+
+参考公开 PD benchmark 方法后，当前报告的结论需要按下面口径阅读：
+
+- DistServe 的 goodput 是 **满足 TTFT/TPOT SLO 的最大 request rate**。本报告的
+  `request_rate=inf` benchmark 是 closed-loop burst 压力测试，只能说明 burst
+  下的吞吐、排队和 steady device capacity，不能直接等价为 SLO goodput。
+- NVIDIA NIM / GenAI-Perf 的 TTFT 口径通常包含 request queueing、prefill、
+  network latency 等端到端等待；ITL/TPOT 更接近首 token 之后的 decode 行为。
+  因此本报告同时保留 client-visible TTFT/ITL 和 serve-internal phase timing。
+- TensorRT-LLM 的 disaggregated serving 方法更强调先分别测 prefill/context
+  req/s 与 decode/generation tok/s，再做 rate matching。按这个思路看现有
+  `16K/4K C128` steady 数据：
+
+| 模式 | prefill active input tok/s | prefill req/s @16K | decode highwater output tok/s | decode req/s @4K | 结论 |
+|---|---:|---:|---:|---:|---|
+| PD 1P1D C128 | 12.79K | 0.780 | 3.18K | 0.776 | P/D 基本 rate matched，是最干净的 pod-count-fair C128 对比。 |
+| PD 2P1D C128 | 15.71K | 0.959 | 3.63K | 0.886 | prefill 端已有余量，decode 端开始更紧；继续加 prefill 的边际收益可能下降。 |
+
+因此更稳妥的阶段性结论是：`PD 1P1D` 在 `16K/4K C128` 上已经接近 P/D
+rate matching；`PD 2P1D` 提高了 burst 下的 prefill active capacity 和总吞吐，
+但下一轮配比实验应优先覆盖 `1P:2D`、`1P:3D` 或 decode MTP，而不是只继续增加
+prefill 节点。
 
 ## Transfer / Time Stats
 
@@ -448,5 +473,6 @@ accuracy protocol，否则 23/30 vs 26/30 的差异应视为采样波动。
 1. 下一步目标应该是 transfer path，而不是 router admission。真正有用的 gap 在 forward-only `~22.8K input tok/s` 和 realized active prefill `~12.8K input tok/s` 之间。
 2. Decode receiver 需要 metadata/prealloc 与 KV transfer wait 之间的真正 overlap。目前 `prealloc_wait + kv_wait` 几乎等于 total，因此仍是串行。
 3. Prefill sender tail 仍然可见：C128 `transfer_tail` 约 `322 ms`，transfer span 约 `2.57 s`。减少 bootstrap/register polling 和 Raiden done-sending tail 应该能直接提升 prefill realized bandwidth。
-4. 2P1D 值得为高并发 production-like load 保留，但当前最佳 cost/perf point 依赖 workload：C64 收益可以忽略，C128 有明确 TTFT 和吞吐收益。
+4. 2P1D 值得为高并发 production-like load 保留，但当前最佳 cost/perf point 依赖 workload：C64 收益可以忽略，C128 有明确 TTFT 和吞吐收益；从 rate matching 看，继续加 P 之前应先测 `1P:2D`、`1P:3D` 或 decode MTP。
 5. 下一步代码实验应关注更大粒度的 host/device scheduling overlap：让 transfer discovery/progress 独立于 decode event-loop tick，或在当前 decode forward in flight 时 pipeline 下一个 request 的 transfer setup。
+6. 下一轮 benchmark 建议增加 open-loop request-rate sweep，并按明确 TTFT/ITL SLO 计算 goodput；这样才能和 DistServe/NIM 风格的公开结果做更公平的对齐。

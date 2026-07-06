@@ -21,6 +21,9 @@
 - 在 two-host non-PD endpoint 上重跑 AIME24。
 - 增加 C128 steady-state advantage note：
   `docs/developer_guide/pd_disaggregation/pd_steady_state_advantage_20260706.md`。
+- 同步公开 benchmark 口径修订：当前数据应被视为 `request_rate=inf`
+  closed-loop burst benchmark 加 serve-log 稳态分析，而不是 DistServe 风格的
+  SLO goodput 结果。
 
 ## 代码改动
 
@@ -76,6 +79,11 @@
     `3.63K tok/s`，serve-internal PD handoff total 约 `4.37s`。
   - Two-host non-PD C128 prefill active input 是 `11.64K tok/s`；rank-local decode
     highwater 很高，但不够对齐/持续，无法赢下完整 C128 run。
+- 按 TensorRT-LLM rate matching 思路折算：
+  - PD 1P1D C128 约 `0.780 prefill req/s @16K` 对 `0.776 decode req/s @4K`，
+    P/D 基本匹配，是当前最干净的 pod-count-fair C128 结果。
+  - PD 2P1D C128 约 `0.959 prefill req/s @16K` 对 `0.886 decode req/s @4K`，
+    说明多 prefill 后 decode 开始更紧，下一步不应只继续加 prefill。
 - non-PD serve-level DP 的 AIME24 follow-up 得到 `0.8667`（26/30）。之前 PD endpoint
   得到 `0.7667`（23/30）。由于使用 `temperature=1`，这应视为采样波动，而不是精度回退证据。
 
@@ -174,8 +182,10 @@ endpoint-host regression test 在修复前先失败，decode 改动后通过。
 
 1. 继续聚焦 transfer 和 host/device scheduling overlap。Router admission 不是当前最重要的剩余成本。
 2. 研究把 transfer discovery/progress 从 decode event-loop tick 中移出来，让 decode forward 和 incoming KV progress 更好地重叠。
-3. 对 C128 anchor 增加 goodput/SLO sweep，不要只依赖 full-run average。建议 SLO：
+3. 对 C128 anchor 增加 open-loop request-rate sweep，并按 goodput/SLO 口径汇报，
+   不要只依赖 full-run average。建议 SLO：
    TTFT `<30s` 或 `<60s`，ITL `<40ms` 或 `<60ms`。
-4. host 可用时评估 decode-heavy ratio，例如 `1P:2D` 或 `1P:3D`。公开 PD-ratio
-   报告显示，一旦 decode 成为主导，`3P:1D` 不一定是最优。
+4. host 可用时评估 decode-heavy ratio，例如 `1P:2D` 或 `1P:3D`；也可以在
+   decode 侧试 MTP。当前 `2P:1D` 已经显示 decode 更紧，公开 PD-ratio 报告也
+   提醒 `3P:1D` 不一定是最佳 host 用法。
 5. 把 precompile cache 视为启动优化，而不是运行时吞吐问题。当前 precompile 本身在模型加载后大约是几十秒；模型加载和 layout conversion 才是重启主要耗时。
