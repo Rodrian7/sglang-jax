@@ -1,0 +1,97 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: jax-inference-service
+  title: JAX Inference Service
+  description: Create a new JAX-based LLM inference service with TPU support, CI/CD, and Backstage integration
+  tags:
+    - jax
+    - tpu
+    - inference
+    - python
+spec:
+  owner: user:development/guest
+  type: service
+  parameters:
+    - title: Service Information
+      required:
+        - name
+        - description
+        - model_name
+      properties:
+        name:
+          title: Service Name
+          type: string
+          description: Unique name for the inference service
+          pattern: '^[a-z0-9-]+$'
+          ui:autofocus: true
+        description:
+          title: Description
+          type: string
+          description: Brief description of what this service does
+        model_name:
+          title: Model Name
+          type: string
+          description: HuggingFace model identifier
+          default: meta-llama/Llama-3-8B
+          enum:
+            - meta-llama/Llama-3-8B
+            - meta-llama/Llama-3-70B
+            - google/gemma-2-9b
+            - mistralai/Mistral-7B-v0.3
+            - Qwen/Qwen2.5-7B
+        tpu_type:
+          title: TPU Type
+          type: string
+          description: Target TPU accelerator
+          default: v4-8
+          enum:
+            - v4-8
+            - v4-16
+            - v4-32
+            - v5e-4
+            - v5e-8
+    - title: Repository Settings
+      required:
+        - repoUrl
+      properties:
+        repoUrl:
+          title: Repository Location
+          type: string
+          ui:field: RepoUrlPicker
+          ui:options:
+            allowedHosts:
+              - github.com
+  steps:
+    - id: fetch-base
+      name: Fetch Base Template
+      action: fetch:template
+      input:
+        url: ./content
+        values:
+          name: ${{ parameters.name }}
+          description: ${{ parameters.description }}
+          model_name: ${{ parameters.model_name }}
+          tpu_type: ${{ parameters.tpu_type }}
+          destination: ${{ parameters.repoUrl | parseRepoUrl }}
+    - id: publish
+      name: Publish to GitHub
+      action: publish:github
+      input:
+        allowedHosts: ['github.com']
+        repoUrl: ${{ parameters.repoUrl }}
+        description: ${{ parameters.description }}
+        defaultBranch: main
+    - id: register
+      name: Register in Backstage
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps['publish'].output.repoContentsUrl }}
+        catalogInfoPath: '/catalog-info.yaml'
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps['publish'].output.remoteUrl }}
+      - title: Open in Backstage
+        icon: catalog
+        entityRef: ${{ steps['register'].output.entityRef }}
