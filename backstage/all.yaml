@@ -1,0 +1,11 @@
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: sglang-jax-backstage-resources
+  description: All Backstage catalog resources for sglang-jax
+spec:
+  targets:
+    - ./domain.yaml
+    - ./system.yaml
+    - ./api.yaml
+    - ./template/template.yaml
