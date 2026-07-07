@@ -40,6 +40,50 @@ from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
 logger = logging.getLogger(__name__)
 
 
+def _next_power_of_2(x: int) -> int:
+    return 1 if x <= 1 else 1 << (x - 1).bit_length()
+
+
+# Tuned (block_tokens, unroll) for grouped_topk_pallas_v2, keyed by device_kind then
+# (pow2(T_local), E, G, Gtop, k). Autotuned on real TPU by
+# `benchmark.kernels.grouped_topk.tune_grouped_topk_bt --variant v2` (v7x: exp-rured4jn0i).
+# v2's [E,BT] tile lets BT reach 4096 (v1 caps at 2048 via padded outputs), which large-T wants.
+# Lookup misses fall back to the 128-aligned VMEM-safe divisor in the wrapper.
+_TUNED_V2_BT: dict[str, dict[tuple, tuple[int, int]]] = {
+    "TPU7x": {
+        # E=256 (DeepSeek-V3 / Ling) — production config
+        (256, 256, 8, 4, 8): (256, 8),
+        (512, 256, 8, 4, 8): (512, 8),
+        (1024, 256, 8, 4, 8): (1024, 8),
+        (2048, 256, 8, 4, 8): (1024, 8),
+        (4096, 256, 8, 4, 8): (4096, 8),
+        (8192, 256, 8, 4, 8): (4096, 8),
+        (16384, 256, 8, 4, 8): (4096, 8),
+        (32768, 256, 8, 4, 8): (4096, 8),
+        # E=512 (MaxText)
+        (256, 512, 8, 4, 8): (256, 8),
+        (512, 512, 8, 4, 8): (512, 8),
+        (1024, 512, 8, 4, 8): (1024, 8),
+        (2048, 512, 8, 4, 8): (1024, 8),
+        (4096, 512, 8, 4, 8): (1024, 8),
+        (8192, 512, 8, 4, 8): (1024, 8),
+        (32768, 512, 8, 4, 8): (1024, 8),
+    },
+}
+
+
+def _tuned_v2_config(bs: int, e: int, g: int, gtop: int, k: int) -> tuple[int | None, int | None]:
+    """Best (BT, unroll) for this device + routing shape, or (None, None) on a miss."""
+    try:
+        kind = jax.devices()[0].device_kind
+    except Exception:  # noqa: BLE001
+        return None, None
+    table = _TUNED_V2_BT.get(kind)
+    if not table:
+        return None, None
+    return table.get((_next_power_of_2(bs), e, g, gtop, k), (None, None))
+
+
 def _grouped_topk_kernel_v2(
     logits_ref,  # [BT, E] f32  (router_logits, PRE-bias) — loaded token-major like v1
     bias_ref,  # [E]     f32  (correction_bias)
@@ -153,19 +197,23 @@ def grouped_topk_pallas_v2(
     router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
 
+    tuned_bt, tuned_unroll = _tuned_v2_config(bs, e, num_expert_group, topk_group, topk)
     if block_tokens == "auto":
-        # 128-aligned (lane dim) divisor of BS, largest that fits VMEM; else one whole-batch block.
-        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
-        if bt > SAFE_AUTO_BT:
-            logger.warning(
-                "grouped_topk_v2: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
-                "128-aligned VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM. Pad local "
-                "tokens to a multiple of 128 or pass an explicit block_tokens.",
-                bt,
-                bs,
-                bs,
-                e,
-            )
+        if tuned_bt is not None and bs % tuned_bt == 0:
+            bt = tuned_bt  # measured to fit v2 VMEM even above SAFE_AUTO_BT (e.g. BT=4096)
+        else:
+            # 128-aligned (lane dim) divisor of BS, largest that fits VMEM; else whole-batch block.
+            bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
+            if bt > SAFE_AUTO_BT:
+                logger.warning(
+                    "grouped_topk_v2: auto block_tokens fell back to whole-batch BT=%d (BS=%d has "
+                    "no 128-aligned VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM. Pad "
+                    "local tokens to a multiple of 128 or pass an explicit block_tokens.",
+                    bt,
+                    bs,
+                    bs,
+                    e,
+                )
     else:
         bt = min(block_tokens, bs)
         if bs % bt != 0:
@@ -175,8 +223,8 @@ def grouped_topk_pallas_v2(
 
     padded_topk = _align_to(topk, 128)  # TPU VMEM output tile needs a 128-multiple minor dim
 
-    # explicit unroll wins, else full unroll; clamp to 1..topk
-    unroll_factor = max(1, min(int(unroll if unroll is not None else topk), topk))
+    # explicit unroll wins, else tuned, else full unroll; clamp to 1..topk
+    unroll_factor = max(1, min(int(unroll if unroll is not None else tuned_unroll or topk), topk))
 
     kernel = functools.partial(
         _grouped_topk_kernel_v2,
