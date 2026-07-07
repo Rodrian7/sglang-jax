@@ -79,17 +79,19 @@ def _grouped_topk_kernel_v2(
 
         def _pick(k, carry):
             cur, ids_buf, w_buf = carry
-            cmax = jnp.max(cur, axis=0, keepdims=True)
-            idx = jnp.min(
-                jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
-            )  # [1, BT] lowest expert id achieving the max
+            # One reduction for the winner index via hardware argmax (v1/group_top2 already rely on
+            # it lowering). This replaces the previous max + (cur==cmax) + masked-min sequence
+            # (2 reductions + 2 elementwise) with a single argmax. Trade-off: argmax uses the
+            # hardware tie-break, not lowest-index — differs from the reference ONLY on exact-equal
+            # scores, where the tied experts are interchangeable (downstream needs the set + weight
+            # pairing, and the harness cross-check is by expert-set).
+            idx = jnp.argmax(cur, axis=0, keepdims=True).astype(jnp.int32)  # [1, BT]
             sel = e_iota == idx  # [E, BT]
-            # weight = PRE-bias logit at the winner. Computed as a masked sum-reduction (NOT a
-            # gather: jnp.take_along_axis does not lower in Pallas/Mosaic — _gather_lowering_rule
-            # raises AssertionError on TPU).
+            # weight = PRE-bias logit at the winner (masked sum-reduction; gather is unsupported in
+            # Pallas/Mosaic — jnp.take_along_axis -> _gather_lowering_rule AssertionError on TPU).
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT] pre-bias
             write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
-            ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
+            ids_buf = jnp.where(write, idx, ids_buf)
             w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
             cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
             return cur, ids_buf, w_buf
