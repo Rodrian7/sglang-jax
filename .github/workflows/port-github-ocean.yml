@@ -20,5 +20,5 @@ jobs:
                 port_base_url: "https://api.port.io"
                 config: |
                     github_host: https://api.github.com
-                    githubToken: ${{ secrets.GH_ACCESS_TOKEN }}
+                    github_token: ${{ secrets.GH_ACCESS_TOKEN }}
                     resync_ratelimit_reservation_threshold: 95
