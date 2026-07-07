@@ -21,8 +21,8 @@ NEG_INF = -jnp.inf
 def _grouped_topk_kernel_v2(
     logits_ref,  # [BT, E] f32  (router_logits, PRE-bias) — loaded token-major like v1
     bias_ref,  # [E]     f32  (correction_bias)
-    w_ref,  # [BT, padded_topk] f32  out: weights
-    ids_ref,  # [BT, padded_topk] i32  out: expert ids
+    w_ref,  # [topk, BT] f32  out: weights (topk in sublane, BT in lane)
+    ids_ref,  # [topk, BT] i32  out: expert ids
     *,
     n_group: int,
     topk_group: int,
@@ -99,8 +99,8 @@ def _grouped_topk_kernel_v2(
             0, topk, _pick, (masked, ids_init, w_init), unroll=unroll_factor
         )
 
-    ids_ref[...] = ids_out.T
-    w_ref[...] = w_out.T
+    ids_ref[...] = ids_out  # [topk, BT] — written BS-in-lane; wrapper .T is a free bitcast
+    w_ref[...] = w_out  # [topk, BT]
 
 
 def grouped_topk_pallas_v3(
@@ -142,7 +142,7 @@ def grouped_topk_pallas_v3(
         num_experts=e,
         unroll_factor=unroll_factor,
     )
-    weights, ids = pl.pallas_call(
+    weights_t, ids_t = pl.pallas_call(
         kernel,
         grid=(bs // bt,),
         in_specs=[
@@ -150,17 +150,21 @@ def grouped_topk_pallas_v3(
             pl.BlockSpec((e,), lambda i: (0,)),
         ],
         out_specs=[
-            pl.BlockSpec((bt, topk), lambda i: (i, 0)),
-            pl.BlockSpec((bt, topk), lambda i: (i, 0)),
+            pl.BlockSpec((topk, bt), lambda i: (0, i)),
+            pl.BlockSpec((topk, bt), lambda i: (0, i)),
         ],
         out_shape=[
-            jax.ShapeDtypeStruct((bs, topk), jnp.float32),
-            jax.ShapeDtypeStruct((bs, topk), jnp.int32),
+            jax.ShapeDtypeStruct((topk, bs), jnp.float32),
+            jax.ShapeDtypeStruct((topk, bs), jnp.int32),
         ],
         interpret=interpret,
         name="grouped-topk-v3",
     )(router_logits, bias)
-    return weights, ids
+    # Kernel emits [topk, BS] (BS in the lane dim — the dense, unpadded layout). The [BS, topk]
+    # contract is recovered by .T, which XLA realizes as a FREE bitcast ([topk,BS]{1,0} == [BS,topk]
+    # {0,1}) rather than the relayout `copy` it inserts when the kernel emits [BS,topk] with topk in
+    # the lanes (topk=8 padded to 128).
+    return weights_t.T, ids_t.T
 
 
 
