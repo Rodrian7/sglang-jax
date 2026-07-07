@@ -1,0 +1,7 @@
+site_name: sglang-jax
+site_description: JAX backend for SGLang
+plugins:
+  - techdocs-core
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
