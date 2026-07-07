@@ -60,32 +60,38 @@ def _grouped_topk_kernel_v2(
             group_mask = jnp.logical_or(group_mask, m)
             tmp = jnp.where(m, NEG_INF, tmp)
 
+    # Apply the group mask ONCE here (dropped groups -> -inf), not inside the pick loop: the mask is
+    # loop-invariant, so masking each of the `topk` iterations repeats this reshape+where 8x for no
+    # reason. Do it once and let the fori_loop carry the already-masked working array.
+    with jax.named_scope("expert_mask"):
+        scores_grouped = jnp.reshape(scores, (n_group, S, bt))
+        masked = jnp.reshape(
+            jnp.where(group_mask[:, None, :], scores_grouped, NEG_INF), (E, bt)
+        )  # [E, BT]
+
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (E,bt), 0)  # expert index along axis 0
         row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, bt), 0)  # output-row index
+        # buffers are [topk, BT]: topk is the SUBLANE (2nd-minor) dim here, so it only needs 8-align
+        # (topk=8 fits exactly) — no 128 padding, unlike v1 where topk is the lane dim.
         ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32) # [topk, bt]
         w_init = jnp.zeros((topk, bt), dtype=jnp.float32) # [topk, bt]
-        g_mask_expanded = group_mask[:, None, :] # [n_group, 1, bt]
-        
+
         def _pick(k, carry):
             cur, ids_buf, w_buf = carry
-            cur_reshaped = jnp.reshape(cur, (n_group, S, bt))
-            cur_masked_reshaped = jnp.where(g_mask_expanded, cur_reshaped, NEG_INF)
-            cur_masked = jnp.reshape(cur_masked_reshaped, (E, bt))
-
-            cmax = jnp.max(cur_masked, axis=0, keepdims=True)
+            cmax = jnp.max(cur, axis=0, keepdims=True)
             idx = jnp.min(
-                jnp.where(cur_masked == cmax, e_iota, E), axis=0, keepdims=True
+                jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
             )  # [1, BT] lowest expert id achieving the max
             sel = e_iota == idx  # [E, BT]
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT] pre-bias
-            write = row_iota == k  # [padded_topk, BT] one-hot on row k (loop index)
+            write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
             ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
             w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
-            cur = jnp.where(sel, NEG_INF, cur)
+            cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
             return cur, ids_buf, w_buf
         _, ids_out, w_out = jax.lax.fori_loop(
-            0, topk, _pick, (scores, ids_init, w_init), unroll=unroll_factor
+            0, topk, _pick, (masked, ids_init, w_init), unroll=unroll_factor
         )
 
     ids_ref[...] = ids_out.T
@@ -104,8 +110,10 @@ def grouped_topk_pallas_v3(
     interpret: bool | None = None,
 ):
     """Wrapper for kernel3 (`_grouped_topk_kernel_v2`): token-in-lane [E,BT], vectorized group top-2,
-    in-loop group masking. Signature-compatible with v1/v2. NOTE: outputs [BS, topk] with topk as the
-    minor dim (no 128 padding) — faithful to the kernel as written."""
+    group mask applied ONCE before the pick loop, final-select buffers kept [topk,BT] (topk in the
+    sublane dim, only 8-aligned — no 128 pad). Signature-compatible with v1/v2. Outputs [BS, topk]
+    with topk as the minor dim; that HBM array is still physically lane-padded to 128, which is
+    unavoidable without changing the [BS, topk] output contract (i.e. touching gate.py)."""
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
     bias = correction_bias.astype(jnp.float32)
