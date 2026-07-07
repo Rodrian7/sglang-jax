@@ -17,6 +17,7 @@ from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
     _largest_safe_divisor,
     grouped_topk_pallas,
 )
+from sgl_jax.srt.kernels.grouped_topk.v2.kernel import grouped_topk_pallas_v2
 
 
 def ref_biased_grouped_topk(router_logits, correction_bias, *, num_expert_group, topk_group, topk):
@@ -85,6 +86,69 @@ def test_pallas_eq_ref(E, G, Gtop, k, name, bs):
         atol=1e-6,
         err_msg=f"{name} bs={bs}: weights differ",
     )
+
+
+@pytest.mark.parametrize("E,G,Gtop,k,name", CONFIGS)
+@pytest.mark.parametrize("bs", BATCHES)
+def test_pallas_v2_eq_ref(E, G, Gtop, k, name, bs):
+    """v2 (token-in-lane [E,BT] layout) must be id-for-id identical to the reference, same as v1."""
+    logits = _logits(bs, E, seed=2)
+    bias = jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1
+
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas_v2(
+        logits,
+        bias,
+        num_expert_group=G,
+        topk_group=Gtop,
+        topk=k,
+        block_tokens=256,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(
+        np.array(ids_pal), np.array(ids_ref), err_msg=f"v2 {name} bs={bs}: top-k ids differ"
+    )
+    np.testing.assert_allclose(
+        np.array(w_pal),
+        np.array(w_ref),
+        rtol=0,
+        atol=1e-6,
+        err_msg=f"v2 {name} bs={bs}: weights differ",
+    )
+
+
+def test_v2_matches_ref_on_flat_ties():
+    """v2 must reproduce the lowest-index tie-break when all scores are equal (the reduction axis
+    moved from lane to sublane — verify Mosaic tie behavior on the new axis is still lowest-index)."""
+    E, G, Gtop, k, bs = 256, 8, 4, 8, 512
+    logits = jnp.full((bs, E), 0.5, dtype=jnp.float32)
+    bias = jnp.zeros((E,), dtype=jnp.float32)
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas_v2(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
+    )
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
+    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
+
+
+def test_v2_matches_ref_on_partial_ties():
+    """v2 within-group tie (experts 3 and 5 share a score) with distinct pre-bias weights."""
+    E, G, Gtop, k, bs = 256, 8, 4, 8, 512
+    logits = _logits(bs, E, seed=11)
+    logits = logits.at[:, 5].set(logits[:, 3])
+    bias = jax.random.normal(jax.random.PRNGKey(5), (E,), dtype=jnp.float32) * 0.1
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas_v2(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
+    )
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
+    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
 
 
 def test_against_real_topk_module():

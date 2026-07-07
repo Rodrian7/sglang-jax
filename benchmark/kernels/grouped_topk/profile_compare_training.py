@@ -24,9 +24,11 @@ from sgl_jax.srt.kernels.grouped_topk.legacy.topk_v1_training import (
     grouped_topk_pallas_training,
 )
 from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
+from sgl_jax.srt.kernels.grouped_topk.v2.kernel import grouped_topk_pallas_v2
 
 SCOPE_V1_FUSED = "bench_grouped_topk_v1_fused"
 SCOPE_V1_TRAINING_GATHER = "bench_grouped_topk_v1_training_gather"
+SCOPE_V2_LANE = "bench_grouped_topk_v2_lane"
 
 
 def _parse_csv_ints(value: str) -> list[int]:
@@ -230,9 +232,22 @@ def _make_jitted_variants(
                 interpret=interpret,
             )
 
+    def v2_lane(logits, bias):
+        with jax.named_scope(SCOPE_V2_LANE):
+            return grouped_topk_pallas_v2(
+                logits,
+                bias,
+                num_expert_group=n_group,
+                topk_group=topk_group,
+                topk=topk,
+                block_tokens=block_tokens,
+                interpret=interpret,
+            )
+
     return {
         "v1_fused": (SCOPE_V1_FUSED, jax.jit(v1_fused)),
         "v1_training_gather": (SCOPE_V1_TRAINING_GATHER, jax.jit(v1_training_gather)),
+        "v2_lane": (SCOPE_V2_LANE, jax.jit(v2_lane)),
     }
 
 
@@ -273,11 +288,25 @@ def run_comparison(
 
             fused_weights, fused_ids = variants["v1_fused"][1](logits, bias)
             training_weights, training_ids = variants["v1_training_gather"][1](logits, bias)
-            jax.block_until_ready((fused_weights, fused_ids, training_weights, training_ids))
+            v2_weights, v2_ids = variants["v2_lane"][1](logits, bias)
+            jax.block_until_ready(
+                (
+                    fused_weights,
+                    fused_ids,
+                    training_weights,
+                    training_ids,
+                    v2_weights,
+                    v2_ids,
+                )
+            )
             if not bool(jnp.array_equal(fused_ids, training_ids)):
                 raise AssertionError(f"top-k ids differ for T={tokens}")
             if not bool(jnp.allclose(fused_weights, training_weights, rtol=0, atol=1e-6)):
                 raise AssertionError(f"top-k weights differ for T={tokens}")
+            if not bool(jnp.array_equal(fused_ids, v2_ids)):
+                raise AssertionError(f"v2_lane top-k ids differ from v1_fused for T={tokens}")
+            if not bool(jnp.allclose(fused_weights, v2_weights, rtol=0, atol=1e-6)):
+                raise AssertionError(f"v2_lane top-k weights differ from v1_fused for T={tokens}")
 
             for variant, (scope, fn) in variants.items():
                 samples_ms, timing_source, variant_trace = _trace_profile_ms(
