@@ -1,0 +1,16 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ${{ values.name }}
+  description: ${{ values.description }}
+  annotations:
+    github.com/project-slug: ${{ values.destination.owner }}/${{ values.destination.repo }}
+    backstage.io/techdocs-ref: dir:.
+    backstage.io/kubernetes-label-selector: app=${{ values.name }}
+spec:
+  type: service
+  lifecycle: experimental
+  owner: user:development/guest
+  system: sglang
+  providesApis:
+    - ${{ values.name }}-api
