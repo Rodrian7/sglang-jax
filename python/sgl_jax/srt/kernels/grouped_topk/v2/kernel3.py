@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+import functools
+import logging
+
+import jax
+import jax.experimental.pallas as pl
+import jax.numpy as jnp
+
+# Wrapper helpers reused from v1 (VMEM cap, 128-aligned divisor, interpret toggle).
+from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
+    SAFE_AUTO_BT,
+    _largest_safe_divisor,
+    get_interpret,
+)
+
+logger = logging.getLogger(__name__)
+
+NEG_INF = -jnp.inf
+
+def _grouped_topk_kernel_v2(
+    logits_ref,  # [BT, E] f32  (router_logits, PRE-bias) — loaded token-major like v1
+    bias_ref,  # [E]     f32  (correction_bias)
+    w_ref,  # [BT, padded_topk] f32  out: weights
+    ids_ref,  # [BT, padded_topk] i32  out: expert ids
+    *,
+    n_group: int,
+    topk_group: int,
+    topk: int,
+    num_experts: int,
+    unroll_factor: int,
+):
+    S = num_experts // n_group
+    E = num_experts
+
+    # Transpose the loaded [BT, E] block to [E, BT] so tokens live in the lane/minor dim and every
+    # selection reduction below runs over the sublane/major (expert) axis == axis 0.
+    logits = logits_ref[...].astype(jnp.float32).T  # [E, BT] pre-bias
+    bt = logits.shape[1]
+    with jax.named_scope("bias_add"):
+        scores = logits + bias_ref[...][:, None]  # [E, BT] post-bias
+    
+    with jax.named_scope("group_top2"):
+        scores_ = jnp.reshape(scores, (n_group, S, bt))
+        v1 = jnp.max(scores_, axis=1, keepdims=True) # [n_group, 1, BT]
+        i1 = jnp.argmax(scores_, axis=1 , keepdims=True) # [n_group, 1, BT]
+        s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
+        scores_masked = jnp.where(s_iota == i1, NEG_INF, scores_)
+        v2 = jnp.max(scores_masked, axis=1, keepdims=True) # [n_group, 1, BT]
+        group_scores = jnp.squeeze(v1 + v2, axis=1) # [n_group, BT]
+
+    with jax.named_scope("group_select"):
+        group_mask = jnp.zeros((n_group, bt), dtype=jnp.bool_)
+        g_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, bt), 0)
+        tmp = group_scores
+        for _ in range(topk_group):
+            gmax = jnp.max(tmp, axis=0, keepdims=True) # [1, BT]
+            gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True) # [1, BT]
+            m = g_iota == gi
+            group_mask = jnp.logical_or(group_mask, m)
+            tmp = jnp.where(m, NEG_INF, tmp)
+
+    with jax.named_scope("final_select"):
+        e_iota = jax.lax.broadcasted_iota(jnp.int32, (E,bt), 0)  # expert index along axis 0
+        row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, bt), 0)  # output-row index
+        ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32) # [topk, bt]
+        w_init = jnp.zeros((topk, bt), dtype=jnp.float32) # [topk, bt]
+        g_mask_expanded = group_mask[:, None, :] # [n_group, 1, bt]
+        
+        def _pick(k, carry):
+            cur, ids_buf, w_buf = carry
+            cur_reshaped = jnp.reshape(cur, (n_group, S, bt))
+            cur_masked_reshaped = jnp.where(g_mask_expanded, cur_reshaped, NEG_INF)
+            cur_masked = jnp.reshape(cur_masked_reshaped, (E, bt))
+
+            cmax = jnp.max(cur_masked, axis=0, keepdims=True)
+            idx = jnp.min(
+                jnp.where(cur_masked == cmax, e_iota, E), axis=0, keepdims=True
+            )  # [1, BT] lowest expert id achieving the max
+            sel = e_iota == idx  # [E, BT]
+            wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT] pre-bias
+            write = row_iota == k  # [padded_topk, BT] one-hot on row k (loop index)
+            ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
+            w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
+            cur = jnp.where(sel, NEG_INF, cur)
+            return cur, ids_buf, w_buf
+        _, ids_out, w_out = jax.lax.fori_loop(
+            0, topk, _pick, (scores, ids_init, w_init), unroll=unroll_factor
+        )
+
+    ids_ref[...] = ids_out.T
+    w_ref[...] = w_out.T
+
+
+def grouped_topk_pallas_v3(
+    router_logits: jax.Array,  # [BS, E]
+    correction_bias: jax.Array,  # [E]
+    *,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    block_tokens: int | str = "auto",
+    unroll: int | None = None,
+    interpret: bool | None = None,
+):
+    """Wrapper for kernel3 (`_grouped_topk_kernel_v2`): token-in-lane [E,BT], vectorized group top-2,
+    in-loop group masking. Signature-compatible with v1/v2. NOTE: outputs [BS, topk] with topk as the
+    minor dim (no 128 padding) — faithful to the kernel as written."""
+    bs, e = router_logits.shape
+    router_logits = router_logits.astype(jnp.float32)
+    bias = correction_bias.astype(jnp.float32)
+
+    if block_tokens == "auto":
+        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
+    else:
+        bt = min(block_tokens, bs)
+        if bs % bt != 0:
+            raise ValueError(f"BS={bs} must be divisible by block_tokens={bt}")
+    if interpret is None:
+        interpret = get_interpret()
+
+    unroll_factor = max(1, min(int(unroll if unroll is not None else topk), topk))
+
+    kernel = functools.partial(
+        _grouped_topk_kernel_v2,
+        n_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        num_experts=e,
+        unroll_factor=unroll_factor,
+    )
+    weights, ids = pl.pallas_call(
+        kernel,
+        grid=(bs // bt,),
+        in_specs=[
+            pl.BlockSpec((bt, e), lambda i: (i, 0)),
+            pl.BlockSpec((e,), lambda i: (0,)),
+        ],
+        out_specs=[
+            pl.BlockSpec((bt, topk), lambda i: (i, 0)),
+            pl.BlockSpec((bt, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((bs, topk), jnp.float32),
+            jax.ShapeDtypeStruct((bs, topk), jnp.int32),
+        ],
+        interpret=interpret,
+        name="grouped-topk-v3",
+    )(router_logits, bias)
+    return weights, ids
+
+
+
+
+
+
+
+
