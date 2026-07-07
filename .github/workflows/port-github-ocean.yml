@@ -1,0 +1,23 @@
+# github-ocean Exporter Workflow
+# This workflow responsible for running github-ocean exporter.
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: '0 */1 * * *'
+
+jobs:
+    run-integration:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - name: Run github-ocean Integration
+              uses: port-labs/ocean-sail@v1
+              with:
+                type: github-ocean
+                port_client_id: ${{ secrets.PORT_CLIENT_ID }}
+                port_client_secret: ${{ secrets.PORT_CLIENT_SECRET }}
+                port_base_url: "https://api.port.io"
+                config: |
+                    github_host: https://api.github.com
+                    resync_ratelimit_reservation_threshold: 95
