@@ -9,4 +9,4 @@ metadata:
 spec:
   type: library
   lifecycle: experimental
-  owner: guests
+  owner: user:development/guest
