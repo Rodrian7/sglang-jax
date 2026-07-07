@@ -4,4 +4,45 @@ plugins:
   - techdocs-core
 nav:
   - Home: index.md
-  - Architecture: architecture.md
+  - Architecture:
+    - Overview: architecture/01-architecture-overview.md
+    - Entrypoints & Tokenization: architecture/02-entrypoints-and-tokenization.md
+    - Scheduler: architecture/03-scheduler.md
+    - Model Executor: architecture/04-model-executor.md
+    - Models: architecture/05-models.md
+    - Layers & Attention: architecture/06-layers-and-attention.md
+    - KV Cache: architecture/07-kv-cache.md
+    - Pallas Kernels: architecture/08-pallas-kernels.md
+    - Speculative Decoding: architecture/09-speculative-decoding.md
+    - LoRA: architecture/10-lora.md
+    - Quantization: architecture/11-quantization.md
+    - Multimodal: architecture/12-multimodal.md
+    - Configuration Reference: architecture/13-configuration-reference.md
+  - Getting Started:
+    - Installation: get_started/install.md
+    - GKE TPU Setup: get_started/gke-tpu-install.md
+    - GPU Setup: get_started/sglang-jax-gpu-install.md
+  - Features:
+    - Chunked Prefill: features/chunked_prefill.md
+    - Speculative Decoding: features/speculative_decoding.md
+    - Structured Output: features/structured_output.md
+    - Quantization: features/quantization.md
+    - Attention Backend: features/attention_backend.md
+    - Dynamic Batching: features/dynamic_continuous_batching.md
+    - Global JIT Compile: features/global_jit_compile.md
+    - DType Config: features/dtype_config.md
+    - Partial Rollout: features/partial_rollout.md
+  - Design:
+    - MLA: design/MLA.md
+    - Data Parallelism: design/data_parallelism.md
+    - LoRA: design/lora.md
+    - PD Disaggregation: design/pd_disaggregation.md
+  - Developer Guide:
+    - Contribution Guide: developer_guide/contribution_guide.md
+    - JAX Tutorial: developer_guide/jax_tutorial.md
+    - Benchmark & Profiling: developer_guide/benchmark_and_profiling.md
+    - CI Architecture: developer_guide/ci_architecture.md
+    - TPU Resources Guide: developer_guide/tpu_resources_guide.md
+    - Release Process: developer_guide/release_process.md
+  - Evaluations: evaluations/evaluations.md
+  - Performance: performance/qwen3_benchmark.md
