@@ -1,0 +1,161 @@
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: sglang-inference-api
+  description: SGLang JAX Inference API - OpenAI-compatible endpoints
+  tags:
+    - openai
+    - rest
+    - inference
+  annotations:
+    github.com/project-slug: Rodrian7/sglang-jax
+spec:
+  type: openapi
+  lifecycle: experimental
+  owner: user:development/guest
+  system: sglang
+  definition: |
+    openapi: 3.0.0
+    info:
+      title: SGLang JAX Inference API
+      version: 0.1.0
+      description: OpenAI-compatible inference API powered by JAX on TPU
+    servers:
+      - url: http://localhost:8080
+        description: Local development server
+    paths:
+      /v1/chat/completions:
+        post:
+          summary: Create chat completion
+          operationId: createChatCompletion
+          tags: [Chat]
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  required: [model, messages]
+                  properties:
+                    model:
+                      type: string
+                      example: meta-llama/Llama-3-8B
+                    messages:
+                      type: array
+                      items:
+                        type: object
+                        required: [role, content]
+                        properties:
+                          role:
+                            type: string
+                            enum: [system, user, assistant]
+                          content:
+                            type: string
+                    temperature:
+                      type: number
+                      default: 0.7
+                    max_tokens:
+                      type: integer
+                      default: 256
+                    stream:
+                      type: boolean
+                      default: false
+                    top_p:
+                      type: number
+                      default: 1.0
+          responses:
+            '200':
+              description: Successful completion
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      object:
+                        type: string
+                        example: chat.completion
+                      choices:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            index:
+                              type: integer
+                            message:
+                              type: object
+                              properties:
+                                role:
+                                  type: string
+                                content:
+                                  type: string
+                            finish_reason:
+                              type: string
+                      usage:
+                        type: object
+                        properties:
+                          prompt_tokens:
+                            type: integer
+                          completion_tokens:
+                            type: integer
+                          total_tokens:
+                            type: integer
+      /v1/completions:
+        post:
+          summary: Create text completion
+          operationId: createCompletion
+          tags: [Completions]
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  required: [model, prompt]
+                  properties:
+                    model:
+                      type: string
+                    prompt:
+                      type: string
+                    max_tokens:
+                      type: integer
+                      default: 256
+                    temperature:
+                      type: number
+                      default: 0.7
+          responses:
+            '200':
+              description: Successful completion
+      /v1/models:
+        get:
+          summary: List available models
+          operationId: listModels
+          tags: [Models]
+          responses:
+            '200':
+              description: List of models
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            object:
+                              type: string
+                            owned_by:
+                              type: string
+      /health:
+        get:
+          summary: Health check
+          operationId: healthCheck
+          tags: [System]
+          responses:
+            '200':
+              description: Service is healthy
