@@ -2,11 +2,16 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: sglang-jax
-  description: JAX backend for SGL
+  description: JAX backend for SGLang - LLM inference on TPU
   annotations:
     github.com/project-slug: Rodrian7/sglang-jax
     backstage.io/techdocs-ref: dir:.
+    backstage.io/kubernetes-label-selector: app=backstage
+    backstage.io/kubernetes-namespace: backstage
 spec:
   type: library
   lifecycle: experimental
   owner: user:development/guest
+  system: sglang
+  providesApis:
+    - sglang-inference-api
