@@ -1,0 +1,11 @@
+apiVersion: backstage.io/v1alpha1
+kind: Domain
+metadata:
+  name: ml-inference
+  description: Machine Learning Inference Platform
+  tags:
+    - ml
+    - inference
+    - tpu
+spec:
+  owner: user:development/guest
