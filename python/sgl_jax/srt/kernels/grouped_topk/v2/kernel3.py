@@ -75,26 +75,27 @@ def _grouped_topk_kernel_v2(
         # buffers are [topk, BT]: topk is the SUBLANE (2nd-minor) dim here, so it only needs 8-align
         # (topk=8 fits exactly) — no 128 padding, unlike v1 where topk is the lane dim.
         ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32) # [topk, bt]
+        w_init = jnp.zeros((topk, bt), dtype=jnp.float32) # [topk, bt]
 
         def _pick(k, carry):
-            cur, ids_buf = carry
+            cur, ids_buf, w_buf = carry
             cmax = jnp.max(cur, axis=0, keepdims=True)
             idx = jnp.min(
                 jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
             )  # [1, BT] lowest expert id achieving the max
             sel = e_iota == idx  # [E, BT]
+            # weight = PRE-bias logit at the winner. Computed as a masked sum-reduction (NOT a
+            # gather: jnp.take_along_axis does not lower in Pallas/Mosaic — _gather_lowering_rule
+            # raises AssertionError on TPU).
+            wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT] pre-bias
             write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
             ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
+            w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
             cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
-            return cur, ids_buf
-        _, ids_out = jax.lax.fori_loop(
-            0, topk, _pick, (masked, ids_init), unroll=unroll_factor
+            return cur, ids_buf, w_buf
+        _, ids_out, w_out = jax.lax.fori_loop(
+            0, topk, _pick, (masked, ids_init, w_init), unroll=unroll_factor
         )
-
-    # Weights = PRE-bias logits at the selected ids. Gather ONCE after the loop instead of a masked
-    # sum-reduction over all E experts on every pick — removes `topk` reductions from final_select.
-    with jax.named_scope("gather_weights"):
-        w_out = jnp.take_along_axis(logits, ids_out, axis=0)  # [topk, BT]
 
     ids_ref[...] = ids_out.T
     w_ref[...] = w_out.T
