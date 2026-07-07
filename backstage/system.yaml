@@ -1,0 +1,14 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: sglang
+  description: SGLang - Structured Generation Language for LLM inference
+  tags:
+    - jax
+    - tpu
+    - llm
+  annotations:
+    backstage.io/techdocs-ref: dir:..
+spec:
+  owner: user:development/guest
+  domain: ml-inference
