@@ -9,3 +9,4 @@ spec:
     - ./system.yaml
     - ./api.yaml
     - ./template/template.yaml
+    - ./guest-user.yaml
